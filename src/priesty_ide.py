@@ -1,5 +1,3 @@
-# Imports necessary libraries
-
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import os
@@ -11,8 +9,6 @@ import datetime
 import threading
 import queue
 import re
-
-# Importing custom modules
 
 from code_editor import CodeEditor
 from console_ui import ConsoleUi
@@ -38,19 +34,20 @@ class PriestyCode(tk.Tk):
 
         try:
             pil_image = Image.open(os.path.join(ICON_PATH, 'priesty.png'))
+            self.window_icon = tk.PhotoImage(file=os.path.join(ICON_PATH, 'priesty.png'))
+            self.iconphoto(True, self.window_icon)
+
             width, height = pil_image.size
             new_width = int(width * (self.icon_size / height))
             resized_image = pil_image.resize((new_width, self.icon_size), Image.Resampling.LANCZOS)
             self.priesty_icon = ImageTk.PhotoImage(resized_image)
-
-            priesty_icon_native = tk.PhotoImage(file=os.path.join(ICON_PATH, 'priesty.png'))
-            self.iconphoto(True, priesty_icon_native)
 
             self.folder_icon = self._load_and_resize_icon('folder_icon.png')
             self.git_icon = self._load_and_resize_icon('git_icon.png')
             self.run_icon = self._load_and_resize_icon('run.png')
             self.unknown_file_icon = self._load_and_resize_icon('unknwon.png')
             self.clear_icon = self._load_and_resize_icon('clear_icon.png')
+            self.python_logo_icon = self._load_and_resize_icon('python_logo.png', size=16)
 
         except FileNotFoundError as e:
             print(f"Error: One or more icon files not found. {e}")
@@ -60,14 +57,7 @@ class PriestyCode(tk.Tk):
             self.run_icon = None
             self.unknown_file_icon = None
             self.clear_icon = None
-        except tk.TclError as e:
-            print(f"Warning: Could not load icons. {e}")
-            self.priesty_icon = None
-            self.folder_icon = None
-            self.git_icon = None
-            self.run_icon = None
-            self.unknown_file_icon = None
-            self.clear_icon = None
+            self.python_logo_icon = None
         except Exception as e:
             print(f"Unexpected error loading icons: {e}")
             self.priesty_icon = None
@@ -76,13 +66,26 @@ class PriestyCode(tk.Tk):
             self.run_icon = None
             self.unknown_file_icon = None
             self.clear_icon = None
+            self.python_logo_icon = None
+
+        try:
+            self.iconbitmap(os.path.join(ICON_PATH, 'Priesty.ico'))
+        except Exception as e:
+            print(f"Error setting window icon: {e}")
 
         self.style = ttk.Style(self)
         self.style.theme_use("default")
         self.style.configure("DarkMenu.TMenu", background="#3C3C3C", foreground="white")
         self.style.map("DarkMenu.TMenu", background=[('active', '#555555')])
 
-        # Modernize Notebook (Tabs)
+        self.style.configure("TPanedwindow", background="#2B2B2B")
+        self.style.configure("TScrollbar", gripcount=0,
+                             background="#555555", darkcolor="#3C3C3C",
+                             lightcolor="#3C3C3C", troughcolor="#2B2B2B",
+                             bordercolor="#2B2B2B", arrowcolor="white")
+        self.style.map("TScrollbar", background=[('active', '#6A6A6A')])
+        self.style.configure("Treeview.Heading", background="#3C3C3C", foreground="white", relief="flat")
+        self.style.map("Treeview.Heading", background=[('active', '#555555')])
         self.style.theme_create("modern_notebook", parent="alt", settings={
             "TNotebook": {"configure": {"background": "#2B2B2B", "tabmargins": [2, 5, 2, 0]}},
             "TNotebook.Tab": {
@@ -136,26 +139,27 @@ class PriestyCode(tk.Tk):
         self.path_label = tk.Label(self.top_toolbar_frame, text=self.working_dir_path, bg="#3C3C3C", fg="#A0A0A0", font=("Segoe UI", 9))
         self.path_label.grid(row=0, column=4, padx=10, pady=2, sticky="e")
 
-    def _load_and_resize_icon(self, icon_filename):
+    def _load_and_resize_icon(self, icon_filename, size=None):
         try:
             pil_image = Image.open(os.path.join(ICON_PATH, icon_filename))
-            width, height = pil_image.size
-            new_width = int(width * (self.icon_size / height))
-            resized_image = pil_image.resize((new_width, self.icon_size), Image.Resampling.LANCZOS)
+            if size:
+                new_width = int(pil_image.width * (size / pil_image.height))
+                resized_image = pil_image.resize((new_width, size), Image.Resampling.LANCZOS)
+            else:
+                width, height = pil_image.size
+                new_width = int(width * (self.icon_size / height))
+                resized_image = pil_image.resize((new_width, self.icon_size), Image.Resampling.LANCZOS)
             return ImageTk.PhotoImage(resized_image)
         except Exception as e:
             print(f"Error loading and resizing icon {icon_filename}: {e}")
             return None
-
     
-
     def _create_main_content_area(self):
         self.main_content_frame = tk.Frame(self, bg="#2B2B2B")
         self.main_content_frame.grid(row=1, column=0, sticky="nsew")
         self.main_content_frame.grid_rowconfigure(0, weight=1)
         self.main_content_frame.grid_columnconfigure(1, weight=1)
 
-        # Left Paned Window (File Explorer and Tabs)
         self.left_pane = tk.Frame(self.main_content_frame, bg="#2B2B2B", width=250)
         self.left_pane.grid(row=0, column=0, sticky="nsw")
         self.left_pane.grid_propagate(False)
@@ -163,8 +167,9 @@ class PriestyCode(tk.Tk):
         self.file_manager_label = tk.Label(self.left_pane, text="File Manager", bg="#3C3C3C", fg="white", font=("Segoe UI", 10, "bold"))
         self.file_manager_label.pack(fill="x", pady=5)
 
-        self.file_explorer = FileExplorer(self.left_pane, project_root_dir)
+        self.file_explorer = FileExplorer(self.left_pane, project_root_dir, self.open_file) # Pass open_file to file explorer
         self.file_explorer.pack(fill="both", expand=True)
+        self.file_explorer.populate_tree() # Populate tree on startup
 
         self.tabs_label = tk.Label(self.left_pane, text="Tabs", bg="#3C3C3C", fg="white", font=("Segoe UI", 10, "bold"))
         self.tabs_label.pack(fill="x", pady=5)
@@ -172,10 +177,21 @@ class PriestyCode(tk.Tk):
         self.tabs_frame = tk.Frame(self.left_pane, bg="#2B2B2B")
         self.tabs_frame.pack(fill="both", expand=True)
 
-
-        # Right Paned Window (Code Editor and Console)
         self.right_pane = ttk.PanedWindow(self.main_content_frame, orient=tk.VERTICAL)
         self.right_pane.grid(row=0, column=1, sticky="nsew")
+
+        self.file_header_frame = tk.Frame(self.right_pane, bg="#3C3C3C", height=25)
+        self.file_header_frame.pack_propagate(False)
+        
+        if self.python_logo_icon:
+            self.python_logo_label = tk.Label(self.file_header_frame, image=self.python_logo_icon, bg="#3C3C3C")
+            self.python_logo_label.pack(side="left", padx=5, pady=0)
+        
+        self.current_filename_label = tk.Label(self.file_header_frame, text="unknown.py", 
+                                                bg="#3C3C3C", fg="white", font=("Segoe UI", 9))
+        self.current_filename_label.pack(side="left", padx=0, pady=0)
+
+        self.right_pane.add(self.file_header_frame, weight=0)
 
         self.code_editor = CodeEditor(self.right_pane)
         self.right_pane.add(self.code_editor, weight=3)
@@ -196,7 +212,7 @@ class PriestyCode(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=0, bg="#3C3C3C", fg="white", activebackground="#555555", activeforeground="white")
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="New File", command=lambda: messagebox.showinfo("New File", "New File functionality coming soon!"))
-        file_menu.add_command(label="Open File...", command=lambda: messagebox.showinfo("Open File", "Open File functionality coming soon!"))
+        file_menu.add_command(label="Open File...", command=self._open_file_dialog) # Changed to call a new method
         file_menu.add_command(label="Save", command=lambda: messagebox.showinfo("Save File", "Save File functionality coming soon!"))
         file_menu.add_command(label="Save As...", command=lambda: messagebox.showinfo("Save As", "Save As functionality coming soon!"))
         file_menu.add_separator()
@@ -214,6 +230,7 @@ class PriestyCode(tk.Tk):
         view_menu = tk.Menu(menubar, tearoff=0, bg="#3C3C3C", fg="white", activebackground="#555555", activeforeground="white")
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Toggle Fullscreen", command=lambda: self.attributes('-fullscreen', not self.attributes('-fullscreen')))
+        view_menu.add_command(label="Reset UI Layout", command=self._reset_ui_layout) # New button
 
         terminal_menu = tk.Menu(menubar, tearoff=0, bg="#3C3C3C", fg="white", activebackground="#555555", activeforeground="white")
         menubar.add_cascade(label="Terminal", menu=terminal_menu)
@@ -263,12 +280,10 @@ class PriestyCode(tk.Tk):
             stdout_thread.start()
             stderr_thread.start()
 
-            self.process.wait(timeout=5) # Wait for process to complete or timeout
+            self.process.wait(timeout=5)
+            stdout_thread.join()
+            stderr_thread.join()
 
-            stdout_thread.join() # Ensure all stdout is read
-            stderr_thread.join() # Ensure all stderr is read
-
-            # After process finishes and streams are read, put a signal for error processing
             if self.process.returncode != 0:
                 self.output_queue.put(("PROCESS_ERROR_SIGNAL", None))
 
@@ -301,17 +316,17 @@ class PriestyCode(tk.Tk):
                 line, tag = item
 
                 if tag == "stderr_tag":
-                    self.output_console.insert_text(line, tag) # Send full stderr to output console
+                    self.output_console.insert_text(line, tag)
                     full_stderr_output.append(line)
                 elif item == ("PROCESS_ERROR_SIGNAL", None):
                     if full_stderr_output:
                         error_message = "".join(full_stderr_output)
                         
-                        # Extract concise error message and line number
-                        concise_error = "An error occurred." # Default concise message
+                        concise_error = "An error occurred."
                         line_num = None
 
-                        file_line_match = re.search(r'File "<string>", line (\d+)', error_message)
+                        file_line_match = re.search(r'File ".*?", line (\d+)', error_message)
+                        
                         if file_line_match:
                             line_num = int(file_line_match.group(1))
 
@@ -331,7 +346,7 @@ class PriestyCode(tk.Tk):
                     else:
                         self.error_console.clear()
                         self.code_editor.clear_error_highlight()
-                    full_stderr_output = [] # Reset for next run
+                    full_stderr_output = []
                 else:
                     self.output_console.insert_text(line, tag)
         except queue.Empty:
@@ -347,6 +362,16 @@ class PriestyCode(tk.Tk):
         with open(file_path, "r") as f:
             self.code_editor.text_area.delete(1.0, tk.END)
             self.code_editor.text_area.insert(tk.END, f.read())
+        self.current_filename_label.config(text=os.path.basename(file_path))
+
+    def _open_file_dialog(self):
+        file_path = filedialog.askopenfilename(
+            initialdir=self.working_dir_path,
+            title="Select a file",
+            filetypes=(("Python files", "*.py"), ("All files", "*.*"))
+        )
+        if file_path:
+            self.open_file(file_path)
 
     def update_tabs(self):
         for child in self.tabs_frame.winfo_children():
@@ -361,11 +386,23 @@ class PriestyCode(tk.Tk):
         terminal_window = tk.Toplevel(self)
         terminal_window.title("New Terminal")
         terminal_window.geometry("800x400")
+        terminal_window.config(bg="#1E1E1E")
         terminal = Terminal(terminal_window)
         terminal.pack(fill="both", expand=True)
 
     def _clear_console(self):
         self.output_console.clear()
+
+    def _reset_ui_layout(self):
+        """Resets the PanedWindow sashes to their initial positions."""
+        # Destroy and re-create the main content area to reset layout
+        # This is a bit heavy-handed, but ensures all layout managers are reset.
+        # A more granular approach would be to manage sash positions directly if available
+        # or reset grid/pack configurations.
+        self.main_content_frame.destroy()
+        self._create_main_content_area()
+        messagebox.showinfo("UI Reset", "UI layout has been reset.")
+
 
     def run(self):
         self.mainloop()

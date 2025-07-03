@@ -60,7 +60,7 @@ class CodeEditor(tk.Frame):
         self.text_area.tag_configure("number_literal", foreground="#B5CEA8") # Lighter Green for numbers
         self.text_area.tag_configure("comment_tag", foreground="#6A9955") # Darker Green for comments
         self.text_area.tag_configure("function_param", foreground="#9CDCFE") # Lighter Blue for function parameters/arguments
-        self.text_area.tag_configure("error_line_tag", foreground="#FF3333", underline=True)
+        self.text_area.tag_configure("error_line_tag", background="#5A1D1D", underline=True)
 
         # --- New tag for parentheses/brackets ---
         self.text_area.tag_configure("bracket_tag", foreground="#FFD700") # Gold for brackets
@@ -148,7 +148,7 @@ class CodeEditor(tk.Frame):
 
     def _highlight_syntax(self):
         for tag in self.text_area.tag_names():
-            if tag not in ("sel", "insert", "current"):
+            if tag not in ("sel", "insert", "current", "error_line_tag"):
                 self.text_area.tag_remove(tag, 1.0, tk.END)
 
         content = self.text_area.get(1.0, tk.END)
