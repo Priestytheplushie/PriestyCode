@@ -1,3 +1,4 @@
+# priesty_ide.py
 # Imports necessary libraries
 
 import tkinter as tk
@@ -22,6 +23,7 @@ from file_explorer import FileExplorer
 current_dir = os.path.dirname(__file__)
 initial_project_root_dir = os.path.abspath(os.path.join(current_dir, '..'))
 ICON_PATH = os.path.join(initial_project_root_dir, 'assets', 'icons')
+CODE_PREFIX_LINES = 4 # Number of lines added to the script before execution
 
 class PriestyCode(tk.Tk):
     def __init__(self):
@@ -251,17 +253,23 @@ class PriestyCode(tk.Tk):
 
         self.right_pane.add(self.file_header_frame, weight=0)
 
-        self.code_editor = CodeEditor(self.right_pane)
-        self.right_pane.add(self.code_editor, weight=3)
-
         self.output_notebook = ttk.Notebook(self.right_pane)
         self.output_console = ConsoleUi(self.output_notebook)
         self.error_console = ConsoleUi(self.output_notebook)
+        self.terminal_console = Terminal(self.output_notebook) # Initialize Terminal
+
+        # Pass the error_console to the CodeEditor
+        self.code_editor = CodeEditor(self.right_pane, error_console=self.error_console)
+        self.right_pane.add(self.code_editor, weight=3)
+        
         self.output_notebook.add(self.output_console, text="Output")
         self.output_notebook.add(self.error_console, text="Errors")
+        self.output_notebook.add(self.terminal_console, text="Terminal") # Add Terminal tab
+        
         self.right_pane.add(self.output_notebook, weight=1)
 
         self.error_console.insert_text("No errors to display.\n", "info_tag")
+
 
     def _on_mousewheel(self, event):
         self.tabs_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
@@ -435,26 +443,33 @@ class PriestyCode(tk.Tk):
                         error_message = "".join(full_stderr_output)
                         
                         concise_error = "An error occurred."
-                        line_num = None
+                        editor_line_num = None
 
-                        file_line_match = re.search(r'File ".*?", line (\d+)', error_message)
-                        
-                        if file_line_match:
-                            line_num = int(file_line_match.group(1))
+                        # Find the last traceback line to get the most relevant error location
+                        matches = list(re.finditer(r'File ".*?", line (\d+)', error_message))
+                        if matches:
+                            last_match = matches[-1]
+                            line_num_from_traceback = int(last_match.group(1))
+                            # Adjust for the lines prepended to the script
+                            editor_line_num = line_num_from_traceback - CODE_PREFIX_LINES
 
+                        # Get the final error type and message
                         error_type_message_match = re.search(r'(?:\w+Error|Warning):\s*(.*)', error_message.splitlines()[-1])
                         if error_type_message_match:
                             concise_error = error_type_message_match.group(0).strip()
                         elif len(error_message.splitlines()) > 1:
                             concise_error = error_message.splitlines()[-1].strip()
 
-                        if line_num:
-                            concise_error = f"Line {line_num}: {concise_error}"
-
-                        self.error_console.format_error_output(concise_error, error_message)
-                        
-                        if line_num:
-                            self.code_editor.highlight_error_line(line_num)
+                        # Update error console and highlight the line in the editor
+                        if editor_line_num and editor_line_num > 0:
+                            concise_error_with_line = f"Line {editor_line_num}: {concise_error}"
+                            self.error_console.format_error_output(concise_error_with_line, error_message)
+                            # Use the new method to highlight and set tooltip
+                            self.code_editor.highlight_runtime_error(editor_line_num, concise_error)
+                        else:
+                            # If line number couldn't be parsed, just show the error without highlighting
+                            self.error_console.format_error_output(concise_error, error_message)
+                            self.code_editor.clear_error_highlight()
                     else:
                         self.error_console.clear()
                         self.code_editor.clear_error_highlight()
@@ -492,7 +507,12 @@ class PriestyCode(tk.Tk):
             self.file_type_icon_label.config(image=selected_icon)
         else:
             self.file_type_icon_label.config(image="")
-        self._file_type_icon_ref = selected_icon # Keep reference to prevent garbage collection
+        self._file_type_icon_ref = selected_icon # Keep reference
+        
+        # Apply syntax highlighting and proactive syntax check immediately after opening the file
+        self.code_editor.apply_syntax_highlighting()
+        self.code_editor._proactive_syntax_check()
+
 
     def _close_tab(self, file_path):
         if file_path in self.open_files:
@@ -511,6 +531,8 @@ class PriestyCode(tk.Tk):
                     else:
                         self.file_type_icon_label.config(image="")
                     self.current_open_file = None
+                    self.code_editor.clear_error_highlight() # Clear highlights if no file is open
+                    self.error_console.clear() # Clear error console if no file is open
             self.update_tabs()
 
 

@@ -42,7 +42,6 @@ class ConsoleUi(tk.Frame):
         self.output_console.config(state="disabled")
         self.output_console.see(tk.END)
 
-        # Set up hover for the entire error output
         self.output_console.bind("<Enter>", lambda e: self._show_tooltip(full_error_text, e))
         self.output_console.bind("<Leave>", lambda e: self._hide_tooltip())
 

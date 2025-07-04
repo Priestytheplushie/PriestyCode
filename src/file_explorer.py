@@ -65,7 +65,6 @@ class FileExplorer(tk.Frame):
             for item in os.listdir(path):
                 full_path = os.path.join(path, item)
                 if os.path.isdir(full_path):
-                    # For directories
                     insert_kwargs = {
                         "parent": parent_node,
                         "index": "end",
@@ -76,9 +75,8 @@ class FileExplorer(tk.Frame):
                     if self.folder_icon is not None:
                         insert_kwargs["image"] = self.folder_icon
                     node = self.tree.insert(**insert_kwargs)
-                    self._add_nodes(node, full_path) # Recursively add subdirectories
+                    self._add_nodes(node, full_path)
                 else:
-                    # For files
                     file_extension = os.path.splitext(item)[1].lower()
                     file_name_lower = item.lower()
                     
