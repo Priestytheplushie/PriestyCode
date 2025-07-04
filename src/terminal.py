@@ -19,6 +19,7 @@ class Terminal(tk.Frame):
         self.stdin_queue = stdin_queue
         self.process = None
         self.interactive_mode = False
+        self.display_name_widget: tk.Label | None = None
 
         self.text = scrolledtext.ScrolledText(
             self, wrap="word", bg="#1E1E1E", fg="#CCCCCC",
@@ -47,19 +48,39 @@ class Terminal(tk.Frame):
         self.after(100, self.show_prompt)
         
     def _initialize_ansi_colors(self):
-        self.ansi_colors = {
-            '30': 'black', '31': '#CD3131', '32': '#0DBC79', '33': '#E5E510',
-            '34': '#2472C8', '35': '#BC3FBC', '36': '#11A8CD', '37': '#E5E5E5',
-            '90': '#767676', '91': '#F14C4C', '92': '#16C60C', '93': '#F9F1A5',
-            '94': '#3B78FF', '95': '#D670D6', '96': '#61D6D6', '97': '#F2F2F2',
+        """Initializes Tkinter tags and categorizes ANSI color codes."""
+        # FIX 2: Added background colors to the map for proper parsing.
+        ansi_color_map = {
+            # Foreground
+            '30': ('foreground', 'black'), '31': ('foreground', '#CD3131'), '32': ('foreground', '#0DBC79'),
+            '33': ('foreground', '#E5E510'), '34': ('foreground', '#2472C8'), '35': ('foreground', '#BC3FBC'),
+            '36': ('foreground', '#11A8CD'), '37': ('foreground', '#E5E5E5'),
+            '90': ('foreground', '#767676'), '91': ('foreground', '#F14C4C'), '92': ('foreground', '#16C60C'),
+            '93': ('foreground', '#F9F1A5'), '94': ('foreground', '#3B78FF'), '95': ('foreground', '#D670D6'),
+            '96': ('foreground', '#61D6D6'), '97': ('foreground', '#F2F2F2'),
+            # Background
+            '40': ('background', '#1E1E1E'), '41': ('background', '#CD3131'), '42': ('background', '#0DBC79'),
+            '43': ('background', '#E5E510'), '44': ('background', '#2472C8'), '45': ('background', '#BC3FBC'),
+            '46': ('background', '#11A8CD'), '47': ('background', '#E5E5E5'),
+            '100': ('background', '#767676'), '101': ('background', '#F14C4C'), '102': ('background', '#16C60C'),
+            '103': ('background', '#F9F1A5'), '104': ('background', '#3B78FF'), '105': ('background', '#D670D6'),
+            '106': ('background', '#61D6D6'), '107': ('background', '#F2F2F2'),
         }
-        for code, color in self.ansi_colors.items():
-            self.text.tag_config(f'ansi_{code}', foreground=color)
+        
+        self.ansi_codes = {}
+        self.fg_color_codes = set()
+        self.bg_color_codes = set()
+
+        for code, (prop, color) in ansi_color_map.items():
+            self.text.tag_config(f'ansi_{code}', **{prop: color})
+            self.ansi_codes[code] = prop
+            if prop == 'foreground':
+                self.fg_color_codes.add(code)
+            elif prop == 'background':
+                self.bg_color_codes.add(code)
 
     def prepare_for_input(self):
-        """Makes the terminal ready to accept user input after a program has printed output."""
         self.text.config(state="normal")
-        # Set the mark before the final implicit newline to correctly capture input.
         self.text.mark_set(self.input_start_mark, self.text.index(f"{tk.END}-1c"))
         self.text.see(tk.END)
         self.text.focus_set()
@@ -79,91 +100,100 @@ class Terminal(tk.Frame):
             self.after(100, self.show_prompt)
 
     def write(self, text: str, tags=None):
-        """Writes text to the terminal, handling ANSI color codes and carriage returns robustly."""
         self.text.config(state="normal")
-
-        if tags and "stderr_tag" in tags:
-            self.text.insert(tk.END, text, ("stderr_tag",))
-            self.text.see(tk.END)
-            self.text.config(state="normal") # Keep it normal for subsequent writes
-            return
-
-        # Process carriage returns to enable single-line animations
+        additional_tags = list(tags) if tags else []
         segments = text.split('\r')
         if len(segments) > 1:
             for i, segment in enumerate(segments):
                 if i > 0:
-                    # A '\r' was here. Delete the last line of output.
                     last_line_start = self.text.index("end-1c linestart")
                     self.text.delete(last_line_start, tk.END)
-                
-                # Now, process and write the current segment with ANSI handling
-                self._write_segment_with_ansi(segment)
+                self._write_segment_with_ansi(segment, additional_tags)
         else:
-            # No carriage returns, process the whole text block at once
-            self._write_segment_with_ansi(text)
-
+            self._write_segment_with_ansi(text, additional_tags)
         self.text.see(tk.END)
-        # The state is left as 'normal' to allow continuous writing.
-        # It should be set to 'disabled' only when waiting for user input.
 
-    def _write_segment_with_ansi(self, text: str):
-        """Helper method to process a single text segment for ANSI codes and insert it."""
+    def _remove_tags_by_type(self, color_type: str):
+        """Removes all fg or bg tags from the current_tags list."""
+        prefixes = ()
+        if color_type == 'fg':
+            prefixes = ('ansi_3', 'ansi_9')
+        elif color_type == 'bg':
+            prefixes = ('ansi_4', 'ansi_10')
+        self.current_tags = [t for t in self.current_tags if not t.startswith(prefixes)]
+
+    def _write_segment_with_ansi(self, text: str, additional_tags: list[str]):
         text_to_process = self.ansi_buffer + text
         self.ansi_buffer = ""
-        
+
         last_end = 0
         for match in self.ansi_escape_pattern.finditer(text_to_process):
             start, end = match.span()
             
             if start > last_end:
-                self.text.insert(tk.END, text_to_process[last_end:start], tuple(self.current_tags))
+                current_combined_tags = tuple(self.current_tags + additional_tags)
+                self.text.insert(tk.END, text_to_process[last_end:start], current_combined_tags)
             
             escape_code = match.group(0)
             parts_str = escape_code.strip('\x1b[').strip('m')
-            
+
             if not parts_str:
-                self.current_tags = []
+                self.current_tags = [] 
             else:
                 parts = parts_str.split(';')
                 for part in parts:
-                    if part == '0' or part == '':
+                    # FIX 2: More robust ANSI state management
+                    part = part.lstrip('0') or '0'
+                    
+                    if part == '0':  # Full Reset
                         self.current_tags = []
-                    elif part in self.ansi_colors:
-                        self.current_tags = [f'ansi_{part}']
+                    elif part == '39':  # Reset Foreground
+                        self._remove_tags_by_type('fg')
+                    elif part == '49':  # Reset Background
+                        self._remove_tags_by_type('bg')
+                    elif part in self.ansi_codes:
+                        prop = self.ansi_codes[part]
+                        if prop == 'foreground':
+                            self._remove_tags_by_type('fg')
+                        elif prop == 'background':
+                            self._remove_tags_by_type('bg')
+                        
+                        color_tag = f'ansi_{part}'
+                        if color_tag not in self.current_tags:
+                            self.current_tags.append(color_tag)
             
             last_end = end
 
         remaining_text = text_to_process[last_end:]
         
-        # This logic handles partial ANSI codes that might be split between writes
         partial_code_index = remaining_text.rfind('\x1b')
-        if partial_code_index != -1:
+        if partial_code_index != -1 and not remaining_text[partial_code_index:].endswith('m'):
             safe_to_insert = remaining_text[:partial_code_index]
             self.ansi_buffer = remaining_text[partial_code_index:]
             if safe_to_insert:
-                self.text.insert(tk.END, safe_to_insert, tuple(self.current_tags))
+                current_combined_tags = tuple(self.current_tags + additional_tags)
+                self.text.insert(tk.END, safe_to_insert, current_combined_tags)
         else:
             if remaining_text:
-                self.text.insert(tk.END, remaining_text, tuple(self.current_tags))
+                current_combined_tags = tuple(self.current_tags + additional_tags)
+                self.text.insert(tk.END, remaining_text, current_combined_tags)
 
     def clear(self):
         self.text.config(state="normal")
         self.text.delete(1.0, tk.END)
+        self.ansi_buffer = ""
+        self.current_tags = []
         
     def show_prompt(self):
         self.text.config(state="normal")
-        
         if self.text.index("end-1c") != "1.0":
             last_char = self.text.get("end-2c")
             if last_char != '\n':
                 self.text.insert(tk.END, "\n")
-
         is_venv = '.venv' in self.python_executable or 'venv' in self.python_executable
         if is_venv:
             venv_name = os.path.basename(os.path.dirname(os.path.dirname(self.python_executable)))
             self.text.insert(tk.END, f"({venv_name}) ", ("prompt_venv",))
-        
         home_dir = os.path.expanduser("~")
         display_path = self.cwd
         try:
@@ -173,10 +203,8 @@ class Terminal(tk.Frame):
                 display_path = display_path.replace('\\', '/')
         except Exception:
              pass
-
         self.text.insert(tk.END, f"{display_path} ", ("prompt_path",))
         self.text.insert(tk.END, "> ", ("prompt_arrow",))
-
         self.text.mark_set(self.input_start_mark, self.text.index(f"{tk.END}-1c"))
         self.text.see(tk.END)
         self.text.config(state="normal")
@@ -189,23 +217,18 @@ class Terminal(tk.Frame):
 
     def _on_enter_key(self, event=None):
         command_line = self.text.get(self.input_start_mark, tk.END).strip()
-        
         self.text.insert(tk.END, "\n")
         self.text.config(state="disabled")
-        
         if self.interactive_mode:
             self.stdin_queue.put(command_line + '\n')
         else:
             self._handle_shell_command(command_line)
-            
         return "break"
 
     def _handle_shell_command(self, command_line):
         if not command_line:
             self.show_prompt()
             return
-
-        # ... (rest of the method is unchanged)
         if command_line.strip().lower() == "cd" or command_line.strip().lower() == "cd ~":
              home = os.path.expanduser("~")
              try:
@@ -216,7 +239,6 @@ class Terminal(tk.Frame):
              self.clear()
              self.show_prompt()
              return
-
         if command_line.strip().lower().startswith("cd "):
             path = command_line.strip()[3:].strip('"').strip("'")
             new_path = os.path.join(self.cwd, path) if not os.path.isabs(path) else path
@@ -231,19 +253,15 @@ class Terminal(tk.Frame):
             self.clear()
             self.show_prompt()
             return
-
         if command_line.lower() in ["cls", "clear"]:
             self.clear()
             self.show_prompt()
             return
-        
         threading.Thread(target=self._execute_command_in_thread, args=(command_line,), daemon=True).start()
 
     def _execute_command_in_thread(self, command_str: str):
-        # ... (method is unchanged)
         env = self._get_execution_env()
         scripts_dir = os.path.dirname(self.python_executable)
-
         try:
             parts = command_str.split()
             command_exe = parts[0]
@@ -251,17 +269,14 @@ class Terminal(tk.Frame):
         except IndexError:
             self.after(0, self.show_prompt)
             return
-
         search_path = f"{scripts_dir}{os.pathsep}{env.get('PATH', '')}"
         full_command_path = shutil.which(command_exe, path=search_path)
-        
         if full_command_path:
             command_to_run = [full_command_path] + command_args
             use_shell = False
         else:
             command_to_run = command_str
             use_shell = True
-
         try:
             self.process = subprocess.Popen(
                 command_to_run, shell=use_shell,
@@ -271,11 +286,9 @@ class Terminal(tk.Frame):
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
                 encoding='utf-8'
             )
-
             if self.process.stdout:
                 for line in iter(self.process.stdout.readline, ''):
                     self.after(0, self.write, line)
-
         except FileNotFoundError:
             err_msg = f"Command not found: {command_exe}\n"
             self.after(0, self.write, err_msg, ("stderr_tag",))
@@ -288,28 +301,22 @@ class Terminal(tk.Frame):
             self.after(10, self.show_prompt)
 
     def _get_execution_env(self):
-        # ... (method is unchanged)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["FORCE_COLOR"] = "1"
-
         scripts_dir = os.path.dirname(self.python_executable)
-        
         venv_root = None
         if os.path.basename(scripts_dir).lower() in ('scripts', 'bin'):
             potential_root = os.path.dirname(scripts_dir)
             if os.path.exists(os.path.join(potential_root, 'pyvenv.cfg')):
                 venv_root = potential_root
-
         if venv_root:
             env['VIRTUAL_ENV'] = venv_root
             env['PATH'] = scripts_dir + os.pathsep + env.get('PATH', '')
         else:
             env['PATH'] = scripts_dir + os.pathsep + env.get('PATH', '')
-
         if sys.platform == 'win32' and 'PATH' in env:
             original_paths = env['PATH'].split(os.pathsep)
             filtered_paths = [p for p in original_paths if 'windowsapps' not in p.lower()]
             env['PATH'] = os.pathsep.join(filtered_paths)
-
         return env
