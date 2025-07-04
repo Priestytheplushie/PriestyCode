@@ -46,7 +46,7 @@ class PriestyCode(tk.Tk):
         self.is_running = False
         self.workspace_root_dir = initial_project_root_dir
         self.python_executable = sys.executable
-        self.find_replace_dialog: 'FindReplaceDialog' | None = None
+        self.find_replace_dialog: 'FindReplaceDialog' | None = None #type: ignore
         
         self.file_type_icon_label: tk.Label
         self.file_name_label: tk.Label
@@ -501,7 +501,7 @@ print("\\n--- End of Sandbox Execution ---")
         
         for i, tab in enumerate(self.tab_widgets):
             close_button = tab.winfo_children()[-1]
-            close_button.config(command=lambda new_i=i: self._close_tab(new_i))
+            close_button.config(command=lambda new_i=i: self._close_tab(new_i)) #type: ignore
             for child in tab.winfo_children()[:-1]:
                 child.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
             tab.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
