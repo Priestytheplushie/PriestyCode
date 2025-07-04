@@ -1,7 +1,7 @@
 # priesty_ide.py
 
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
+from tkinter import messagebox, filedialog, ttk, simpledialog
 import os
 import subprocess
 import sys
@@ -42,7 +42,6 @@ class PriestyCode(tk.Tk):
 
         self.icon_size = 16
         self.process: subprocess.Popen | None = None
-        # FIX 1: Correct queue type hint
         self.output_queue: queue.Queue[tuple[str, Union[str, int, None]]] = queue.Queue()
         self.stdin_queue: queue.Queue[str] = queue.Queue()
         self.stderr_buffer = ""
@@ -58,12 +57,21 @@ class PriestyCode(tk.Tk):
         self.python_executable = sys.executable
         self.find_replace_dialog: 'FindReplaceDialog' | None = None #type: ignore
         self.venv_warning_shown = False
+        self.temp_run_file: str | None = None
         
         self.file_type_icon_label: tk.Label
         self.file_name_label: tk.Label
-        self.terminal_console: Terminal
         self.error_console: ConsoleUi
         self.file_explorer: FileExplorer
+
+        # --- Terminal Management ---
+        self.terminals: list[Terminal] = []
+        self.terminal_ui_map: dict[Terminal, tk.Frame] = {}
+        self.active_terminal: Terminal | None = None
+        self.terminal_content_frame: tk.Frame
+        self.terminal_tabs_sidebar: tk.Frame
+        self.add_terminal_button: tk.Button
+        self.output_notebook: ttk.Notebook
 
         self.autocomplete_enabled = tk.BooleanVar(value=True)
         self.proactive_errors_enabled = tk.BooleanVar(value=True)
@@ -104,6 +112,10 @@ class PriestyCode(tk.Tk):
         self.python_logo_icon = self._load_and_resize_icon('python_logo.png')
         self.close_icon = self._load_and_resize_icon('close_icon.png', size=12)
         self.txt_icon = self._load_and_resize_icon('txt_icon.png')
+        self.md_icon = self._load_and_resize_icon('markdown_icon.png')
+        self.add_icon = self._load_and_resize_icon('add_icon.png', size=16)
+        self.terminal_icon = self._load_and_resize_icon('terminal_icon.png', size=16)
+
 
         # Icons for autocomplete manager
         self.snippet_icon = self._load_and_resize_icon('snippet_icon.png')
@@ -157,7 +169,7 @@ class PriestyCode(tk.Tk):
         self.file_name_label.pack(side="left", padx=(2, 10))
 
         btn_kwargs = {"bg": "#3C3C3C", "bd": 0, "activebackground": "#555555", "highlightthickness": 0}
-        self.clear_console_button = tk.Button(self.top_toolbar_frame, command=self._clear_console, **btn_kwargs)
+        self.clear_console_button = tk.Button(self.top_toolbar_frame, command=self._clear_active_output_view, **btn_kwargs)
         if self.clear_icon: self.clear_console_button.config(image=self.clear_icon)
         else: self.clear_console_button.config(text="Clear", fg="white")
         self.clear_console_button.pack(side="right", padx=5)
@@ -182,6 +194,7 @@ class PriestyCode(tk.Tk):
 
         file_menu.add_command(label="Open File...", command=self._open_file, accelerator="Ctrl+O")
         file_menu.add_command(label="Open Folder...", command=self._open_folder)
+        file_menu.add_command(label="Open Sandbox", command=self._open_new_sandbox_tab)
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self._save_file, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self._save_file_as, accelerator="Ctrl+Shift+S")
@@ -211,6 +224,14 @@ class PriestyCode(tk.Tk):
         menubar.add_cascade(label="Run", menu=run_menu)
         run_menu.add_command(label="Run Current File", command=self._run_code, accelerator="F5")
         run_menu.add_command(label="Stop Execution", command=self._stop_code, accelerator="Ctrl+F2")
+
+        terminal_menu = tk.Menu(menubar, **menu_kwargs)
+        menubar.add_cascade(label="Terminal", menu=terminal_menu)
+        terminal_menu.add_command(label="New Terminal Tab", command=self._create_new_terminal)
+        terminal_menu.add_command(label="Open External Terminal", command=self._open_external_terminal)
+        terminal_menu.add_separator()
+        terminal_menu.add_command(label="Clear Active Terminal/Console", command=self._clear_active_output_view)
+        terminal_menu.add_command(label="Clear Errors Console", command=lambda: self.error_console.clear())
         
         workspace_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Workspace", menu=workspace_menu)
@@ -242,7 +263,7 @@ class PriestyCode(tk.Tk):
         self.file_explorer = FileExplorer(left_pane, self, self.workspace_root_dir, self._open_file_from_path, 
                                           folder_icon=self.folder_icon, python_icon=self.python_logo_icon, 
                                           git_icon=self.git_icon, unknown_icon=self.unknown_file_icon,
-                                          txt_icon=self.txt_icon)
+                                          txt_icon=self.txt_icon, md_icon=self.md_icon)
         self.file_explorer.pack(fill="both", expand=True)
 
         self.right_pane = ttk.PanedWindow(self.main_paned_window, orient=tk.VERTICAL)
@@ -257,36 +278,146 @@ class PriestyCode(tk.Tk):
         self.editor_content_frame = tk.Frame(editor_area_frame, bg="#2B2B2B")
         self.editor_content_frame.grid(row=1, column=0, sticky="nsew")
 
-        self.output_notebook = ttk.Notebook(self.right_pane)
-        self.right_pane.add(self.output_notebook, weight=1)
+        # --- New Output Area with Top Tabs (Terminal/Errors) and Side Tabs (for terminals) ---
+        output_container = tk.Frame(self.right_pane)
+        self.right_pane.add(output_container, weight=1)
         
-        self.terminal_console = Terminal(self.output_notebook, stdin_queue=self.stdin_queue, 
-                                         cwd=self.workspace_root_dir, python_executable=self.python_executable)
-        self.output_notebook.add(self.terminal_console, text="Terminal")
+        self.output_notebook = ttk.Notebook(output_container)
+        self.output_notebook.pack(fill="both", expand=True)
 
-        self.error_console = ConsoleUi(self.output_notebook)
-        self.output_notebook.add(self.error_console, text="Errors")
-        self.output_notebook.bind("<<NotebookTabChanged>>", self._on_output_tab_change)
+        # -- Terminal Page --
+        terminal_page = tk.Frame(self.output_notebook, bg="#2B2B2B")
+        terminal_page.grid_columnconfigure(0, weight=1)
+        terminal_page.grid_rowconfigure(0, weight=1)
+        
+        self.terminal_content_frame = tk.Frame(terminal_page)
+        self.terminal_content_frame.grid(row=0, column=0, sticky="nsew")
+        
+        self.terminal_tabs_sidebar = tk.Frame(terminal_page, bg="#2B2B2B", width=150)
+        self.terminal_tabs_sidebar.grid(row=0, column=1, sticky="ns")
+        self.terminal_tabs_sidebar.pack_propagate(False)
 
-    def _on_output_tab_change(self, event=None):
+        self.add_terminal_button = tk.Button(self.terminal_tabs_sidebar, text=" New", command=self._create_new_terminal,
+                                             bg="#3C3C3C", fg="white", bd=0, activebackground="#555555",
+                                             font=("Segoe UI", 8), relief="flat", image=self.add_icon, compound="left", padx=5) # type: ignore #type ignore
+        self.add_terminal_button.pack(side="bottom", fill="x", pady=5, padx=5)
+
+        # -- Errors Page --
+        error_page = tk.Frame(self.output_notebook, bg="#1E1E1E")
+        self.error_console = ConsoleUi(error_page)
+        self.error_console.pack(fill="both", expand=True)
+        
+        self.output_notebook.add(terminal_page, text="TERMINAL")
+        self.output_notebook.add(error_page, text="ERRORS")
+        
+        self._create_new_terminal() # Create the first terminal
+
+    def _create_new_terminal(self):
+        new_terminal = Terminal(self.terminal_content_frame, stdin_queue=self.stdin_queue, 
+                                cwd=self.workspace_root_dir, python_executable=self.python_executable)
+        
+        # Create side tab UI
+        tab_frame = tk.Frame(self.terminal_tabs_sidebar, bg="#2B2B2B")
+        
+        icon_label = tk.Label(tab_frame, bg="#2B2B2B")
+        if self.terminal_icon:
+            icon_label.config(image=self.terminal_icon)
+        icon_label.pack(side="left", padx=(5, 2))
+
+        name_label = tk.Label(tab_frame, text=f"Terminal {len(self.terminals) + 1}", 
+                              bg="#2B2B2B", fg="white", font=("Segoe UI", 9), anchor="w")
+        name_label.pack(side="left", fill="x", expand=True)
+        new_terminal.display_name_widget = name_label
+
+        close_button = tk.Button(tab_frame, text="\u2715", bg="#2B2B2B", fg="#CCCCCC", bd=0, 
+                                 activebackground="#E81123", activeforeground="white", relief="flat",
+                                 command=lambda t=new_terminal: self._close_terminal(t))
+        close_button.pack(side="right", padx=(0, 5))
+
+        tab_frame.pack(side="top", fill="x", pady=(1,0), padx=2)
+        
+        # Bindings for selection and context menu
+        for widget in [tab_frame, icon_label, name_label]:
+            widget.bind("<Button-1>", lambda e, t=new_terminal: self._switch_terminal(t))
+            widget.bind("<Button-3>", lambda e, t=new_terminal: self._show_terminal_context_menu(e, t))
+
+        self.terminals.append(new_terminal)
+        self.terminal_ui_map[new_terminal] = tab_frame
+        
+        self._switch_terminal(new_terminal)
+        self.output_notebook.select(0) # Switch to Terminal page
+        return new_terminal
+
+    def _switch_terminal(self, terminal_to_activate: Terminal):
+        if self.active_terminal == terminal_to_activate:
+            return
+
+        if self.active_terminal:
+            self.active_terminal.pack_forget()
+            if self.active_terminal in self.terminal_ui_map:
+                self.terminal_ui_map[self.active_terminal].config(bg="#2B2B2B")
+                for child in self.terminal_ui_map[self.active_terminal].winfo_children():
+                    child.config(bg="#2B2B2B") # type: ignore
+
+        self.active_terminal = terminal_to_activate
+        if self.active_terminal:
+            self.active_terminal.pack(fill="both", expand=True)
+            if self.active_terminal in self.terminal_ui_map:
+                self.terminal_ui_map[self.active_terminal].config(bg="#3C3C3C")
+                for child in self.terminal_ui_map[self.active_terminal].winfo_children():
+                    child.config(bg="#3C3C3C") # type: ignore
+            self.active_terminal.text.focus_set()
+
+    def _close_terminal(self, terminal_to_close: Terminal):
+        if len(self.terminals) <= 1:
+            messagebox.showwarning("Close Terminal", "Cannot close the last terminal.", parent=self)
+            return
+
+        was_active = (self.active_terminal == terminal_to_close)
+        
+        # Clean up UI and data
+        if terminal_to_close in self.terminal_ui_map:
+            self.terminal_ui_map[terminal_to_close].destroy()
+            del self.terminal_ui_map[terminal_to_close]
+        
+        terminal_to_close.destroy()
+        self.terminals.remove(terminal_to_close)
+        
+        if was_active:
+            # Activate another terminal
+            self._switch_terminal(self.terminals[-1] if self.terminals else None) # type: ignore
+
+    def _show_terminal_context_menu(self, event, terminal: Terminal):
+        context_menu = tk.Menu(self, tearoff=0, bg="#3C3C3C", fg="white",
+                               activebackground="#555555", activeforeground="white")
+        context_menu.add_command(label="Rename...", command=lambda: self._rename_terminal(terminal))
+        context_menu.add_command(label="Close", command=lambda: self._close_terminal(terminal))
+        
         try:
-            tab_text = self.output_notebook.tab(self.output_notebook.select(), "text")
-            if tab_text == "Terminal": self.terminal_console.text.after(50, self.terminal_console.text.focus_set)
-            elif tab_text == "Errors" and self.error_console: self.error_console.output_console.focus_set()
-        except tk.TclError: pass
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+            
+    def _rename_terminal(self, terminal: Terminal):
+        current_name = terminal.display_name_widget.cget("text") # type: ignore
+        new_name = simpledialog.askstring("Rename Terminal", "Enter new name:", initialvalue=current_name, parent=self)
+        if new_name and new_name.strip():
+            terminal.display_name_widget.config(text=new_name.strip()) # type: ignore
+
+    def _get_run_terminal(self) -> Terminal:
+        if not self.active_terminal:
+            if not self.terminals:
+                return self._create_new_terminal()
+            return self.terminals[0]
+        return self.active_terminal
 
     def _open_sandbox_if_empty(self):
         if not self.open_files:
-            sandbox_path = os.path.join(self.workspace_root_dir, "sandbox.py")
-            if not os.path.exists(sandbox_path):
-                content = "# sandbox.py\nimport traceback\n\nprint('--- Welcome to the Sandbox ---')\n"
-                try:
-                    with open(sandbox_path, "w", encoding="utf-8") as f: f.write(content)
-                    self.file_explorer.populate_tree()
-                except Exception as e:
-                    messagebox.showerror("Sandbox Creation Failed", f"Could not create sandbox.py: {e}")
-                    return
-            self._open_file_from_path(sandbox_path)
+            self._open_new_sandbox_tab()
+    
+    def _open_new_sandbox_tab(self, event=None):
+        content = "# PriestyCode Sandbox\n# This is a temporary file. Save it to keep your changes.\n"
+        self._add_new_tab(file_path="sandbox.py", content=content)
 
     def _check_virtual_env(self):
         found_venv = False
@@ -307,13 +438,14 @@ class PriestyCode(tk.Tk):
                 if messagebox.askyesno("Virtual Environment Recommended", "No virtual environment was found. It is highly recommended to use one.\n\nWould you like to create one now?"):
                     self._create_virtual_env()
         
-        if hasattr(self, 'terminal_console'):
-            self.terminal_console.set_python_executable(self.python_executable)
-            self.terminal_console.clear(); self.terminal_console.show_prompt()
+        for term in self.terminals:
+            term.set_python_executable(self.python_executable)
+            term.clear(); term.show_prompt()
 
     def _create_virtual_env(self):
-        self.terminal_console.write("Creating virtual environment 'venv'... This may take a moment.\n")
-        self.output_notebook.select(self.terminal_console)
+        run_terminal = self._get_run_terminal()
+        run_terminal.write("Creating virtual environment 'venv'... This may take a moment.\n")
+        self.output_notebook.select(0)
         self.update_idletasks()
         venv_dir = os.path.join(self.workspace_root_dir, "venv")
         if os.path.exists(venv_dir):
@@ -324,8 +456,8 @@ class PriestyCode(tk.Tk):
             try:
                 subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True, capture_output=True, text=True, cwd=self.workspace_root_dir)
                 self.after(0, self._check_virtual_env); self.after(0, self.file_explorer.populate_tree)
-            except Exception as e: self.terminal_console.write(f"Failed to create venv: {e}\n", "stderr_tag")
-            finally: self.after(0, self.terminal_console.show_prompt)
+            except Exception as e: run_terminal.write(f"Failed to create venv: {e}\n", "stderr_tag")
+            finally: self.after(0, run_terminal.show_prompt)
 
         threading.Thread(target=create, daemon=True).start()
 
@@ -342,7 +474,9 @@ class PriestyCode(tk.Tk):
         while self.open_files:
             if not self._close_tab(0, force_ask=True): return
         self.workspace_root_dir, self.venv_warning_shown = new_path, False
-        self.file_explorer.set_project_root(new_path); self.terminal_console.set_cwd(new_path)
+        self.file_explorer.set_project_root(new_path)
+        for term in self.terminals:
+            term.set_cwd(new_path)
         self._check_virtual_env()
         self.title(f"PriestyCode - {os.path.basename(new_path)}")
 
@@ -351,7 +485,18 @@ class PriestyCode(tk.Tk):
         if extension.lower() in self.BINARY_EXTENSIONS:
             messagebox.showerror("Cannot Open File", f"The file '{os.path.basename(file_path)}' appears to be a binary file.")
             return
-
+        
+        # Special handling to prevent multiple sandboxes
+        if os.path.basename(file_path) == "sandbox.py":
+            # Check if sandbox is already open
+            for open_path in self.open_files:
+                if os.path.basename(open_path) == "sandbox.py":
+                    self._switch_to_tab(self.open_files.index(open_path))
+                    return
+            # If not open, we treat it as a special case for _add_new_tab
+            self._open_new_sandbox_tab()
+            return
+            
         if file_path in self.open_files: self._switch_to_tab(self.open_files.index(file_path))
         else: self._add_new_tab(file_path=file_path)
 
@@ -360,17 +505,22 @@ class PriestyCode(tk.Tk):
         editor = CodeEditor(editor_frame, error_console=self.error_console, autocomplete_icons={'snippet':self.snippet_icon, 'keyword':self.keyword_icon, 'function':self.function_icon, 'variable':self.variable_icon, 'class':self.function_icon})
         editor.pack(fill="both", expand=True)
 
-        if file_path and not file_path.startswith("Untitled-"):
+        is_sandbox = (file_path == "sandbox.py")
+        is_untitled = False
+
+        if file_path and not is_sandbox and not file_path.startswith("Untitled-"):
             try:
                 with open(file_path, "r", encoding="utf-8") as f: content = f.read()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to open file: {e}"); editor_frame.destroy(); return
-        elif not file_path:
+        elif not file_path or file_path.startswith("Untitled-"):
+            is_untitled = True
             count = 1; untitled_name = f"Untitled-{count}{extension}"
             while untitled_name in self.open_files: count += 1; untitled_name = f"Untitled-{count}{extension}"
             file_path = untitled_name
 
-        editor.set_file_path(file_path); editor.text_area.insert("1.0", content); editor.text_area.edit_modified(False)
+        editor.set_file_path(file_path); editor.text_area.insert("1.0", content)
+        editor.text_area.edit_modified(is_sandbox or is_untitled) # Sandbox/Untitled starts modified
         self.after(50, editor._on_content_changed)
 
         tab = tk.Frame(self.tab_bar_frame, bg="#3C3C3C"); tab.pack(side="left", fill="y", padx=(0, 1))
@@ -435,13 +585,15 @@ class PriestyCode(tk.Tk):
         ext = os.path.splitext(file_path)[1]
         if ext == ".py": return self.python_logo_icon
         if ext == ".txt": return self.txt_icon
+        if ext == ".md": return self.md_icon
         return self.unknown_file_icon
 
     def _save_file(self, event=None, index=None) -> bool:
         idx = self.current_tab_index if index is None else index
         if not (0 <= idx < len(self.open_files)): return False
         file_path = self.open_files[idx]
-        if file_path.startswith("Untitled-"): return self._save_file_as(index=idx)
+        if file_path.startswith("Untitled-") or file_path == "sandbox.py":
+            return self._save_file_as(index=idx)
         try:
             with open(file_path, "w", encoding="utf-8") as f: f.write(cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0]).text_area.get("1.0", "end-1c"))
             cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0]).text_area.edit_modified(False)
@@ -451,31 +603,81 @@ class PriestyCode(tk.Tk):
     def _save_file_as(self, event=None, index=None) -> bool:
         idx = self.current_tab_index if index is None else index
         if not (0 <= idx < len(self.open_files)): return False
-        new_path = filedialog.asksaveasfilename(initialdir=self.workspace_root_dir, defaultextension=".py", filetypes=[("Python", "*.py")])
+        
+        old_path = self.open_files[idx]
+        initial_file = os.path.basename(old_path) if old_path != "sandbox.py" else "sandbox.py"
+
+        new_path = filedialog.asksaveasfilename(initialdir=self.workspace_root_dir, 
+                                                initialfile=initial_file,
+                                                defaultextension=".py", 
+                                                filetypes=[("Python", "*.py"), ("All files", "*.*")])
         if not new_path: return False
         try:
             with open(new_path, "w", encoding="utf-8") as f: f.write(cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0]).text_area.get("1.0", "end-1c"))
-            self.handle_file_rename(self.open_files[idx], new_path); self.file_explorer.populate_tree()
+            
+            # If saving an existing file, it's a rename. Otherwise, it's a new file.
+            if not old_path.startswith("Untitled-"):
+                self.handle_file_rename(old_path, new_path)
+            else: # First time save for untitled/sandbox
+                self.open_files[idx] = new_path
+                editor = cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0])
+                editor.set_file_path(new_path)
+                editor.text_area.edit_modified(False)
+                # Update tab UI
+                tab_label = cast(tk.Label, self.tab_widgets[idx].winfo_children()[1])
+                tab_label.config(text=os.path.basename(new_path))
+                if idx == self.current_tab_index:
+                    self._update_file_header(new_path)
+
+            self.file_explorer.populate_tree()
             return True
         except Exception as e: messagebox.showerror("Save Error", f"Failed to save: {e}"); return False
 
     def _run_code(self, event=None):
         if self.is_running: self._stop_code(); return
-        if not self.active_editor or not self.current_open_file: messagebox.showerror("No File", "Please open a file to run."); return
-        if self.current_open_file.startswith("Untitled-") or self.active_editor.text_area.edit_modified():
-            if not self._save_file(): messagebox.showwarning("Run Cancelled", "File must be saved before running."); return
+        if not self.active_editor or not self.current_open_file:
+            messagebox.showerror("No File", "Please open a file to run.")
+            return
 
-        self.active_editor.clear_error_highlight(); self.terminal_console.clear(); self.error_console.clear()
+        is_sandbox = self.current_open_file == "sandbox.py"
+        
+        if not is_sandbox and (self.current_open_file.startswith("Untitled-") or self.active_editor.text_area.edit_modified()):
+            if not self._save_file():
+                messagebox.showwarning("Run Cancelled", "File must be saved before running.")
+                return
+
+        run_terminal = self._get_run_terminal()
+        self.active_editor.clear_error_highlight(); run_terminal.clear(); self.error_console.clear()
         self.stderr_buffer, self.stdout_buffer, self.is_running = "", "", True
-        self._update_run_stop_button_state(); self.terminal_console.set_interactive_mode(True)
-        self.output_notebook.select(self.terminal_console); self.terminal_console.text.focus_set()
-        threading.Thread(target=self._execute_in_thread, daemon=True).start()
+        self._update_run_stop_button_state(); run_terminal.set_interactive_mode(True)
+        self.output_notebook.select(0)
+        self._switch_terminal(run_terminal)
+        
+        file_to_run = None
+        if is_sandbox:
+            try:
+                # Use a temporary file for sandbox execution
+                temp_file = tempfile.NamedTemporaryFile(mode='w+', suffix='.py', delete=False, encoding='utf-8')
+                temp_file.write(self.active_editor.text_area.get("1.0", "end-1c"))
+                temp_file.close()
+                self.temp_run_file = temp_file.name
+                file_to_run = self.temp_run_file
+            except Exception as e:
+                messagebox.showerror("Sandbox Error", f"Could not create temporary file for sandbox: {e}")
+                self._cleanup_after_run()
+                return
+        
+        threading.Thread(target=self._execute_in_thread, args=(file_to_run,), daemon=True).start()
 
-    def _start_process_and_threads(self, executable_path):
-        if not self.current_open_file: self.output_queue.put((PROCESS_ERROR_SIGNAL, "No file to run.")); return
+    def _start_process_and_threads(self, executable_path, file_path_to_run):
         env = os.environ.copy(); env["PYTHONUNBUFFERED"] = "1"; env["PYTHONUTF8"] = "1"
         try:
-            self.process = subprocess.Popen([executable_path, self.current_open_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True, cwd=os.path.dirname(self.current_open_file), creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0, encoding='utf-8', errors='replace', bufsize=1, env=env)
+            # For sandbox, run in workspace root. For files, run in their own dir.
+            cwd = self.workspace_root_dir if os.path.basename(file_path_to_run).startswith("tmp") else os.path.dirname(file_path_to_run)
+
+            self.process = subprocess.Popen([executable_path, file_path_to_run], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True, cwd=cwd, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0, encoding='utf-8', errors='replace', bufsize=1, env=env)
+            
+            # Start threads to read stdout, stderr, write stdin, and monitor process
             threading.Thread(target=self._read_stream_to_queue, args=(self.process.stdout, "stdout_tag"), daemon=True).start()
             threading.Thread(target=self._read_stream_to_queue, args=(self.process.stderr, "stderr_tag"), daemon=True).start()
             threading.Thread(target=self._write_to_stdin, daemon=True).start()
@@ -485,8 +687,13 @@ class PriestyCode(tk.Tk):
     def _monitor_process(self):
         if self.process: self.output_queue.put((PROCESS_END_SIGNAL, self.process.wait()))
 
-    def _execute_in_thread(self):
-        try: self._start_process_and_threads(self.python_executable)
+    def _execute_in_thread(self, file_to_run_override=None):
+        file_path = file_to_run_override or self.current_open_file
+        if not file_path:
+            self.output_queue.put((PROCESS_ERROR_SIGNAL, "No file to run."))
+            return
+            
+        try: self._start_process_and_threads(self.python_executable, file_path)
         except Exception as e: self.output_queue.put((PROCESS_ERROR_SIGNAL, str(e)))
     
     def _read_stream_to_queue(self, stream, tag):
@@ -504,20 +711,37 @@ class PriestyCode(tk.Tk):
             except (IOError, ValueError): break
 
     def _stop_code(self, event=None):
-        if not self.process or self.process.poll() is not None: self.is_running = False; self._update_run_stop_button_state(); return
-        self.is_running = False; self.terminal_console.set_interactive_mode(False)
+        if not self.process or self.process.poll() is not None:
+            self._cleanup_after_run()
+            return
+        
+        run_terminal = self._get_run_terminal()
+        run_terminal.set_interactive_mode(False)
         while not self.stdin_queue.empty():
             try: self.stdin_queue.get_nowait()
             except queue.Empty: break
-        try: self.process.terminate(); self.process.wait(timeout=2); self.terminal_console.write("\n--- Process terminated ---\n", ("stderr_tag",))
-        except: self.process.kill(); self.terminal_console.write("\n--- Process killed ---\n", ("stderr_tag",))
-        self.process = None; self._update_run_stop_button_state(); self.terminal_console.show_prompt() 
+        try: self.process.terminate(); self.process.wait(timeout=2); run_terminal.write("\n--- Process terminated ---\n", ("stderr_tag",))
+        except: self.process.kill(); run_terminal.write("\n--- Process killed ---\n", ("stderr_tag",))
+        
+        self.process = None
+        self._cleanup_after_run()
+        run_terminal.show_prompt() 
+
+    def _cleanup_after_run(self):
+        self.is_running = False
+        self._update_run_stop_button_state()
+        if self.temp_run_file:
+            try:
+                os.remove(self.temp_run_file)
+            except OSError as e:
+                print(f"Error cleaning up temp file: {e}")
+            finally:
+                self.temp_run_file = None
 
     def _update_run_stop_button_state(self):
         if self.is_running: icon, cmd, text = self.pause_icon, self._stop_code, "Stop"
         else: icon, cmd, text = self.run_icon, self._run_code, "Run"
         self.run_stop_button.config(command=cmd)
-        # FIX 2: Explicitly check for icon to satisfy type checker
         if icon: self.run_stop_button.config(image=icon)
         else: self.run_stop_button.config(text=text)
 
@@ -529,27 +753,57 @@ class PriestyCode(tk.Tk):
     def _show_about(self):
         messagebox.showinfo("About PriestyCode", "PriestyCode v1.0.0\nA simple, extensible IDE.\n\nCreated with Python and Tkinter.")
 
-    def _clear_console(self):
-        self.terminal_console.clear(); self.error_console.clear()
-        if not self.terminal_console.interactive_mode: self.terminal_console.show_prompt()
+    def _clear_active_output_view(self):
+        try:
+            selected_tab_text = self.output_notebook.tab(self.output_notebook.select(), "text")
+            if selected_tab_text == "TERMINAL":
+                if self.active_terminal and hasattr(self.active_terminal, 'clear'):
+                    self.active_terminal.clear()
+                    if not self.active_terminal.interactive_mode:
+                        self.active_terminal.show_prompt()
+            elif selected_tab_text == "ERRORS":
+                if hasattr(self.error_console, 'clear'):
+                    self.error_console.clear()
+        except tk.TclError:
+            pass # No tab selected
+
+    def _open_external_terminal(self):
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(f'start cmd /K "cd /d {self.workspace_root_dir}"', shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(['open', '-a', 'Terminal', self.workspace_root_dir])
+            else: # Linux
+                try:
+                    subprocess.Popen(['gnome-terminal', '--working-directory', self.workspace_root_dir])
+                except FileNotFoundError:
+                    try:
+                        subprocess.Popen(['konsole', '--workdir', self.workspace_root_dir])
+                    except FileNotFoundError:
+                        subprocess.Popen(['xterm', '-e', f'cd "{self.workspace_root_dir}"; bash'])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open external terminal: {e}")
 
     def _process_output_queue(self):
+        run_terminal = self._get_run_terminal()
         try:
             while not self.output_queue.empty():
                 char, tag = self.output_queue.get_nowait()
                 if char == PROCESS_END_SIGNAL:
-                    self.is_running = False; self._update_run_stop_button_state(); self.terminal_console.set_interactive_mode(False)
+                    self._cleanup_after_run()
+                    run_terminal.set_interactive_mode(False)
                     if isinstance(tag, int): # Check if tag is the integer return code
                         full_traceback = self.stderr_buffer + self.stdout_buffer
                         if tag != 0 and "Traceback" in self.stderr_buffer: self._handle_error_output(self.stderr_buffer, "Runtime Error", "reactive")
                         elif tag == 0 and "Traceback" in full_traceback and self.highlight_handled_exceptions.get(): self._handle_error_output(full_traceback, "Handled Exception", "handled")
-                        elif tag != 0 and self.stderr_buffer.strip(): self.error_console.display_error("Execution Error", self.stderr_buffer.strip()); self.output_notebook.select(self.error_console)
+                        elif tag != 0 and self.stderr_buffer.strip(): self.error_console.display_error("Execution Error", self.stderr_buffer.strip()); self.output_notebook.select(1)
                     self.stderr_buffer, self.stdout_buffer = "", ""
                 elif char == PROCESS_ERROR_SIGNAL:
-                    self.is_running = False; self._update_run_stop_button_state(); self.terminal_console.set_interactive_mode(False)
-                    self.error_console.display_error("Execution Error", str(tag)); self.output_notebook.select(self.error_console)
+                    self._cleanup_after_run()
+                    run_terminal.set_interactive_mode(False)
+                    self.error_console.display_error("Execution Error", str(tag)); self.output_notebook.select(1)
                 else:
-                    self.terminal_console.write(char, (str(tag),))
+                    run_terminal.write(char, (str(tag),))
                     if tag == "stderr_tag": self.stderr_buffer += char
                     elif tag == "stdout_tag": self.stdout_buffer += char
         except queue.Empty: pass
@@ -560,17 +814,34 @@ class PriestyCode(tk.Tk):
         traceback_matches = list(re.finditer(r'File "(.*?)", line (\d+)', full_error_text))
         if traceback_matches:
             file_path, line_num = traceback_matches[-1].groups()
+            
+            # For sandbox, the path will be a temp file. We need to map it back.
+            is_temp_file = self.temp_run_file and os.path.normcase(file_path) == os.path.normcase(self.temp_run_file)
+            
             last_line = full_error_text.strip().split('\n')[-1]
             error_title = last_line.split(':')[0] if 'Error' in last_line or 'Exception' in last_line else default_title
-            norm_error_path = os.path.normcase(os.path.abspath(file_path))
-            for i, open_path in enumerate(self.open_files):
-                if open_path and os.path.normcase(os.path.abspath(open_path)) == norm_error_path:
-                    editor = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
-                    highlight_method = getattr(editor, f"highlight_{highlight_type}_error", None)
-                    if highlight_method: self.after(0, highlight_method, int(line_num), full_error_text)
-                    break
-            self.error_console.display_error(error_title, full_error_text); self.output_notebook.select(self.error_console)
-        else: self.error_console.display_error(default_title, full_error_text); self.output_notebook.select(self.error_console)
+            
+            if is_temp_file:
+                # Find the sandbox editor
+                for i, open_path in enumerate(self.open_files):
+                    if open_path == "sandbox.py":
+                        editor = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
+                        highlight_method = getattr(editor, f"highlight_{highlight_type}_error", None)
+                        if highlight_method: self.after(0, highlight_method, int(line_num), full_error_text)
+                        break
+            else:
+                # Normal file path matching
+                norm_error_path = os.path.normcase(os.path.abspath(file_path))
+                for i, open_path in enumerate(self.open_files):
+                    if open_path and os.path.normcase(os.path.abspath(open_path)) == norm_error_path:
+                        editor = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
+                        highlight_method = getattr(editor, f"highlight_{highlight_type}_error", None)
+                        if highlight_method: self.after(0, highlight_method, int(line_num), full_error_text)
+                        break
+                        
+            self.error_console.display_error(error_title, full_error_text); self.output_notebook.select(1)
+        else: 
+            self.error_console.display_error(default_title, full_error_text); self.output_notebook.select(1)
 
     def run(self): self.protocol("WM_DELETE_WINDOW", self._on_closing); self.mainloop()
         
@@ -724,4 +995,4 @@ class FindReplaceDialog(tk.Toplevel):
     def close_dialog(self):
         # Clean up selection when closing
         self.text_area.tag_remove("sel", "1.0", tk.END)
-        self.destroy()  
+        self.destroy()

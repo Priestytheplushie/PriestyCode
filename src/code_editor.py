@@ -200,7 +200,7 @@ class CodeEditor(tk.Frame):
         self.error_tooltip_text = "" # Stores the current error message for the tooltip
         
         self.autocomplete_manager = AutocompleteManager(self, icons=autocomplete_icons)
-        self.file_path: str | None = None # Added for Bug 5: Stores the path of the current file
+        self.file_path: str | None = None
         self._configure_autocomplete_data()
         self._configure_tags_and_tooltips()
 
@@ -212,14 +212,18 @@ class CodeEditor(tk.Frame):
         self.text_area.bind("<Button-4>", self._on_mouse_scroll) # Linux scroll up
         self.text_area.bind("<Button-5>", self._on_mouse_scroll) # Linux scroll down
         self.text_area.bind("<Button-1>", self._on_click) # Hide autocomplete on click
-        self.text_area.bind("<Return>", self._on_return_key) # Handle Enter key (Bug 2)
-        self.text_area.bind("<Tab>", self._on_tab) # Handle Tab key
-        self.text_area.bind("<BackSpace>", self._on_backspace) # Handle Backspace
-        self.text_area.bind("<Control-BackSpace>", self._on_ctrl_backspace) # FIX 3: Handle Ctrl+Backspace
-        # Auto-completion for brackets/parentheses
+        self.text_area.bind("<Return>", self._on_return_key)
+        self.text_area.bind("<Tab>", self._on_tab)
+        self.text_area.bind("<BackSpace>", self._on_backspace)
+        self.text_area.bind("<Control-BackSpace>", self._on_ctrl_backspace)
+        
+        # Auto-completion for brackets/parentheses/quotes
         self.text_area.bind("(", lambda event: self._auto_complete_brackets(event, '(', ')'))
         self.text_area.bind("[", lambda event: self._auto_complete_brackets(event, '[', ']'))
         self.text_area.bind("{", lambda event: self._auto_complete_brackets(event, '{', '}'))
+        self.text_area.bind('"', lambda event: self._auto_complete_brackets(event, '"', '"'))
+        self.text_area.bind("'", lambda event: self._auto_complete_brackets(event, "'", "'"))
+
         self.text_area.bind(".", self._on_dot_key) # Context-aware autocomplete trigger
         self.text_area.bind("<Escape>", self._on_escape) # Hide autocomplete on escape
         self.text_area.bind("<Up>", self._on_arrow_up) # Navigate autocomplete list
@@ -229,7 +233,7 @@ class CodeEditor(tk.Frame):
         self.apply_syntax_highlighting()
 
     def set_file_path(self, path: str):
-        """Sets the file path associated with this editor instance (Bug 5)."""
+        """Sets the file path associated with this editor instance."""
         self.file_path = path
 
     def set_proactive_error_checking(self, is_active):
@@ -652,6 +656,7 @@ class CodeEditor(tk.Frame):
         
         completions = []
         labels_so_far = set()
+        current_word_lower = current_word.lower()
 
         def add_completion(item):
             if item['label'] not in labels_so_far:
@@ -659,17 +664,17 @@ class CodeEditor(tk.Frame):
                 labels_so_far.add(item['label'])
         
         for s in self.snippets:
-            if s['match'].startswith(current_word): add_completion(s)
+            if s['match'].lower().startswith(current_word_lower): add_completion(s)
         for k in self.keyword_list:
-            if k.startswith(current_word): add_completion({'label': k, 'type': 'keyword', 'insert': k, 'detail': 'Python keyword.'})
+            if k.lower().startswith(current_word_lower): add_completion({'label': k, 'type': 'keyword', 'insert': k, 'detail': 'Python keyword.'})
         for f in self.builtin_list:
-            if f.startswith(current_word): add_completion({'label': f, 'type': 'function', 'insert': f, 'detail': self.builtin_tooltips.get(f, 'Built-in Python function.')})
+            if f.lower().startswith(current_word_lower): add_completion({'label': f, 'type': 'function', 'insert': f, 'detail': self.builtin_tooltips.get(f, 'Built-in Python function.')})
         for e in self.exception_list:
-            if e.startswith(current_word): add_completion({'label': e, 'type': 'class', 'insert': e, 'detail': self.exception_tooltips.get(e, 'Built-in Python exception.')})
+            if e.lower().startswith(current_word_lower): add_completion({'label': e, 'type': 'class', 'insert': e, 'detail': self.exception_tooltips.get(e, 'Built-in Python exception.')})
         for m in self.standard_libraries:
-            if m.startswith(current_word): add_completion({'label': m, 'type': 'class', 'insert': m, 'detail': self.standard_libraries[m].get('tooltip', 'Standard library module.')})
+            if m.lower().startswith(current_word_lower): add_completion({'label': m, 'type': 'class', 'insert': m, 'detail': self.standard_libraries[m].get('tooltip', 'Standard library module.')})
         for w in sorted(list(words_in_doc)):
-            if w.startswith(current_word) and len(w) > len(current_word): add_completion({'label': w, 'type': 'variable', 'insert': w, 'detail': 'Variable from current document.'})
+            if w.lower().startswith(current_word_lower) and len(w) > len(current_word): add_completion({'label': w, 'type': 'variable', 'insert': w, 'detail': 'Variable from current document.'})
         
         completions.sort(key=lambda x: x['label'])
 
@@ -741,15 +746,28 @@ class CodeEditor(tk.Frame):
     def _auto_indent(self, event):
         self.text_area.edit_separator()
         current_index = self.text_area.index(tk.INSERT)
-        line_num_str, _ = current_index.split('.')
+        line_num_str, col_str = current_index.split('.')
+        
         prev_line_index = f"{line_num_str}.0 - 1 lines"
         prev_line_content = self.text_area.get(prev_line_index, f"{prev_line_index} lineend")
-        indent_to_insert = ""
-        if prev_line_content:
-            prev_indent_match = re.match(r'^(\s*)', prev_line_content)
-            if prev_indent_match: indent_to_insert = prev_indent_match.group(1)
-            if prev_line_content.strip().endswith(':'): indent_to_insert += "    "
-        self.text_area.insert(tk.INSERT, f"\n{indent_to_insert}")
+        
+        current_indent = ""
+        prev_indent_match = re.match(r'^(\s*)', prev_line_content)
+        if prev_indent_match:
+            current_indent = prev_indent_match.group(1)
+
+        new_indent = current_indent
+        if prev_line_content.strip().endswith(':'):
+            new_indent += "    "
+        
+        # Handle de-denting for else/elif/except/finally
+        text_before_cursor = self.text_area.get(f"{line_num_str}.0", f"{line_num_str}.{col_str}").strip()
+        de_indent_keywords = ('elif', 'else', 'except', 'finally')
+        if text_before_cursor in de_indent_keywords and new_indent == current_indent:
+            if len(new_indent) >= 4:
+                new_indent = new_indent[:-4]
+
+        self.text_area.insert(tk.INSERT, f"\n{new_indent}")
         self._proactive_syntax_check()
         self.last_action_was_autocomplete = True
         return "break"

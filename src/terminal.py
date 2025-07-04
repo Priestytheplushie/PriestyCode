@@ -19,6 +19,7 @@ class Terminal(tk.Frame):
         self.stdin_queue = stdin_queue
         self.process = None
         self.interactive_mode = False
+        self.display_name_widget: tk.Label | None = None
 
         self.text = scrolledtext.ScrolledText(
             self, wrap="word", bg="#1E1E1E", fg="#CCCCCC",

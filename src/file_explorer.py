@@ -9,7 +9,7 @@ import subprocess
 
 class FileExplorer(tk.Frame):
     def __init__(self, master, parent, project_root, open_file_callback,
-                 folder_icon=None, python_icon=None, git_icon=None, unknown_icon=None, txt_icon=None):
+                 folder_icon=None, python_icon=None, git_icon=None, unknown_icon=None, txt_icon=None, md_icon=None):
         super().__init__(master, bg="#2B2B2B")
         self.parent = parent # The main PriestyCode instance
         self.project_root = project_root
@@ -20,6 +20,7 @@ class FileExplorer(tk.Frame):
         self.git_icon = git_icon
         self.unknown_icon = unknown_icon
         self.txt_icon = txt_icon
+        self.md_icon = md_icon
 
         self.tree = ttk.Treeview(self, show="tree", selectmode="browse")
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
@@ -90,9 +91,9 @@ class FileExplorer(tk.Frame):
                     icon = self.unknown_icon
                     if file_extension == '.py': icon = self.python_icon
                     elif file_extension == '.txt': icon = self.txt_icon
+                    elif file_extension == '.md': icon = self.md_icon
                     elif item.lower() in ['.gitignore', '.gitattributes', '.gitmodules', 'readme.md']: icon = self.git_icon
                     
-                    # FIX 1 & 2: Use a non-conflicting tag name and check if icon is None
                     insert_kwargs = {'parent': parent_node, 'index': "end", 'iid': full_path, 'text': item, 'tags': ('file_item',)}
                     if icon:
                         insert_kwargs['image'] = icon
@@ -102,13 +103,13 @@ class FileExplorer(tk.Frame):
 
     def _show_context_menu(self, event):
         item_id = self.tree.identify_row(event.y)
-        if not item_id: return
-
-        self.tree.selection_set(item_id)
+        if item_id:
+            self.tree.selection_set(item_id)
+        
         self.context_menu.delete(0, "end")
         
-        is_file = os.path.isfile(item_id)
-        is_dir = os.path.isdir(item_id)
+        is_file = item_id and os.path.isfile(item_id)
+        is_dir = item_id and os.path.isdir(item_id)
         
         if is_file and item_id.endswith(".py"):
             self.context_menu.add_command(label="Run", command=lambda: self._run_item(item_id))
@@ -121,10 +122,65 @@ class FileExplorer(tk.Frame):
             self.context_menu.add_separator()
             self.context_menu.add_command(label="Reveal in File Explorer", command=lambda: self._open_in_explorer(item_id))
 
+        target_dir = None
+        if is_dir:
+            target_dir = item_id
+        elif not item_id: # Clicked on empty space
+            target_dir = self.project_root
+
+        if target_dir:
+            if self.context_menu.index("end") is not None:
+                self.context_menu.add_separator()
+            
+            new_menu = tk.Menu(self.context_menu, tearoff=0, bg="#3C3C3C", fg="white",
+                               activebackground="#555555", activeforeground="white")
+            new_menu.add_command(label="Python File (.py)", command=lambda: self._create_new_file(target_dir, ".py"))
+            new_menu.add_command(label="Markdown File (.md)", command=lambda: self._create_new_file(target_dir, ".md", "# New Markdown File\n"))
+            new_menu.add_command(label="Text File (.txt)", command=lambda: self._create_new_file(target_dir, ".txt"))
+            
+            self.context_menu.add_cascade(label="New File...", menu=new_menu)
+            self.context_menu.add_command(label="New Folder", command=lambda: self._create_new_folder(target_dir))
+
+        if self.context_menu.index("end") is not None:
+            try:
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.context_menu.grab_release()
+
+    def _create_new_file(self, target_dir, extension, default_content=""):
+        name = simpledialog.askstring("New File", f"Enter name for new {extension} file:", parent=self)
+        if not name: return
+
+        if not name.endswith(extension):
+            name += extension
+        
+        new_path = os.path.join(target_dir, name)
+        if os.path.exists(new_path):
+            messagebox.showerror("Error", "A file with that name already exists.", parent=self)
+            return
+
         try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+            with open(new_path, "w", encoding="utf-8") as f:
+                f.write(default_content)
+            self.populate_tree()
+            self.open_file_callback(new_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create file: {e}", parent=self)
+            
+    def _create_new_folder(self, target_dir):
+        name = simpledialog.askstring("New Folder", "Enter name for new folder:", parent=self)
+        if not name: return
+
+        new_path = os.path.join(target_dir, name)
+        if os.path.exists(new_path):
+            messagebox.showerror("Error", "A folder with that name already exists.", parent=self)
+            return
+
+        try:
+            os.makedirs(new_path)
+            self.populate_tree()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create folder: {e}", parent=self)
 
     def move_item(self, item_id):
         initial_dir = os.path.dirname(os.path.dirname(item_id))
