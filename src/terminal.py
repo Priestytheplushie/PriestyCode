@@ -5,113 +5,127 @@ import queue
 import os
 
 class Terminal(tk.Frame):
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, stdin_queue: queue.Queue, **kwargs):
         super().__init__(parent, **kwargs)
         self.config(bg="#1E1E1E")
 
         self.text = tk.Text(self, bg="#1E1E1E", fg="#CCCCCC", insertbackground="white",
-                            selectbackground="#4E4E4E", font=("Consolas", 10), undo=True)
+                            selectbackground="#4E4E4E", font=("Consolas", 10), undo=True,
+                            borderwidth=0, highlightthickness=0)
         self.text.pack(fill="both", expand=True)
 
         self.text.bind("<Return>", self._on_enter)
+        self.text.bind("<Button-1>", lambda e: self.after(10, self.text.focus_set))
+        
         self.output_queue = queue.Queue()
+        self.stdin_queue = stdin_queue
 
         self.cwd = os.getcwd()
-        self.text.insert(tk.END, f"\n{self.cwd}> ")
-
-        self.process = None
-        self.error_callback = None
-        self.on_execution_start = None
-        self.on_execution_finish = None
+        self.interactive_mode = False
+        
+        self.input_start_mark = "input_start_mark"
+        self.text.mark_set(self.input_start_mark, "1.0")
+        self.text.mark_gravity(self.input_start_mark, "left")
 
         self.after(100, self._process_output_queue)
+        self.show_prompt()
 
-    def stop(self):
-        """Stops the currently running subprocess, if any."""
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.kill()
-                self.output_queue.put("\n--- Process terminated by user ---\n")
-            except Exception as e:
-                self.output_queue.put(f"\nError terminating process: {e}\n")
+    def set_interactive_mode(self, is_interactive: bool):
+        self.interactive_mode = is_interactive
+        if is_interactive:
+            self.text.mark_set(self.input_start_mark, tk.END)
+        if not is_interactive:
+            self.after(100, self.show_prompt)
 
     def _on_enter(self, event):
-        # Allow user to enter commands in the terminal
-        command_start_index = self.text.search(f"{self.cwd}> ", "insert linestart", backwards=True)
-        if command_start_index:
-            command = self.text.get(f"{command_start_index} + {len(self.cwd)+2}c", "insert")
-        else:
-            command = self.text.get("insert linestart", "insert").strip()
+        if self.interactive_mode:
+            user_input = self.text.get(self.input_start_mark, "insert")
+            self.stdin_queue.put(user_input + "\n")
+            self.text.insert(tk.END, "\n")
+            self.text.see(tk.END)
+            self.text.mark_set(self.input_start_mark, tk.END)
+            return "break"
 
+        if self.text.compare("insert", "<", "end-1l linestart"):
+            self.text.mark_set(tk.INSERT, tk.END)
+            return "break"
+
+        last_prompt_pos = self.text.search(">", "1.0", tk.END, backwards=True)
+        if not last_prompt_pos:
+            return "break"
+        
+        command_start_pos = self.text.index(f"{last_prompt_pos} + 2c")
+        command = self.text.get(command_start_pos, "end-1c").strip()
+        
         self.text.insert(tk.END, "\n")
-        self.execute_command(command)
+        self.text.see(tk.END)
+
+        if command:
+            self._execute_command(command)
+        else:
+            self.show_prompt()
+            
         return "break"
 
-    def execute_command(self, command):
-        if not command:
-            self.text.insert(tk.END, f"{self.cwd}> ")
-            return
-        
-        # Use a thread to run the command, keeping the UI responsive
-        threading.Thread(target=self._run_in_thread, args=(command,), daemon=True).start()
+    def _execute_command(self, command):
+        threading.Thread(target=self._run_shell_command, args=(command,), daemon=True).start()
 
-    def _run_in_thread(self, command):
-        if self.on_execution_start:
-            self.on_execution_start()
-        
+    def _run_shell_command(self, command):
         try:
-            # Handle 'cd' command separately as it's a shell built-in
-            if command.strip().startswith("cd "):
-                new_dir = command.strip()[3:].strip()
-                try:
-                    os.chdir(new_dir)
-                    self.cwd = os.getcwd()
-                except FileNotFoundError:
-                     self.output_queue.put(f"cd: no such file or directory: {new_dir}\n")
-                except Exception as e:
-                     self.output_queue.put(str(e) + "\n")
+            if command.strip().lower().startswith("cd "):
+                new_dir = command.strip()[3:]
+                try: os.chdir(os.path.join(self.cwd, new_dir)); self.cwd = os.getcwd()
+                except FileNotFoundError as e: self.output_queue.put(str(e) + "\n")
+                self.show_prompt()
                 return
 
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                            shell=True, text=True, cwd=self.cwd, encoding='utf-8', bufsize=1)
-
-            # Threads to read stdout and stderr without blocking
-            stdout_thread = threading.Thread(target=self._read_stream, args=(self.process.stdout,), daemon=True)
-            stderr_thread = threading.Thread(target=self._read_stream, args=(self.process.stderr,), daemon=True)
-            stdout_thread.start()
-            stderr_thread.start()
-            
-            # Wait for the process to complete
-            self.process.wait()
-            stdout_thread.join()
-            stderr_thread.join()
-            
-            # Capture final stderr for error parsing
-            _, stderr_output = self.process.communicate()
-            if stderr_output and self.error_callback:
-                self.error_callback(stderr_output)
-
+            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=self.cwd)
+            stdout, stderr = process.communicate()
+            if stdout: self.output_queue.put(stdout)
+            if stderr: self.output_queue.put(stderr)
+            self.show_prompt()
         except Exception as e:
-            self.output_queue.put(str(e) + "\n")
-        finally:
-            self.process = None
-            self.output_queue.put(f"{self.cwd}> ")
-            if self.on_execution_finish:
-                self.on_execution_finish()
-    
-    def _read_stream(self, stream):
-        """Reads lines from a stream and puts them in the output queue."""
-        for line in iter(stream.readline, ''):
-            self.output_queue.put(line)
-        stream.close()
+            self.output_queue.put(f"Error: {e}\n")
+            self.show_prompt()
+
+    def write(self, text, tag=None):
+        self.output_queue.put((text, tag))
 
     def _process_output_queue(self):
         try:
             while True:
-                line = self.output_queue.get_nowait()
-                self.text.insert(tk.END, line)
+                item = self.output_queue.get_nowait()
+                self.text.config(state="normal")
+                text_to_insert, tag_to_apply = ("", None)
+
+                if isinstance(item, tuple):
+                    text_to_insert, tag_to_apply = item
+                else:
+                    text_to_insert = str(item)
+                
+                if tag_to_apply:
+                    self.text.insert(tk.END, text_to_insert, tag_to_apply)
+                else:
+                    self.text.insert(tk.END, text_to_insert)
+
                 self.text.see(tk.END)
+                
+                if self.interactive_mode:
+                    self.text.mark_set(self.input_start_mark, tk.END)
+
+                self.text.config(state="normal")
         except queue.Empty:
             pass
         finally:
             self.after(100, self._process_output_queue)
+
+    def show_prompt(self):
+        if not self.interactive_mode:
+            self.output_queue.put(f"\n{self.cwd}> ")
+
+    def clear(self):
+        self.text.config(state="normal")
+        self.text.delete("1.0", tk.END)
+        if not self.interactive_mode:
+            self.show_prompt()
+        self.text.see(tk.END)
