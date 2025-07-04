@@ -215,6 +215,7 @@ class CodeEditor(tk.Frame):
         self.text_area.bind("<Return>", self._on_return_key) # Handle Enter key (Bug 2)
         self.text_area.bind("<Tab>", self._on_tab) # Handle Tab key
         self.text_area.bind("<BackSpace>", self._on_backspace) # Handle Backspace
+        self.text_area.bind("<Control-BackSpace>", self._on_ctrl_backspace) # FIX 3: Handle Ctrl+Backspace
         # Auto-completion for brackets/parentheses
         self.text_area.bind("(", lambda event: self._auto_complete_brackets(event, '(', ')'))
         self.text_area.bind("[", lambda event: self._auto_complete_brackets(event, '[', ']'))
@@ -312,8 +313,37 @@ class CodeEditor(tk.Frame):
             {'label': 'with (file)', 'match': 'with', 'type': 'snippet', 'detail': "Open a file safely.\n\nwith open('file.txt', 'r') as f:\n    content = f.read()", 'insert': "with open('file.txt', 'r') as f:\n    pass"},
             {'label': 'main', 'match': 'main', 'type': 'snippet', 'detail': 'Standard main execution block.\n\nif __name__ == "__main__":\n    # code here', 'insert': 'if __name__ == "__main__":\n    pass'},
             {'label': '__str__', 'match': '__str__', 'type': 'snippet', 'detail': 'Define the string representation of an object.', 'insert': 'def __str__(self):\n    return super().__str__()'},
-            {'label': 'docstring', 'match': 'doc', 'type': 'snippet', 'detail': 'Create a standard docstring for a function or class.', 'insert': '"""\n\n"""'}
+            {'label': 'docstring', 'match': 'doc', 'type': 'snippet', 'detail': 'Create a standard docstring for a function or class.', 'insert': '"""\n\n"""'},
+            {'label': 'list comprehension', 'match': 'for', 'type': 'snippet', 'detail': 'List comprehension to generate a list.\n\n[expression for item in iterable]', 'insert': '[x for x in iterable]'},
+            {'label': 'enumerate loop', 'match': 'for', 'type': 'snippet', 'detail': 'Enumerate loop with index and value.\n\nfor i, val in enumerate(iterable):', 'insert': 'for i, val in enumerate(iterable):\n    pass'},
+            {'label': 'property decorator', 'match': '@property', 'type': 'snippet', 'detail': 'Expose method as a read-only property.', 'insert': '@property\ndef attr_name(self):\n    return self._attr_name'},
+            {'label': 'lambda function', 'match': 'lambda', 'type': 'snippet', 'detail': 'Anonymous function.\n\nlambda args: expression', 'insert': 'lambda x: x * 2'},
+            {'label': 'context manager', 'match': 'with', 'type': 'snippet', 'detail': 'Custom context manager class.\n\nclass MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass', 'insert': 'class MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass\n\nwith MyContext() as ctx:\n    pass'},
+            {'label': 'list comprehension', 'match': 'for', 'type': 'snippet', 'detail': 'List comprehension to generate a list.\n\n[expression for item in iterable]', 'insert': '[x for x in iterable]'},
+            {'label': 'enumerate loop', 'match': 'for', 'type': 'snippet', 'detail': 'Enumerate loop with index and value.\n\nfor i, val in enumerate(iterable):', 'insert': 'for i, val in enumerate(iterable):\n    pass'},
+            {'label': 'property decorator', 'match': '@property', 'type': 'snippet', 'detail': 'Expose method as a read-only property.', 'insert': '@property\ndef attr_name(self):\n    return self._attr_name'},
+            {'label': 'lambda function', 'match': 'lambda', 'type': 'snippet', 'detail': 'Anonymous function.\n\nlambda args: expression', 'insert': 'lambda x: x * 2'},
+            {'label': 'context manager', 'match': 'with', 'type': 'snippet', 'detail': 'Custom context manager class.\n\nclass MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass', 'insert': 'class MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass\n\nwith MyContext() as ctx:\n    pass'},
+            {'label': 'classmethod', 'match': 'def', 'type': 'snippet', 'detail': 'Define a class method.\n\n@classmethod\ndef method(cls):', 'insert': '@classmethod\ndef from_something(cls, arg):\n    return cls(arg)'},
+            {'label': 'staticmethod', 'match': 'def', 'type': 'snippet', 'detail': 'Define a static method.\n\n@staticmethod\ndef method():', 'insert': '@staticmethod\ndef util_method(x):\n    return x'},
+            {'label': 'dataclass', 'match': '@dataclass', 'type': 'snippet', 'detail': 'Use Python 3.7+ dataclass decorator.\n\n@dataclass\nclass Name:', 'insert': '@dataclass\nclass MyData:\n    field1: int\n    field2: str'},
+            {'label': 'generator', 'match': 'def', 'type': 'snippet', 'detail': 'Create a generator function.\n\ndef gen():\n    yield item', 'insert': 'def my_generator():\n    for i in range(10):\n        yield i'},
+            {'label': 'list comprehension', 'match': 'for', 'type': 'snippet', 'detail': 'List comprehension to generate a list.\n\n[expression for item in iterable]', 'insert': '[x for x in iterable]'},
+            {'label': 'enumerate loop', 'match': 'for', 'type': 'snippet', 'detail': 'Enumerate loop with index and value.\n\nfor i, val in enumerate(iterable):', 'insert': 'for i, val in enumerate(iterable):\n    pass'},
+            {'label': 'property decorator', 'match': '@property', 'type': 'snippet', 'detail': 'Expose method as a read-only property.', 'insert': '@property\ndef attr_name(self):\n    return self._attr_name'},
+            {'label': 'lambda function', 'match': 'lambda', 'type': 'snippet', 'detail': 'Anonymous function.\n\nlambda args: expression', 'insert': 'lambda x: x * 2'},
+            {'label': 'context manager', 'match': 'with', 'type': 'snippet', 'detail': 'Custom context manager class.\n\nclass MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass', 'insert': 'class MyContext:\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        pass\n\nwith MyContext() as ctx:\n    pass'},
+            {'label': 'classmethod', 'match': 'def', 'type': 'snippet', 'detail': 'Define a class method.\n\n@classmethod\ndef method(cls):', 'insert': '@classmethod\ndef from_something(cls, arg):\n    return cls(arg)'},
+            {'label': 'staticmethod', 'match': 'def', 'type': 'snippet', 'detail': 'Define a static method.\n\n@staticmethod\ndef method():', 'insert': '@staticmethod\ndef util_method(x):\n    return x'},
+            {'label': 'dataclass', 'match': '@dataclass', 'type': 'snippet', 'detail': 'Use Python 3.7+ dataclass decorator.\n\n@dataclass\nclass Name:', 'insert': '@dataclass\nclass MyData:\n    field1: int\n    field2: str'},
+            {'label': 'generator', 'match': 'def', 'type': 'snippet', 'detail': 'Create a generator function.\n\ndef gen():\n    yield item', 'insert': 'def my_generator():\n    for i in range(10):\n        yield i'},
+            {'label': 'print statement', 'match': 'pri', 'type': 'snippet', 'detail': 'Basic print usage.\n\nprint("message")', 'insert': 'print("Hello, world!")'},
+            {'label': 'input prompt', 'match': 'inp', 'type': 'snippet', 'detail': 'Read user input.\n\ninput("prompt")', 'insert': 'user_input = input("Enter value: ")'},
+            {'label': 'function call', 'match': 'func', 'type': 'snippet', 'detail': 'Call a function with parameters.\n\nfunction_name(args)', 'insert': 'result = my_function(arg1, arg2)'},
+            {'label': 'basic assignment', 'match': 'val', 'type': 'snippet', 'detail': 'Assign a value to a variable.\n\nvar = value', 'insert': 'x = 42'},
+            {'label': 'range loop', 'match': 'for', 'type': 'snippet', 'detail': 'For loop with range.\n\nfor i in range(n):', 'insert': 'for i in range(10):\n    print(i)'}
         ]
+
         self.builtin_list = ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr', 'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple', 'type', 'vars', 'zip']
         self.keyword_list = ['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield']
 
@@ -366,7 +396,8 @@ class CodeEditor(tk.Frame):
             'threading': {'members': ['Thread', 'Lock', 'Event', 'Semaphore', 'current_thread'], 'tooltip': 'Thread-based parallelism.'},
             'collections': {'members': ['defaultdict', 'Counter', 'deque', 'namedtuple', 'OrderedDict'], 'tooltip': 'High-performance container datatypes.'},
             'tkinter': {'members': ['Tk', 'Frame', 'Button', 'Label', 'Entry', 'Text', 'ttk', 'filedialog', 'messagebox'], 'tooltip': 'The standard Python interface to the Tcl/Tk GUI toolkit.'},
-            'traceback': {'members': ['print_exc', 'format_exc', 'extract_stack'], 'tooltip': 'Print or retrieve a stack traceback.'}
+            'traceback': {'members': ['print_exc', 'format_exc', 'extract_stack'], 'tooltip': 'Print or retrieve a stack traceback.'},
+            'time': {'members': ['time', 'sleep', 'asctime','pthread_getcpuclockid, clock_getres, '], 'tooltip': 'Time access and conversions.'}
         }
         self.standard_library_function_tooltips = {
             'os.path': 'Common pathname manipulations.',
@@ -571,7 +602,6 @@ class CodeEditor(tk.Frame):
         self.text_area.insert(current_word_start, text_to_insert)
         self.last_action_was_autocomplete = True
         self.text_area.focus_set()
-        # FIX: Trigger full content re-evaluation to apply highlighting immediately.
         self._on_content_changed()
 
     def _on_backspace(self, event):
@@ -582,6 +612,11 @@ class CodeEditor(tk.Frame):
             return "break"
         self.after(10, self._update_autocomplete_display)
         return None
+    
+    def _on_ctrl_backspace(self, event):
+        """Handles Ctrl+Backspace to delete the previous word."""
+        self.text_area.delete("insert-1c wordstart", "insert")
+        return "break"
 
     def _on_tab(self, event):
         if self.autocomplete_manager.is_visible():
@@ -768,7 +803,6 @@ class CodeEditor(tk.Frame):
         
         # Pass 3: Keywords, Built-ins, and other fixed patterns
         keywords_map = { r"\bif\b": "keyword_if", r"\belse\b": "keyword_else", r"\belif\b": "keyword_elif", r"\bfor\b": "keyword_for", r"\bwhile\b": "keyword_while", r"\breturn\b": "keyword_return", r"\bbreak\b": "keyword_break", r"\bcontinue\b": "keyword_continue", r"\byield\b": "keyword_yield", r"\bpass\b": "keyword_pass", r"\bimport\b": "keyword_import", r"\bfrom\b": "keyword_from", r"\bas\b": "keyword_as", r"\btry\b": "keyword_try", r"\bexcept\b": "keyword_except", r"\bfinally\b": "keyword_finally", r"\braise\b": "keyword_raise", r"\bassert\b": "keyword_assert", r"\bTrue\b": "keyword_True", r"\bFalse\b": "keyword_False", r"\bNone\b": "keyword_None", r"\band\b": "keyword_and", r"\bor\b": "keyword_or", r"\bnot\b": "keyword_not", r"\bin\b": "keyword_in", r"\bis\b": "keyword_is", r"\bdel\b": "keyword_del", r"\bglobal\b": "keyword_global", r"\bnonlocal\b": "keyword_nonlocal", r"\basync\b": "keyword_async", r"\bawait\b": "keyword_await", r"\bwith\b": "keyword_with", r"\blambda\b": "keyword_lambda" }
-        # FIX: Added __str__ and __repr__ to dunder method highlighting.
         static_patterns = { **keywords_map, r"\bPriesty\b": "priesty_keyword", r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"\b(" + "|".join(self.exception_list) + r")\b": "exception_type", r"[(){}[\]]": "bracket_tag", r"\b(__init__|__str__|__repr__)\b": "dunder_method" }
         
         for pattern, tag in static_patterns.items():
@@ -791,11 +825,9 @@ class CodeEditor(tk.Frame):
 
     def _parse_imports(self, content):
         self.imported_aliases.clear()
-        # FIX: More robust regex that doesn't read past the import line.
         # import module, module as alias
         for match in re.finditer(r"^\s*import\s+([^\n]+)", content, re.MULTILINE):
             modules_str = match.group(1).strip()
-            # Handle comments on the same line
             modules_str = modules_str.split('#')[0].strip()
             for part in re.split(r'\s*,\s*', modules_str):
                 if ' as ' in part:
