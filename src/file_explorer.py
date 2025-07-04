@@ -13,6 +13,7 @@ class FileExplorer(tk.Frame):
         self.python_icon = python_icon
         self.git_icon = git_icon
         self.unknown_icon = unknown_icon
+        self.txt_icon = txt_icon  # Store the text icon
 
         self.tree = ttk.Treeview(self, show="tree", selectmode="browse")
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
@@ -34,6 +35,11 @@ class FileExplorer(tk.Frame):
                              foreground="white",
                              font=("Segoe UI", 9, "bold"))
         self.style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])
+
+    def set_project_root(self, path):
+        """Sets a new project root directory and repopulates the tree view."""
+        self.project_root = path
+        self.populate_tree()
 
     def populate_tree(self):
         for i in self.tree.get_children():
@@ -73,6 +79,8 @@ class FileExplorer(tk.Frame):
                     selected_icon = self.unknown_icon
                     if file_extension == '.py':
                         selected_icon = self.python_icon
+                    elif file_extension == '.txt':
+                        selected_icon = self.txt_icon
                     elif item.lower() in ['.gitignore', '.gitattributes', '.gitmodules', 'readme.md']:
                         selected_icon = self.git_icon
                     

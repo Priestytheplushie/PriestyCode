@@ -5,9 +5,10 @@ import re
 import ast
 
 class AutocompleteManager:
-    def __init__(self, editor_instance):
+    def __init__(self, editor_instance, icons=None):
         self.editor = editor_instance
         self.text_area = editor_instance.text_area
+        self.icons = icons if icons is not None else {}
 
         self.window = tk.Toplevel(self.text_area)
         self.window.wm_overrideredirect(True)
@@ -44,6 +45,8 @@ class AutocompleteManager:
         self.style.map('Custom.Treeview', background=[('selected', '#555555')])
         self.tree.config(style="Custom.Treeview")
         
+        self.tree.heading('#0', text='')
+        
         self.tree.tag_configure('variable', foreground='#9CDCFE')
         self.tree.tag_configure('snippet', foreground='#CE9178')
         self.tree.tag_configure('keyword', foreground='#C586C0')
@@ -55,7 +58,7 @@ class AutocompleteManager:
         self.tree.bind('<Double-1>', self.confirm_selection)
 
     def show(self, completions, bbox):
-        if not completions:
+        if not completions or not bbox:
             self.hide()
             return
         
@@ -63,13 +66,18 @@ class AutocompleteManager:
         self.tree.delete(*self.tree.get_children())
 
         for i, item in enumerate(completions):
-            type_char = {
-                'variable': '[v]', 'snippet': '[s]',
-                'keyword': '[k]', 'function': '[f]'
-            }.get(item['type'], '[?]')
+            item_type = item.get('type', 'variable')
             
-            display_text = f" {type_char} {item['label']}"
-            self.tree.insert('', 'end', iid=i, text=display_text, tags=(item['type'],))
+            insert_kwargs = {
+                'iid': i,
+                'text': ' ' + item['label'],
+                'tags': (item_type,)
+            }
+            icon = self.icons.get(item_type)
+            if icon:
+                insert_kwargs['image'] = icon
+
+            self.tree.insert('', 'end', **insert_kwargs)
 
         num_items = len(completions)
         new_height = min(num_items, 10) * 22 + 6
@@ -107,7 +115,11 @@ class AutocompleteManager:
         selected_index = int(selected_ids[0])
         item = self.completions[selected_index]
         
-        preview_content = item.get('detail', '') + "\n\n" + item.get('insert', item['label'])
+        item_type = item.get('type', 'variable').capitalize()
+        detail = item.get('detail', '')
+        preview_content = f"({item_type}) {item.get('label')}\n"
+        if detail:
+            preview_content += f"-----------------\n{detail}"
         
         self.preview_text.config(state="normal")
         self.preview_text.delete("1.0", tk.END)
@@ -140,13 +152,14 @@ class AutocompleteManager:
         return 'break'
 
 class CodeEditor(tk.Frame):
-    def __init__(self, master=None, error_console=None, **kwargs):
+    def __init__(self, master=None, error_console=None, autocomplete_icons=None, **kwargs):
         super().__init__(master, **kwargs)
         self.config(bg="#2B2B2B")
 
         self.error_console = error_console
         self.last_action_was_autocomplete = False
         self.autocomplete_active = True
+        self.proactive_errors_active = True
         self.autocomplete_dismissed_word = None
 
         self.editor_frame = tk.Frame(self, bg="#2B2B2B")
@@ -161,11 +174,11 @@ class CodeEditor(tk.Frame):
         self.tooltip_window = tk.Toplevel(self.text_area)
         self.tooltip_window.wm_overrideredirect(True)
         self.tooltip_window.wm_withdraw()
-        self.tooltip_label = tk.Label(self.tooltip_window, text="", justify='left', background="#3C3C3C", foreground="white", relief='solid', borderwidth=1, wraplength=400, font=("Consolas", 9))
+        self.tooltip_label = tk.Label(self.tooltip_window, text="", justify='left', background="#3C3C3C", foreground="white", relief='solid', borderwidth=1, wraplength=400, font=("Consolas", 9), padx=4, pady=2)
         self.tooltip_label.pack(ipadx=1)
         self.error_tooltip_text = ""
         
-        self.autocomplete_manager = AutocompleteManager(self)
+        self.autocomplete_manager = AutocompleteManager(self, icons=autocomplete_icons)
         self._configure_autocomplete_data()
         self._configure_tags_and_tooltips()
 
@@ -189,6 +202,13 @@ class CodeEditor(tk.Frame):
 
         self.text_area.edit_modified(False)
         self.apply_syntax_highlighting()
+
+    def set_proactive_error_checking(self, is_active):
+        self.proactive_errors_active = is_active
+        if not is_active:
+            self.clear_error_highlight()
+        else:
+            self._proactive_syntax_check()
 
     def _on_escape(self, event):
         if self.autocomplete_manager.is_visible():
@@ -217,16 +237,19 @@ class CodeEditor(tk.Frame):
 
     def _configure_autocomplete_data(self):
         self.snippets = [
-            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'detail': 'Define a new function.', 'insert': 'def function_name(params):\n    pass'},
-            {'label': 'def (constructor)', 'match': 'def', 'type': 'snippet', 'detail': 'Define the constructor for a class.', 'insert': 'def __init__(self):\n    pass'},
-            {'label': 'for', 'match': 'for', 'type': 'snippet', 'detail': 'Create a for loop.', 'insert': 'for item in iterable:\n    pass'},
-            {'label': 'if', 'match': 'if', 'type': 'snippet', 'detail': 'Create an if statement.', 'insert': 'if condition:\n    pass'},
-            {'label': 'if/else', 'match': 'if', 'type': 'snippet', 'detail': 'Create an if/else block.', 'insert': 'if condition:\n    pass\nelse:\n    pass'},
-            {'label': 'class', 'match': 'class', 'type': 'snippet', 'detail': 'Create a new class.', 'insert': 'class NewClass:\n    def __init__(self):\n        pass'},
-            {'label': 'try', 'match': 'try', 'type': 'snippet', 'detail': 'Create a try/except block.', 'insert': 'try:\n    pass\nexcept Exception as e:\n    print(f"An error occurred: {e}")'},
-            {'label': 'with (file)', 'match': 'with', 'type': 'snippet', 'detail': 'Open a file safely.', 'insert': "with open('file.txt', 'r') as f:\n    pass"},
-            {'label': 'main', 'match': 'main', 'type': 'snippet', 'detail': 'Standard main execution block.', 'insert': 'if __name__ == "__main__":\n    pass'},
+            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'detail': 'Define a new function.\n\ndef function_name(params):\n    pass', 'insert': 'def function_name(params):\n    pass'},
+            {'label': 'def (constructor)', 'match': 'def', 'type': 'snippet', 'detail': 'Define the constructor for a class.\n\ndef __init__(self):\n    pass', 'insert': 'def __init__(self):\n    pass'},
+            {'label': 'if', 'match': 'if', 'type': 'snippet', 'detail': 'Create an if statement.\n\nif condition:\n    pass', 'insert': 'if condition:\n    pass'},
+            {'label': 'if/else', 'match': 'if', 'type': 'snippet', 'detail': 'Create an if/else block.\n\nif condition:\n    pass\nelse:\n    pass', 'insert': 'if condition:\n    pass\nelse:\n    pass'},
+            {'label': 'if/elif/else', 'match': 'if', 'type': 'snippet', 'detail': 'Create an if/elif/else block.\n\nif condition1:\n    pass\nelif condition2:\n    pass\nelse:\n    pass', 'insert': 'if condition1:\n    pass\nelif condition2:\n    pass\nelse:\n    pass'},
+            {'label': 'for', 'match': 'for', 'type': 'snippet', 'detail': 'Create a for loop.\n\nfor item in iterable:\n    pass', 'insert': 'for item in iterable:\n    pass'},
+            {'label': 'while', 'match': 'while', 'type': 'snippet', 'detail': 'Create a while loop.\n\nwhile condition:\n    pass', 'insert': 'while condition:\n    pass'},
+            {'label': 'class', 'match': 'class', 'type': 'snippet', 'detail': 'Create a new class.\n\nclass NewClass:\n    def __init__(self):\n        pass', 'insert': 'class NewClass:\n    def __init__(self):\n        pass'},
+            {'label': 'try', 'match': 'try', 'type': 'snippet', 'detail': 'Create a try/except block.\n\ntry:\n    pass\nexcept Exception as e:\n    print(e)', 'insert': 'try:\n    pass\nexcept Exception as e:\n    print(f"An error occurred: {e}")'},
+            {'label': 'with (file)', 'match': 'with', 'type': 'snippet', 'detail': "Open a file safely.\n\nwith open('file.txt', 'r') as f:\n    content = f.read()", 'insert': "with open('file.txt', 'r') as f:\n    pass"},
+            {'label': 'main', 'match': 'main', 'type': 'snippet', 'detail': 'Standard main execution block.\n\nif __name__ == "__main__":\n    # code here', 'insert': 'if __name__ == "__main__":\n    pass'},
             {'label': '__str__', 'match': '__str__', 'type': 'snippet', 'detail': 'Define the string representation of an object.', 'insert': 'def __str__(self):\n    return super().__str__()'},
+            {'label': 'docstring', 'match': 'doc', 'type': 'snippet', 'detail': 'Create a standard docstring for a function or class.', 'insert': '"""\n\n"""'}
         ]
         self.builtin_list = ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr', 'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple', 'type', 'vars', 'zip']
         self.keyword_list = ['and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield']
@@ -299,13 +322,16 @@ class CodeEditor(tk.Frame):
         self.text_area.tag_bind("proactive_error_line", "<Leave>", self._hide_tooltip)
 
     def _on_hover_word(self, event, tooltip_dict):
-        index = self.text_area.index(f"@{event.x},{event.y}")
-        word_start = self.text_area.index(f"{index} wordstart")
-        word_end = self.text_area.index(f"{index} wordend")
-        word = self.text_area.get(word_start, word_end)
-        tooltip_text = tooltip_dict.get(word)
-        if tooltip_text:
-            self._show_tooltip(event, tooltip_text)
+        try:
+            index = self.text_area.index(f"@{event.x},{event.y}")
+            word_start = self.text_area.index(f"{index} wordstart")
+            word_end = self.text_area.index(f"{index} wordend")
+            word = self.text_area.get(word_start, word_end)
+            tooltip_text = tooltip_dict.get(word)
+            if tooltip_text:
+                self._show_tooltip(event, tooltip_text)
+        except tk.TclError:
+            pass
 
     def perform_autocomplete(self, text_to_insert):
         self.text_area.edit_separator()
@@ -364,7 +390,6 @@ class CodeEditor(tk.Frame):
         labels_so_far = set()
 
         def add_completion(item):
-            # Use the 'label' for uniqueness check
             if item['label'] not in labels_so_far:
                 completions.append(item)
                 labels_so_far.add(item['label'])
@@ -378,8 +403,8 @@ class CodeEditor(tk.Frame):
         for f in self.builtin_list:
             if f.startswith(current_word):
                 add_completion({'label': f, 'match': f, 'type': 'function', 'insert': f, 'detail': self.builtin_tooltips.get(f, 'Built-in Python function.')})
-        for w in words_in_doc:
-            if w.startswith(current_word):
+        for w in sorted(list(words_in_doc)):
+            if w.startswith(current_word) and len(w) > len(current_word):
                 add_completion({'label': w, 'match': w, 'type': 'variable', 'insert': w, 'detail': 'Variable from current document.'})
         
         completions.sort(key=lambda x: x['label'])
@@ -411,8 +436,7 @@ class CodeEditor(tk.Frame):
         line_numbers_text = "\n".join(str(i) for i in range(1, num_lines + 1))
         self.linenumbers.insert("1.0", line_numbers_text)
         self.linenumbers.config(state="disabled")
-        first_visible_line = self.text_area.yview()[0]
-        self.linenumbers.yview_moveto(first_visible_line)
+        self.linenumbers.yview_moveto(self.text_area.yview()[0])
 
     def _on_content_changed(self, event=None):
         self.update_line_numbers()
@@ -426,14 +450,13 @@ class CodeEditor(tk.Frame):
         if event.keysym in ("Up", "Down", "Return", "Tab", "Escape"):
             return 
         
-        if len(event.keysym) == 1 or event.keysym == '_' or event.keysym == 'BackSpace':
+        if len(event.keysym) == 1 or event.keysym in ('underscore', 'BackSpace'):
             self.after(50, self._update_autocomplete_display)
         else:
             self.autocomplete_manager.hide()
             self.autocomplete_dismissed_word = None
             
-        if event.keysym not in ("Return", "(", "[", "{", "BackSpace", "Delete", "Tab"):
-             self._on_content_changed()
+        self._on_content_changed()
 
     def _on_text_modified(self, event=None):
         if self.text_area.edit_modified():
@@ -443,14 +466,8 @@ class CodeEditor(tk.Frame):
 
     def _on_mouse_scroll(self, event):
         self.autocomplete_manager.hide()
-        
-        scroll = 0
-        if event.num == 4 or event.delta > 0: scroll = -1
-        elif event.num == 5 or event.delta < 0: scroll = 1
-        if scroll != 0:
-            self.linenumbers.yview_scroll(scroll, "units")
-            self.text_area.yview_scroll(scroll, "units")
-        return "break"
+        self.after(10, self.update_line_numbers)
+        # return "break" - REMOVED to allow scrolling to happen
 
     def _auto_complete_brackets(self, event, open_char, close_char):
         self.autocomplete_dismissed_word = None
@@ -458,26 +475,28 @@ class CodeEditor(tk.Frame):
         self.text_area.insert(tk.INSERT, open_char + close_char)
         self.text_area.mark_set(tk.INSERT, "insert-1c")
         self.last_action_was_autocomplete = True
-        self._on_content_changed()
         return "break"
 
     def _auto_indent(self, event):
         self.text_area.edit_separator()
         current_index = self.text_area.index(tk.INSERT)
-        line_str, _ = current_index.split('.')
-        if not line_str.isdigit(): return "break"
-        line = int(line_str)
-        current_line_content = self.text_area.get(f"{line}.0", current_index)
-        stripped_current_line = current_line_content.rstrip()
-        self.text_area.insert(tk.INSERT, "\n")
-        prev_indent_match = re.match(r'^(\s*)', stripped_current_line)
-        prev_indent = prev_indent_match.group(1) if prev_indent_match else ""
-        indent_to_insert = prev_indent
-        if stripped_current_line.endswith(':'):
-            indent_to_insert += "    "
-        self.text_area.insert(tk.INSERT, indent_to_insert)
+        line_num_str, _ = current_index.split('.')
+        
+        prev_line_index = f"{line_num_str}.0 - 1 lines"
+        prev_line_content = self.text_area.get(prev_line_index, f"{prev_line_index} lineend")
+        
+        indent_to_insert = ""
+        if prev_line_content: # Guard against None or empty string
+            prev_indent_match = re.match(r'^(\s*)', prev_line_content)
+            if prev_indent_match:
+                indent_to_insert = prev_indent_match.group(1)
+
+            if prev_line_content.strip().endswith(':'):
+                indent_to_insert += "    "
+        
+        self.text_area.insert(tk.INSERT, f"\n{indent_to_insert}")
+        
         self.last_action_was_autocomplete = True
-        self._on_content_changed()
         return "break"
 
     def highlight_syntax_error(self, line_number, error_message):
@@ -498,36 +517,42 @@ class CodeEditor(tk.Frame):
 
         content = self.text_area.get("1.0", tk.END)
         
-        # This dictionary maps the regex pattern to the specific tag name
-        keywords = { r"\bif\b": "keyword_if", r"\belse\b": "keyword_else", r"\belif\b": "keyword_elif", r"\bfor\b": "keyword_for", r"\bwhile\b": "keyword_while", r"\breturn\b": "keyword_return", r"\bbreak\b": "keyword_break", r"\bcontinue\b": "keyword_continue", r"\byield\b": "keyword_yield", r"\bpass\b": "keyword_pass", r"\bimport\b": "keyword_import", r"\bfrom\b": "keyword_from", r"\bas\b": "keyword_as", r"\btry\b": "keyword_try", r"\bexcept\b": "keyword_except", r"\bfinally\b": "keyword_finally", r"\braise\b": "keyword_raise", r"\bassert\b": "keyword_assert", r"\bTrue\b": "keyword_True", r"\bFalse\b": "keyword_False", r"\bNone\b": "keyword_None", r"\band\b": "keyword_and", r"\bor\b": "keyword_or", r"\bnot\b": "keyword_not", r"\bin\b": "keyword_in", r"\bis\b": "keyword_is", r"\bdel\b": "keyword_del", r"\bglobal\b": "keyword_global", r"\bnonlocal\b": "keyword_nonlocal", r"\basync\b": "keyword_async", r"\bawait\b": "keyword_await", r"\bwith\b": "keyword_with", r"\blambda\b": "keyword_lambda" }
-        highlight_patterns = { r"\bPriesty\b": "priesty_keyword", r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"[(){}[\]]": "bracket_tag", r"\b__init__\b": "dunder_init", **keywords }
+        keywords_map = { r"\bif\b": "keyword_if", r"\belse\b": "keyword_else", r"\belif\b": "keyword_elif", r"\bfor\b": "keyword_for", r"\bwhile\b": "keyword_while", r"\breturn\b": "keyword_return", r"\bbreak\b": "keyword_break", r"\bcontinue\b": "keyword_continue", r"\byield\b": "keyword_yield", r"\bpass\b": "keyword_pass", r"\bimport\b": "keyword_import", r"\bfrom\b": "keyword_from", r"\bas\b": "keyword_as", r"\btry\b": "keyword_try", r"\bexcept\b": "keyword_except", r"\bfinally\b": "keyword_finally", r"\braise\b": "keyword_raise", r"\bassert\b": "keyword_assert", r"\bTrue\b": "keyword_True", r"\bFalse\b": "keyword_False", r"\bNone\b": "keyword_None", r"\band\b": "keyword_and", r"\bor\b": "keyword_or", r"\bnot\b": "keyword_not", r"\bin\b": "keyword_in", r"\bis\b": "keyword_is", r"\bdel\b": "keyword_del", r"\bglobal\b": "keyword_global", r"\bnonlocal\b": "keyword_nonlocal", r"\basync\b": "keyword_async", r"\bawait\b": "keyword_await", r"\bwith\b": "keyword_with", r"\blambda\b": "keyword_lambda" }
+        highlight_patterns = { r"\bPriesty\b": "priesty_keyword", r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"[(){}[\]]": "bracket_tag", r"\b__init__\b": "dunder_init", **keywords_map }
 
         for match in re.finditer(r"(#.*)", content): self._apply_tag("comment_tag", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
         for pattern in [r"'''.*?'''", r'""".*?"""']:
             for match in re.finditer(pattern, content, re.DOTALL): self._apply_tag("string_literal", f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars")
-        for match in re.finditer(r"""(?<!['"])(['"])(?:(?=(\\?))\2.)*?\1""", content):
+        
+        string_regex = r"""'[^'\\\n]*(?:\\.[^'\\\n]*)*'|\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\""""
+        for match in re.finditer(string_regex, content):
              start, end = f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars"
-             if not self._is_inside_tag_by_index(start, end, "string_literal"): self._apply_tag("string_literal", start, end)
+             if not self._is_inside_tag_by_index(start, "comment_tag"): self._apply_tag("string_literal", start, end)
         
         for pattern, tag in highlight_patterns.items():
             for match in re.finditer(pattern, content):
                 start, end = f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars"
-                if not (self._is_inside_tag_by_index(start, end, "comment_tag") or self._is_inside_tag_by_index(start, end, "string_literal")):
+                if not self._is_inside_tag_by_index(start, "comment_tag") and not self._is_inside_tag_by_index(start, "string_literal"):
                     self._apply_tag(tag, start, end)
 
         for match in re.finditer(r'\b\d+(\.\d*)?([eE][+-]?\d+)?\b', content):
             start, end = f"1.0 + {match.start()} chars", f"1.0 + {match.end()} chars"
-            if not (self._is_inside_tag_by_index(start, end, "comment_tag") or self._is_inside_tag_by_index(start, end, "string_literal")):
+            if not self._is_inside_tag_by_index(start, "comment_tag") and not self._is_inside_tag_by_index(start, "string_literal"):
                 self._apply_tag("number_literal", start, end)
 
     def _apply_tag(self, tag_name, start_index, end_index):
         try: self.text_area.tag_add(tag_name, start_index, end_index)
         except tk.TclError: pass
 
-    def _is_inside_tag_by_index(self, start_index, end_index, tag_name):
-        return bool(self.text_area.tag_nextrange(tag_name, start_index, end_index))
+    def _is_inside_tag_by_index(self, index, tag_name):
+        return tag_name in self.text_area.tag_names(index)
 
     def _proactive_syntax_check(self):
+        if not self.proactive_errors_active:
+            self.clear_error_highlight()
+            if self.error_console: self.error_console.clear()
+            return
+
         code_content = self.text_area.get("1.0", tk.END)
         self.clear_error_highlight()
         if not code_content.strip():
@@ -539,11 +564,13 @@ class CodeEditor(tk.Frame):
         except SyntaxError as e:
             cursor_line_str = self.text_area.index(tk.INSERT).split('.')[0]
             if e.lineno == (int(cursor_line_str) if cursor_line_str.isdigit() else 0): return
+            
             line_num = e.lineno or 1
             tooltip_text = f"Syntax Error: {e.msg}"
             self.highlight_syntax_error(line_num, tooltip_text)
             if self.error_console:
-                self.error_console.format_error_output(f"Syntax Error (Line {line_num}): {e.msg}\n", f"Full Syntax Error Details:\n{e}")
+                error_details = f"File: <current editor>\nLine {e.lineno}, Column {e.offset or 0}\n\n{e.text.strip()}\n{' ' * (e.offset - 1 if e.offset else 0)}^" #type: ignore
+                self.error_console.display_error(f"Syntax Error: {e.msg}", error_details)
         except Exception as e:
             if self.error_console:
-                self.error_console.format_error_output(f"Proactive Check Error: {type(e).__name__}: {e}", f"Full Error Details:\n{e}")
+                self.error_console.display_error(f"Proactive Check Error: {type(e).__name__}", str(e))
