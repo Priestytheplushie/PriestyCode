@@ -11,6 +11,7 @@ import threading
 import queue
 import time
 from typing import cast
+import re # Import re for error parsing (Bug 3, 4)
 
 from code_editor import CodeEditor
 from console_ui import ConsoleUi
@@ -25,7 +26,6 @@ PROCESS_END_SIGNAL = "<<ProcessEnd>>"
 PROCESS_ERROR_SIGNAL = "<<ProcessError>>"
 
 class PriestyCode(tk.Tk):
-    # ... (the first part of the class is unchanged)
     def __init__(self):
         super().__init__()
         self.title("PriestyCode v1.0.0")
@@ -36,13 +36,15 @@ class PriestyCode(tk.Tk):
         self.process: subprocess.Popen | None = None
         self.output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
         self.stdin_queue: queue.Queue[str] = queue.Queue()
-        self.stderr_buffer = ""
+        self.stderr_buffer = "" # Buffer for stderr output to parse runtime errors
+        self.stdout_buffer = "" # Buffer for stdout to parse handled exceptions
         self.open_files: list[str] = []
         self.tab_widgets: list[tk.Frame] = []
         self.editor_widgets: list[tk.Frame] = []
         self.current_tab_index = -1
         self.current_open_file: str | None = None
-        self.code_editor: CodeEditor | None = None
+        self.code_editor: CodeEditor | None = None # Reference to the currently active CodeEditor instance
+        self.active_editor: CodeEditor | None = None # Added for clarity and consistency (Bug 3, 4)
         self.is_running = False
         self.workspace_root_dir = initial_project_root_dir
         self.python_executable = sys.executable
@@ -51,9 +53,11 @@ class PriestyCode(tk.Tk):
         self.file_type_icon_label: tk.Label
         self.file_name_label: tk.Label
         self.terminal_console: Terminal
+        self.error_console: ConsoleUi # Declare error_console here
 
         self.autocomplete_enabled = tk.BooleanVar(value=True)
         self.proactive_errors_enabled = tk.BooleanVar(value=True)
+        self.highlight_handled_exceptions = tk.BooleanVar(value=True) # New option
 
         self._load_icons()
         self._configure_styles()
@@ -65,8 +69,8 @@ class PriestyCode(tk.Tk):
         self.after(200, self._check_virtual_env)
         self.after(500, self._open_sandbox_if_empty)
     
-    # ... (all methods from _load_icons to _save_file_as are unchanged)
     def _load_icons(self):
+        """Loads and resizes icons used throughout the IDE."""
         self.window_icon = self._load_and_resize_icon('priesty.png', is_photo_image=True)
         if isinstance(self.window_icon, tk.PhotoImage):
             self.iconphoto(True, self.window_icon)
@@ -89,12 +93,14 @@ class PriestyCode(tk.Tk):
         self.close_icon = self._load_and_resize_icon('close_icon.png', size=12)
         self.txt_icon = self._load_and_resize_icon('txt_icon.png')
 
+        # Icons for autocomplete manager
         self.snippet_icon = self._load_and_resize_icon('snippet_icon.png')
         self.keyword_icon = self._load_and_resize_icon('keyword_icon.png')
         self.function_icon = self._load_and_resize_icon('function_icon.png')
         self.variable_icon = self._load_and_resize_icon('variable_icon.png')
 
     def _load_and_resize_icon(self, icon_name, size=None, is_photo_image=False):
+        """Helper to load, resize, and return a PhotoImage from an icon file."""
         try:
             path = os.path.join(ICON_PATH, icon_name)
             if not os.path.exists(path): return None
@@ -111,42 +117,54 @@ class PriestyCode(tk.Tk):
             return None
 
     def _configure_styles(self):
+        """Configures the ttk styles for various widgets."""
         self.style = ttk.Style(self)
-        self.style.theme_use("default")
+        self.style.theme_use("default") # Use default theme as a base
         self.style.configure("TPanedwindow", background="#2B2B2B")
         self.style.configure("TNotebook", background="#2B2B2B", borderwidth=0)
         self.style.configure("TNotebook.Tab", background="#3C3C3C", foreground="white", padding=[10, 5], font=("Segoe UI", 10), borderwidth=0)
         self.style.map("TNotebook.Tab", background=[("selected", "#2B2B2B"), ("active", "#555555")])
 
     def _setup_layout(self):
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        """Sets up the main grid layout for the IDE window."""
+        self.grid_rowconfigure(1, weight=1) # Main content area expands vertically
+        self.grid_columnconfigure(0, weight=1) # Main content area expands horizontally
 
     def _create_top_toolbar(self):
+        """Creates the top toolbar with IDE name, file info, and run/clear buttons."""
         self.top_toolbar_frame = tk.Frame(self, bg="#3C3C3C", height=30)
         self.top_toolbar_frame.grid(row=0, column=0, sticky="ew")
-        self.top_toolbar_frame.grid_propagate(False)
+        self.top_toolbar_frame.grid_propagate(False) # Prevent frame from resizing to fit contents
+
+        # PriestyCode icon and label
         if self.priesty_icon:
             tk.Label(self.top_toolbar_frame, image=self.priesty_icon, bg="#3C3C3C").pack(side="left", padx=5)
+        
+        # File type icon and name label
         self.file_type_icon_label = tk.Label(self.top_toolbar_frame, bg="#3C3C3C")
         self.file_type_icon_label.pack(side="left", padx=(5,0))
         self.file_name_label = tk.Label(self.top_toolbar_frame, text="No File Open", fg="white", bg="#3C3C3C", font=("Segoe UI", 10, "bold"))
         self.file_name_label.pack(side="left", padx=(2, 10))
+
+        # Buttons on the right side
         btn_kwargs = {"bg": "#3C3C3C", "bd": 0, "activebackground": "#555555", "highlightthickness": 0}
         self.clear_console_button = tk.Button(self.top_toolbar_frame, command=self._clear_console, **btn_kwargs)
         if self.clear_icon: self.clear_console_button.config(image=self.clear_icon)
         else: self.clear_console_button.config(text="Clear", fg="white")
         self.clear_console_button.pack(side="right", padx=5)
+
         self.run_stop_button = tk.Button(self.top_toolbar_frame, command=self._run_code, **btn_kwargs)
         if self.run_icon: self.run_stop_button.config(image=self.run_icon)
         else: self.run_stop_button.config(text="Run", fg="white")
         self.run_stop_button.pack(side="right", padx=5)
 
     def _create_menu_bar(self):
+        """Creates the main menu bar with File, Edit, Run, Workspace, Options, and Help menus."""
         menubar = tk.Menu(self, bg="#3C3C3C", fg="white", activebackground="#555555", activeforeground="white", relief="flat", borderwidth=0)
         self.config(menu=menubar)
         menu_kwargs = {"tearoff": 0, "bg": "#3C3C3C", "fg": "white", "activebackground": "#555555", "activeforeground": "white"}
         
+        # File Menu
         file_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="New File", command=self._new_file)
@@ -156,10 +174,11 @@ class PriestyCode(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
 
+        # Edit Menu
         edit_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Edit", menu=edit_menu)
-        edit_menu.add_command(label="Undo", command=lambda: self.code_editor.text_area.edit_undo() if self.code_editor else None)
-        edit_menu.add_command(label="Redo", command=lambda: self.code_editor.text_area.edit_redo() if self.code_editor else None)
+        edit_menu.add_command(label="Undo", command=lambda: self.active_editor.text_area.edit_undo() if self.active_editor else None)
+        edit_menu.add_command(label="Redo", command=lambda: self.active_editor.text_area.edit_redo() if self.active_editor else None)
         edit_menu.add_separator()
         def event_gen(event_name):
             widget = self.focus_get()
@@ -171,41 +190,53 @@ class PriestyCode(tk.Tk):
         edit_menu.add_separator()
         edit_menu.add_command(label="Find/Replace", command=self._open_find_replace_dialog)
 
+        # Run Menu
         run_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Run", menu=run_menu)
         run_menu.add_command(label="Run Current File", command=self._run_code)
         run_menu.add_command(label="Stop Execution", command=self._stop_code)
         
+        # Workspace Menu
         workspace_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Workspace", menu=workspace_menu)
         workspace_menu.add_command(label="Open Folder...", command=self._open_folder)
         workspace_menu.add_command(label="Refresh Explorer", command=lambda: self.file_explorer.populate_tree())
         workspace_menu.add_command(label="Create Virtual Environment", command=self._create_virtual_env)
 
+        # Options Menu
         options_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Options", menu=options_menu)
         options_menu.add_checkbutton(label="Enable Code Completion", variable=self.autocomplete_enabled,
                                       onvalue=True, offvalue=False, command=self._toggle_autocomplete)
         options_menu.add_checkbutton(label="Enable Proactive Error Checking", variable=self.proactive_errors_enabled,
                                       onvalue=True, offvalue=False, command=self._toggle_proactive_errors)
+        # Add the new option to the menu
+        options_menu.add_checkbutton(label="Highlight Handled Exceptions", variable=self.highlight_handled_exceptions,
+                                      onvalue=True, offvalue=False)
 
+        # Help Menu
         help_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About", command=self._show_about)
 
     def _toggle_autocomplete(self):
+        """Toggles the autocomplete feature in the active editor."""
         is_enabled = self.autocomplete_enabled.get()
-        if self.code_editor:
-            self.code_editor.autocomplete_active = is_enabled
+        if self.active_editor: # Use active_editor
+            self.active_editor.autocomplete_active = is_enabled
 
     def _toggle_proactive_errors(self):
+        """Toggles proactive error checking in the active editor."""
         is_enabled = self.proactive_errors_enabled.get()
-        if self.code_editor:
-            self.code_editor.set_proactive_error_checking(is_enabled)
+        if self.active_editor: # Use active_editor
+            self.active_editor.set_proactive_error_checking(is_enabled)
 
     def _create_main_content_area(self):
+        """Creates the main content area with file explorer, editor tabs, and output console."""
         self.main_paned_window = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_paned_window.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        # Left pane for File Explorer
         left_pane = ttk.Frame(self.main_paned_window)
         self.main_paned_window.add(left_pane, weight=1)
         self.file_explorer = FileExplorer(left_pane, self.workspace_root_dir, self._open_file_from_path, 
@@ -214,27 +245,37 @@ class PriestyCode(tk.Tk):
                                           txt_icon=self.txt_icon)
         self.file_explorer.pack(fill="both", expand=True)
         self.file_explorer.populate_tree()
+
+        # Right pane for Editor and Output
         self.right_pane = ttk.PanedWindow(self.main_paned_window, orient=tk.VERTICAL)
         self.main_paned_window.add(self.right_pane, weight=4)
+
+        # Editor Area (top part of right pane)
         editor_area_frame = tk.Frame(self.right_pane, bg="#2B2B2B")
         self.right_pane.add(editor_area_frame, weight=3)
         editor_area_frame.grid_rowconfigure(1, weight=1); editor_area_frame.grid_columnconfigure(0, weight=1)
+        
         self.tab_bar_frame = tk.Frame(editor_area_frame, bg="#2B2B2B")
         self.tab_bar_frame.grid(row=0, column=0, sticky="ew")
         self.editor_content_frame = tk.Frame(editor_area_frame, bg="#2B2B2B")
         self.editor_content_frame.grid(row=1, column=0, sticky="nsew")
+
+        # Output Notebook (bottom part of right pane)
         self.output_notebook = ttk.Notebook(self.right_pane)
         self.right_pane.add(self.output_notebook, weight=1)
         
+        # Terminal Tab
         self.terminal_console = Terminal(self.output_notebook, stdin_queue=self.stdin_queue, 
                                          cwd=self.workspace_root_dir, python_executable=self.python_executable)
         self.output_notebook.add(self.terminal_console, text="Terminal")
 
+        # Errors Tab
         self.error_console = ConsoleUi(self.output_notebook)
         self.output_notebook.add(self.error_console, text="Errors")
         self.output_notebook.bind("<<NotebookTabChanged>>", self._on_output_tab_change)
 
     def _on_output_tab_change(self, event=None):
+        """Handles tab changes in the output notebook, focusing the appropriate widget."""
         try:
             selected_tab_id = self.output_notebook.select()
             if not selected_tab_id:
@@ -245,62 +286,47 @@ class PriestyCode(tk.Tk):
             elif tab_text == "Errors" and self.error_console:
                 self.error_console.output_console.focus_set()
         except tk.TclError:
-            pass 
+            pass # Ignore if tab is being destroyed or invalid
 
     def _open_sandbox_if_empty(self):
+        """Opens or creates a sandbox.py file if no files are open."""
         if not self.open_files:
             sandbox_path = os.path.join(self.workspace_root_dir, "sandbox.py")
             if not os.path.exists(sandbox_path):
                 content = """# sandbox.py
-# This is a scratchpad for testing Python code.
+import traceback
 
 print("--- Welcome to the Sandbox ---")
 
-# Example of user input. The terminal will wait for you to type something.
+# Example of a handled exception.
+# This error will be caught, and its traceback will be printed.
 try:
-    user_name = input("Please enter your name: ")
-    print(f"Hello, {user_name}! Your input was received.")
-except EOFError:
-    print("\\nInput stream closed. Running non-interactively.")
+    # This line will cause a NameError
+    print(hello)
+except Exception:
+    print("Caught an exception as expected!")
+    # Use traceback.print_exc() to print the full details.
+    # PriestyCode will detect this and highlight the line in orange.
+    traceback.print_exc()
 
-# --- Sample Code Section ---
-# 1. Basic Output: Print a simple message
-print("\\nHello from sandbox.py!")
-print("This is a temporary file for quick Python tests.")
 
-# 2. Variable Declaration and Basic Arithmetic
-num1 = 10
-num2 = 5
-sum_result = num1 + num2
-product_result = num1 * num2
-
-print(f"\\nSum of {num1} and {num2} is: {sum_result}")
-print(f"Product of {num1} and {num2} is: {product_result}")
-
-# 3. Looping with a for loop
-print("\\nCounting with a for loop:")
-for i in range(3): # Loops from 0 to 2
-    print(f"Count: {i}")
-
-# 4. Function Definition and Call
-def greet_user(name):
-    \"\"\"This function prints a personalized greeting.\"\"\"
-    print(f"\\nHello, {name}! Welcome to the function.")
-
-greet_user("Python Enthusiast")
+# Example of an unhandled exception (a crash).
+# Uncomment the line below to see a runtime error (red highlight).
+# print(10 / 0)
 
 print("\\n--- End of Sandbox Execution ---")
 """
                 try:
                     with open(sandbox_path, "w", encoding="utf-8") as f:
                         f.write(content)
-                    self.file_explorer.populate_tree()
+                    self.file_explorer.populate_tree() # Refresh file explorer
                 except Exception as e:
                     messagebox.showerror("Sandbox Creation Failed", f"Could not create sandbox.py: {e}")
                     return
             self._add_new_tab(file_path=sandbox_path)
 
     def _check_virtual_env(self):
+        """Checks for a virtual environment and sets the Python executable path."""
         found_venv = False
         py_exec_path = ""
         for venv_name in ('.venv', 'venv'): 
@@ -317,6 +343,7 @@ print("\\n--- End of Sandbox Execution ---")
         
         if not found_venv:
             py_exec_path = os.path.abspath(sys.executable)
+            # Warn if using Microsoft Store stub Python on Windows
             if sys.platform == 'win32' and 'windowsapps' in py_exec_path.lower():
                 messagebox.showwarning(
                     "Python Path Warning",
@@ -334,9 +361,10 @@ print("\\n--- End of Sandbox Execution ---")
                 self.terminal_console.show_prompt()
 
     def _create_virtual_env(self):
+        """Creates a virtual environment in the current workspace."""
         self.terminal_console.write("Creating virtual environment 'venv'... This may take a moment.\n")
-        self.output_notebook.select(self.terminal_console)
-        self.update_idletasks()
+        self.output_notebook.select(self.terminal_console) # Switch to terminal tab
+        self.update_idletasks() # Update UI to show message immediately
         
         venv_dir = os.path.join(self.workspace_root_dir, "venv")
         if os.path.exists(venv_dir):
@@ -346,6 +374,7 @@ print("\\n--- End of Sandbox Execution ---")
             return
 
         def create():
+            """Function to run in a separate thread for venv creation."""
             try:
                 process = subprocess.run(
                     [sys.executable, "-m", "venv", venv_dir], 
@@ -353,8 +382,8 @@ print("\\n--- End of Sandbox Execution ---")
                     cwd=self.workspace_root_dir
                 )
                 self.terminal_console.write(f"Successfully created virtual environment in:\n{venv_dir}\n")
-                self.after(0, self._check_virtual_env)
-                self.after(0, self.file_explorer.populate_tree)
+                self.after(0, self._check_virtual_env) # Re-check Python executable
+                self.after(0, self.file_explorer.populate_tree) # Refresh file explorer
             except subprocess.CalledProcessError as e:
                 error_message = f"Failed to create virtual environment.\n\nSTDOUT:\n{e.stdout}\n\nSTDERR:\n{e.stderr}"
                 self.terminal_console.write(error_message, "stderr_tag")
@@ -366,50 +395,59 @@ print("\\n--- End of Sandbox Execution ---")
         threading.Thread(target=create, daemon=True).start()
 
     def _new_file(self):
+        """Creates a new untitled file tab."""
         self._add_new_tab()
 
     def _open_file(self):
+        """Opens a file dialog to select and open a file."""
         file_path = filedialog.askopenfilename(initialdir=self.workspace_root_dir,
                                                filetypes=[("Python files", "*.py"), ("Text files", "*.txt"), ("All files", "*.*")])
         if file_path:
             self._open_file_from_path(file_path)
 
     def _open_folder(self):
+        """Opens a folder dialog to select a new workspace root."""
         new_path = filedialog.askdirectory(title="Select a Folder to Open as Workspace", initialdir=self.workspace_root_dir)
         if not new_path or not os.path.isdir(new_path):
             return
         
+        # Close all open tabs before changing workspace
         while self.open_files:
-            if not self._close_tab(0, force_ask=True):
-                return
+            if not self._close_tab(0, force_ask=True): # Ask to save if modified
+                return # User cancelled closing tabs, so cancel opening new folder
         
         self.workspace_root_dir = new_path
-        self.file_explorer.set_project_root(new_path)
+        self.file_explorer.set_project_root(new_path) # Update file explorer root
         
-        self.terminal_console.cwd = new_path
-        self._check_virtual_env()
+        self.terminal_console.set_cwd(new_path) # Update terminal CWD
+        self._check_virtual_env() # Re-check virtual environment for new workspace
         
-        self.title(f"PriestyCode v1.0.0 - {os.path.basename(new_path)}")
+        self.title(f"PriestyCode v1.0.0 - {os.path.basename(new_path)}") # Update window title
 
     def _open_file_from_path(self, file_path):
+        """Opens a file from a given path, switching to it if already open."""
         if file_path in self.open_files:
             self._switch_to_tab(self.open_files.index(file_path))
         else:
             self._add_new_tab(file_path=file_path)
 
     def _add_new_tab(self, file_path=None, content=""):
+        """Adds a new editor tab for a file."""
         editor_frame = tk.Frame(self.editor_content_frame, bg="#2B2B2B")
         
+        # Pass autocomplete icons to the CodeEditor's AutocompleteManager
         autocomplete_icons = {
             'snippet': self.snippet_icon, 'keyword': self.keyword_icon,
             'function': self.function_icon, 'variable': self.variable_icon
         }
         editor = CodeEditor(editor_frame, error_console=self.error_console, autocomplete_icons=autocomplete_icons)
+        editor.set_file_path(file_path if file_path else "Untitled-X.py") # Set file path for Bug 5
         
         editor.autocomplete_active = self.autocomplete_enabled.get()
         editor.set_proactive_error_checking(self.proactive_errors_enabled.get())
         editor.pack(fill="both", expand=True)
 
+        # Load content if file_path is provided and not an untitled file
         if file_path and not file_path.startswith("Untitled-"):
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
@@ -419,6 +457,7 @@ print("\\n--- End of Sandbox Execution ---")
                 editor_frame.destroy()
                 return
         elif not file_path:
+            # Generate a unique name for untitled files
             count = 1
             untitled_name = f"Untitled-{count}.py"
             while untitled_name in self.open_files:
@@ -427,23 +466,29 @@ print("\\n--- End of Sandbox Execution ---")
             file_path = untitled_name
 
         editor.text_area.insert("1.0", content)
-        editor.text_area.edit_modified(False)
-        self.after(50, editor._on_content_changed)
+        editor.text_area.edit_modified(False) # Reset modified flag after loading content
+        self.after(50, editor._on_content_changed) # Trigger initial highlighting and checks
 
+        # Create the tab button in the tab bar
         tab = tk.Frame(self.tab_bar_frame, bg="#3C3C3C")
         tab.pack(side="left", fill="y", padx=(0, 1))
         
+        # File icon on the tab
         icon = self._get_icon_for_file(file_path)
         icon_label = tk.Label(tab, bg="#3C3C3C")
         if icon:
             icon_label.config(image=icon)
         icon_label.pack(side="left", padx=(5, 2), pady=2)
 
+        # File name label on the tab
         text_label = tk.Label(tab, text=os.path.basename(file_path), fg="white", bg="#3C3C3C", font=("Segoe UI", 9))
         text_label.pack(side="left", padx=(0, 5), pady=2)
+        
+        # Close button on the tab
         close_button = tk.Button(tab, text="\u2715", bg="#3C3C3C", fg="white", bd=0, relief="flat", activebackground="#E81123", activeforeground="white", font=("Segoe UI", 8, "bold"))
         close_button.pack(side="right", padx=(5, 5), pady=2)
 
+        # Store references and bind events
         new_index = len(self.open_files)
         tab.bind("<Button-1>", lambda e, i=new_index: self._switch_to_tab(i))
         icon_label.bind("<Button-1>", lambda e, i=new_index: self._switch_to_tab(i))
@@ -456,20 +501,32 @@ print("\\n--- End of Sandbox Execution ---")
         self._switch_to_tab(new_index)
 
     def _switch_to_tab(self, index: int):
+        """Switches to the tab at the given index."""
         if not (0 <= index < len(self.tab_widgets)): return
+        
+        # Hide the currently active editor (if any)
         if self.current_tab_index != -1 and self.current_tab_index < len(self.editor_widgets):
             self.editor_widgets[self.current_tab_index].pack_forget()
             self._set_tab_appearance(self.tab_widgets[self.current_tab_index], active=False)
+        
+        # Update current tab index and file info
         self.current_tab_index = index
         self.current_open_file = self.open_files[index]
+        
+        # Show the new editor frame
         new_editor_frame = self.editor_widgets[index]
         new_editor_frame.pack(fill="both", expand=True)
+        
+        # Get reference to the CodeEditor instance within the frame
         self.code_editor = cast(CodeEditor, new_editor_frame.winfo_children()[0])
+        self.active_editor = self.code_editor # Set active_editor (Bug 3, 4)
+
         self._set_tab_appearance(self.tab_widgets[index], active=True)
-        self.code_editor.text_area.focus_set()
+        self.code_editor.text_area.focus_set() # Focus the text area
         self._update_file_header(self.current_open_file)
 
     def _set_tab_appearance(self, tab_widget: tk.Frame, active: bool):
+        """Sets the background color of a tab to indicate active/inactive state."""
         bg = "#2B2B2B" if active else "#3C3C3C"
         tab_widget.config(bg=bg)
         for child in tab_widget.winfo_children():
@@ -477,6 +534,7 @@ print("\\n--- End of Sandbox Execution ---")
                 child.config(bg=bg)
 
     def _close_tab(self, index_to_close: int, force_ask: bool = False) -> bool:
+        """Closes the tab at the given index, prompting to save if modified."""
         if not (0 <= index_to_close < len(self.open_files)): return False
         
         file_to_close_path = self.open_files[index_to_close]
@@ -484,21 +542,24 @@ print("\\n--- End of Sandbox Execution ---")
         
         editor_to_close = cast(CodeEditor, self.editor_widgets[index_to_close].winfo_children()[0])
 
+        # Prompt to save if file is modified and not sandbox.py
         if editor_to_close.text_area.edit_modified() and not is_sandbox:
             message = f"Save changes to {os.path.basename(file_to_close_path)}?"
             if force_ask:
                 message = f"Save changes to {os.path.basename(file_to_close_path)} before closing?"
             
             response = messagebox.askyesnocancel("Save on Close", message)
-            if response is None: return False
-            if response is True and not self._save_file(index_to_close): return False
+            if response is None: return False # User cancelled
+            if response is True and not self._save_file(index_to_close): return False # Save failed
 
+        # Destroy widgets and remove from lists
         self.tab_widgets[index_to_close].destroy()
         self.editor_widgets[index_to_close].destroy()
         self.tab_widgets.pop(index_to_close)
         self.editor_widgets.pop(index_to_close)
         self.open_files.pop(index_to_close)
         
+        # Re-index close buttons and tab bindings for remaining tabs
         for i, tab in enumerate(self.tab_widgets):
             close_button = tab.winfo_children()[-1]
             close_button.config(command=lambda new_i=i: self._close_tab(new_i)) #type: ignore
@@ -506,30 +567,33 @@ print("\\n--- End of Sandbox Execution ---")
                 child.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
             tab.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
         
+        # Determine which tab to activate next
         if not self.open_files:
-            self.current_tab_index = -1; self.current_open_file = None; self.code_editor = None
+            self.current_tab_index = -1; self.current_open_file = None; self.code_editor = None; self.active_editor = None
             self._update_file_header(None)
         else:
             new_active_index = self.current_tab_index
             if index_to_close < self.current_tab_index:
-                new_active_index -= 1
+                new_active_index -= 1 # Shift index if a tab before it was closed
             elif index_to_close == self.current_tab_index:
-                new_active_index = max(0, index_to_close - 1)
+                new_active_index = max(0, index_to_close - 1) # Activate previous or first tab
             
             if new_active_index >= len(self.open_files):
-                new_active_index = len(self.open_files) - 1
+                new_active_index = len(self.open_files) - 1 # Adjust if last tab was closed
 
-            self.current_tab_index = -1 
+            self.current_tab_index = -1 # Force switch to re-apply appearance
             self._switch_to_tab(new_active_index)
         return True
 
     def _update_file_header(self, file_path):
+        """Updates the file icon and name in the top toolbar."""
         icon = self._get_icon_for_file(file_path)
         if icon:
             self.file_type_icon_label.config(image=icon)
         self.file_name_label.config(text=os.path.basename(file_path) if file_path else "No File Open")
 
     def _get_icon_for_file(self, file_path):
+        """Returns the appropriate icon for a given file path."""
         if not file_path:
             return self.unknown_file_icon
         if file_path.endswith(".py"):
@@ -539,6 +603,7 @@ print("\\n--- End of Sandbox Execution ---")
         return self.unknown_file_icon
 
     def _save_file(self, index=None) -> bool:
+        """Saves the content of the current or specified file."""
         idx = self.current_tab_index if index is None else index
         if not (0 <= idx < len(self.open_files)): return False
         
@@ -546,31 +611,34 @@ print("\\n--- End of Sandbox Execution ---")
         file_path = self.open_files[idx]
 
         if file_path.startswith("Untitled-"):
-            return self._save_file_as(idx)
+            return self._save_file_as(idx) # If untitled, prompt for save as
         try:
             with open(file_path, "w", encoding="utf-8") as f: 
-                f.write(editor.text_area.get("1.0", "end-1c"))
-            editor.text_area.edit_modified(False)
+                f.write(editor.text_area.get("1.0", "end-1c")) # Save all text except last newline
+            editor.text_area.edit_modified(False) # Reset modified flag
             return True
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save: {e}")
             return False
 
     def _save_file_as(self, index=None) -> bool:
+        """Prompts the user to save the current file with a new name/location."""
         idx = self.current_tab_index if index is None else index
         if not (0 <= idx < len(self.open_files)): return False
         
         editor = cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0])
         new_path = filedialog.asksaveasfilename(initialdir=self.workspace_root_dir,
                                                 defaultextension=".py", filetypes=[("Python", "*.py")])
-        if not new_path: return False
+        if not new_path: return False # User cancelled
         try:
             with open(new_path, "w", encoding="utf-8") as f: 
                 f.write(editor.text_area.get("1.0", "end-1c"))
             
-            self.open_files[idx] = new_path
+            self.open_files[idx] = new_path # Update file path in list
+            editor.set_file_path(new_path) # Update file path in editor instance (Bug 5)
+
+            # Update tab appearance
             tab = self.tab_widgets[idx]
-            
             icon_label = cast(tk.Label, tab.winfo_children()[0])
             text_label = cast(tk.Label, tab.winfo_children()[1])
             new_icon = self._get_icon_for_file(new_path)
@@ -580,142 +648,136 @@ print("\\n--- End of Sandbox Execution ---")
 
             if idx == self.current_tab_index:
                 self.current_open_file = new_path
-                self._update_file_header(new_path)
+                self._update_file_header(new_path) # Update toolbar header
 
             editor.text_area.edit_modified(False)
-            self.file_explorer.populate_tree()
+            self.file_explorer.populate_tree() # Refresh file explorer to show new file
             return True
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save: {e}")
             return False
 
-    # === vvv ALL METHODS BELOW THIS LINE ARE REPLACED vvv ===
-
     def _run_code(self):
+        """Starts the execution of the current Python file."""
         if self.is_running:
             self._stop_code()
             return
             
-        if not self.code_editor or not self.current_open_file:
+        if not self.active_editor or not self.current_open_file: # Use active_editor
             messagebox.showerror("No File", "Please open a file to run.")
             return
             
-        if self.current_open_file.startswith("Untitled-") or self.code_editor.text_area.edit_modified():
+        # Save file if it's untitled or modified
+        if self.current_open_file.startswith("Untitled-") or self.active_editor.text_area.edit_modified():
             if not self._save_file():
                 messagebox.showwarning("Run Cancelled", "File must be saved before running.")
                 return
 
-        self.code_editor.clear_error_highlight()
+        self.active_editor.clear_error_highlight() 
         self.terminal_console.clear()
-        self.error_console.clear()
-        self.stderr_buffer = ""
+        self.error_console.clear() 
+        # Reset both stdout and stderr buffers
+        self.stderr_buffer = "" 
+        self.stdout_buffer = ""
         self.is_running = True
         self._update_run_stop_button_state()
-        self.terminal_console.set_interactive_mode(True)
-        self.output_notebook.select(self.terminal_console)
-        self.terminal_console.text.focus_set()
+        self.terminal_console.set_interactive_mode(True) 
+        self.output_notebook.select(self.terminal_console) 
+        self.terminal_console.text.focus_set() 
         
-        # The main execution is now started in a separate thread
         main_execution_thread = threading.Thread(target=self._execute_in_thread, daemon=True)
         main_execution_thread.start()
 
     def _start_process_and_threads(self, executable_path: str):
+        """Starts the subprocess for code execution and its I/O threads."""
         file_to_run = self.current_open_file
         if not file_to_run:
             self.output_queue.put((PROCESS_ERROR_SIGNAL, "Internal error: No file to execute."))
             return
 
         exec_dir = os.path.dirname(file_to_run)
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0 
         
         env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        env["FORCE_COLOR"] = "1"
-        # This line forces the child process to use UTF-8, fixing the error.
-        env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1" 
+        env["FORCE_COLOR"] = "1" 
+        env["PYTHONUTF8"] = "1" 
         
         try:
             self.process = subprocess.Popen(
                 [executable_path, file_to_run],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.PIPE, 
                 stdin=subprocess.PIPE,
-                text=True,
+                text=True, 
                 cwd=exec_dir,
                 creationflags=creationflags,
                 encoding='utf-8',
-                errors='replace', # Add error handling for robustness
-                bufsize=1,
+                errors='replace', 
+                bufsize=1, 
                 env=env
             )
         except FileNotFoundError:
-            # Handle case where python executable itself is not found
             self.output_queue.put((PROCESS_ERROR_SIGNAL, f"Executable not found: {executable_path}"))
             return
         except Exception as e:
             self.output_queue.put((PROCESS_ERROR_SIGNAL, f"Failed to start process: {e}"))
             return
 
-        # Start threads for I/O
         threading.Thread(target=self._read_stream_to_queue, args=(self.process.stdout, "stdout_tag"), daemon=True).start()
         threading.Thread(target=self._read_stream_to_queue, args=(self.process.stderr, "stderr_tag"), daemon=True).start()
         threading.Thread(target=self._write_to_stdin, daemon=True).start()
         
-        # Start a thread to monitor when the process finishes
         threading.Thread(target=self._monitor_process, daemon=True).start()
 
     def _monitor_process(self):
-        """Waits for the process to complete and then signals its end."""
+        """Waits for the process to complete and then signals its end with the return code."""
         if self.process:
-            self.process.wait()
-            self.output_queue.put((PROCESS_END_SIGNAL, None))
+            return_code = self.process.wait() # Wait for the process to terminate and get return code
+            self.output_queue.put((PROCESS_END_SIGNAL, return_code)) # type:ignore
 
     def _execute_in_thread(self):
         """Prepares and starts the subprocess execution."""
         try:
-            # This logic now just finds the python executable and starts the process.
-            # The waiting is handled by the _monitor_process thread.
             self._start_process_and_threads(self.python_executable)
         except Exception as e:
-            # This will catch errors in _start_process_and_threads, like file not found.
             self.output_queue.put((PROCESS_ERROR_SIGNAL, str(e)))
     
     def _read_stream_to_queue(self, stream, tag):
         """Reads a stream character by character and puts it on the output queue."""
         try:
             if stream:
-                for char in iter(lambda: stream.read(1), ''):
+                for char in iter(lambda: stream.read(1), ''): # Read character by character
                     self.output_queue.put((char, tag))
         except (ValueError, OSError):
-            pass
+            pass # Stream might close during reading
         finally:
             if stream:
                 stream.close()
 
     def _write_to_stdin(self):
         """Reads from the stdin queue and writes to the process's stdin pipe."""
-        while self.process and self.process.poll() is None:
+        while self.process and self.process.poll() is None: # While process is running
             try:
-                data = self.stdin_queue.get(timeout=0.5)
+                data = self.stdin_queue.get(timeout=0.5) # Get data from queue with timeout
                 if self.process and self.process.stdin:
                     self.process.stdin.write(data)
                     self.process.stdin.flush()
             except queue.Empty:
-                continue
+                continue # No data, continue looping
             except (BrokenPipeError, OSError, ValueError):
-                # ValueError can be raised if stdin is closed.
-                break
+                break # Exit loop if pipe is broken or stream closed
 
     def _stop_code(self):
+        """Stops the currently running code execution."""
         if not self.process or self.process.poll() is not None:
             self.is_running = False
             self._update_run_stop_button_state()
             return
             
-        self.is_running = False # Set state immediately
+        self.is_running = False 
         self.terminal_console.set_interactive_mode(False)
         
-        # Clear any pending input
         while not self.stdin_queue.empty():
             try:
                 self.stdin_queue.get_nowait()
@@ -723,19 +785,19 @@ print("\\n--- End of Sandbox Execution ---")
                 break
         
         try:
-            self.process.terminate()
-            # Use a short timeout to avoid hanging the UI
-            self.process.wait(timeout=2)
+            self.process.terminate() 
+            self.process.wait(timeout=2) 
             self.terminal_console.write("\n--- Process terminated by user ---\n", ("stderr_tag",))
         except (subprocess.TimeoutExpired, Exception):
-            self.process.kill()
+            self.process.kill() 
             self.terminal_console.write("\n--- Process forcefully killed by user ---\n", ("stderr_tag",))
         
-        self.process = None
+        self.process = None 
         self._update_run_stop_button_state()
-        self.terminal_console.show_prompt()
+        self.terminal_console.show_prompt() 
 
     def _update_run_stop_button_state(self):
+        """Updates the run/stop button icon and command based on execution state."""
         if self.is_running:
             icon, cmd = self.pause_icon, self._stop_code
         else:
@@ -747,45 +809,61 @@ print("\\n--- End of Sandbox Execution ---")
             self.run_stop_button.config(text="Stop" if self.is_running else "Run")
 
     def _open_find_replace_dialog(self):
-        if not self.code_editor: return
+        """Opens the find and replace dialog."""
+        if not self.active_editor: return 
         if self.find_replace_dialog and self.find_replace_dialog.winfo_exists():
-            self.find_replace_dialog.lift()
+            self.find_replace_dialog.lift() 
         else:
-            self.find_replace_dialog = FindReplaceDialog(self, self.code_editor)
+            self.find_replace_dialog = FindReplaceDialog(self, self.active_editor) 
 
     def _show_about(self):
+        """Displays the about dialog."""
         messagebox.showinfo("About PriestyCode", "PriestyCode v1.0.0\nA simple, extensible IDE.\n\nCreated with Python and Tkinter.")
 
     def _clear_console(self):
+        """Clears both the terminal and errors console."""
         self.terminal_console.clear()
         if not self.terminal_console.interactive_mode:
             self.terminal_console.show_prompt()
         self.error_console.clear()
 
     def _process_output_queue(self):
+        """Processes output from the subprocess queue and updates the UI."""
         output_chunk = ""
         current_tag = None
-        had_items = not self.output_queue.empty()
+        had_items = not self.output_queue.empty() 
         
         try:
             while not self.output_queue.empty():
                 char, tag = self.output_queue.get_nowait()
 
                 if char == PROCESS_END_SIGNAL:
-                    if output_chunk: # Write any remaining chunk
+                    if output_chunk: 
                         self.terminal_console.write(output_chunk, current_tag)
                         output_chunk = ""
+                    
+                    return_code = tag # This is now the return code from the process
                     
                     self.is_running = False
                     self._update_run_stop_button_state()
                     self.terminal_console.set_interactive_mode(False)
-
-                    if "Traceback (most recent call last):" in self.stderr_buffer or \
-                       "SyntaxError:" in self.stderr_buffer or \
-                       "Exception:" in self.stderr_buffer:
-                        self.error_console.display_error("Runtime Error", self.stderr_buffer)
+                    
+                    # FIX: New logic to differentiate unhandled crashes vs. handled exceptions
+                    full_traceback_text = self.stderr_buffer + self.stdout_buffer
+                    
+                    # Case 1: Unhandled Exception (Crash)
+                    if return_code != 0 and "Traceback (most recent call last):" in self.stderr_buffer:
+                        self._handle_error_output(self.stderr_buffer, "Runtime Error", "reactive")
+                    # Case 2: Handled Exception (Successful exit, but traceback was printed)
+                    elif return_code == 0 and "Traceback (most recent call last):" in full_traceback_text and self.highlight_handled_exceptions.get():
+                        self._handle_error_output(full_traceback_text, "Handled Exception", "handled")
+                    # Case 3: Other crash without a standard traceback
+                    elif return_code != 0 and self.stderr_buffer.strip():
+                        self.error_console.display_error("Execution Error", self.stderr_buffer.strip())
                         self.output_notebook.select(self.error_console)
+
                     self.stderr_buffer = ""
+                    self.stdout_buffer = ""
                     continue
 
                 if char == PROCESS_ERROR_SIGNAL:
@@ -804,6 +882,8 @@ print("\\n--- End of Sandbox Execution ---")
                 output_chunk += char
                 if tag == "stderr_tag":
                     self.stderr_buffer += char
+                elif tag == "stdout_tag":
+                    self.stdout_buffer += char
 
         except queue.Empty:
             pass
@@ -812,25 +892,70 @@ print("\\n--- End of Sandbox Execution ---")
                 self.terminal_console.write(output_chunk, current_tag)
 
             if self.is_running and had_items:
-                # This prepares the terminal for user input after the prompt is printed
                 self.terminal_console.prepare_for_input()
             
             self.after(50, self._process_output_queue)
 
+    def _handle_error_output(self, error_text: str, default_title: str, highlight_type: str):
+        """Parses error text and triggers UI updates for highlighting and error console."""
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        full_error_text = ansi_escape.sub('', error_text).strip()
+        
+        traceback_matches = list(re.finditer(r'File "(.*?)", line (\d+)', full_error_text))
+        
+        if traceback_matches:
+            last_match = traceback_matches[-1]
+            file_path_error = last_match.group(1)
+            line_num_error = int(last_match.group(2))
+            
+            error_title = default_title
+            last_lines = full_error_text.strip().split('\n')
+            if last_lines:
+                error_title_candidate = last_lines[-1].split(':')[0]
+                if 'Error' in error_title_candidate or 'Exception' in error_title_candidate:
+                    error_title = error_title_candidate
+
+            try:
+                error_file_index = -1
+                norm_error_path = os.path.normcase(os.path.abspath(file_path_error))
+                for i, open_file_path in enumerate(self.open_files):
+                    if open_file_path and os.path.normcase(os.path.abspath(open_file_path)) == norm_error_path:
+                        error_file_index = i
+                        break
+                
+                if error_file_index != -1:
+                    editor_frame = self.editor_widgets[error_file_index]
+                    editor_instance = cast(CodeEditor, editor_frame.winfo_children()[0])
+                    
+                    if highlight_type == "reactive":
+                        self.after(0, editor_instance.highlight_runtime_error, line_num_error, full_error_text)
+                    elif highlight_type == "handled":
+                        self.after(0, editor_instance.highlight_handled_exception, line_num_error, full_error_text)
+
+            except Exception as e:
+                print(f"Non-critical error: Could not highlight error in editor. Details: {e}")
+            
+            self.error_console.display_error(error_title, full_error_text)
+            self.output_notebook.select(self.error_console)
+        else:
+            self.error_console.display_error(default_title, full_error_text)
+            self.output_notebook.select(self.error_console)
+
     def run(self):
-        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        """Starts the Tkinter event loop."""
+        self.protocol("WM_DELETE_WINDOW", self._on_closing) 
         self.mainloop()
 
     def _on_closing(self):
+        """Handles the window closing event, prompting to save modified files."""
         if self.is_running:
-            self._stop_code()
+            self._stop_code() 
         
         while self.open_files:
             if not self._close_tab(0, force_ask=True):
                 return
         self.destroy()
 
-# The FindReplaceDialog class remains unchanged
 class FindReplaceDialog(tk.Toplevel):
     def __init__(self, parent, editor: CodeEditor):
         super().__init__(parent)
