@@ -34,8 +34,9 @@ class Terminal(tk.Frame):
         self._initialize_ansi_colors()
 
         self.text.bind("<Return>", self._on_enter_key)
-        self.text.bind("<<Modified>>", self._on_modify)
-        
+        # FIX: Replace ineffective <<Modified>> binding with a preventative <Key> binding
+        self.text.bind("<Key>", self._on_key)
+
         self.text.tag_config("prompt_venv", foreground="#66FF66")
         self.text.tag_config("prompt_path", foreground="#569CD6")
         self.text.tag_config("prompt_arrow", foreground="#C586C0")
@@ -210,10 +211,43 @@ class Terminal(tk.Frame):
         self.text.config(state="normal")
         self.current_tags = []
 
-    def _on_modify(self, event=None):
-        if self.text.compare(tk.INSERT, "<", self.input_start_mark):
-             self.text.mark_set(tk.INSERT, self.input_start_mark)
-        self.text.edit_modified(False)
+    # FIX: Replaced _on_modify with a robust preventative key handler
+    def _on_key(self, event):
+        """Prevents the user from modifying the read-only part of the terminal."""
+        # Allow copy (Ctrl+C)
+        if event.state & 4 and event.keysym.lower() == 'c':
+            return
+        
+        # Allow all other Ctrl-key combos for now (e.g., for other shortcuts)
+        # except for paste (v) and cut (x) which are handled below.
+        if event.state & 4 and event.keysym.lower() not in ('v', 'x'):
+             return
+
+        # Check if a selection exists.
+        try:
+            sel_start = self.text.index(tk.SEL_FIRST)
+            # If selection is in the protected area, block the key press.
+            if self.text.compare(sel_start, "<", self.input_start_mark):
+                # Allow navigation keys to move the cursor out of the selection
+                if event.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End'):
+                    return
+                return "break"
+        except tk.TclError:
+            # No selection, check the insertion cursor.
+            insert_index = self.text.index(tk.INSERT)
+            if self.text.compare(insert_index, "<", self.input_start_mark):
+                # Allow navigation keys
+                if event.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End'):
+                    return
+                # Block all other keys
+                return "break"
+
+        # Prevent deleting the prompt with backspace at the boundary
+        insert_index = self.text.index(tk.INSERT)
+        if self.text.compare(insert_index, "==", self.input_start_mark) and event.keysym == "BackSpace":
+            return "break"
+            
+        return # Allow the key press
 
     def _on_enter_key(self, event=None):
         command_line = self.text.get(self.input_start_mark, tk.END).strip()

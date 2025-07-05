@@ -13,15 +13,30 @@ import time
 from typing import cast, Union
 import re
 import shutil
+import json
+from platformdirs import user_config_dir # ADDED: Import for platform-specific directories
 
 from code_editor import CodeEditor
 from console_ui import ConsoleUi
 from terminal import Terminal
 from file_explorer import FileExplorer
 
+# --- Core Application Paths ---
 current_dir = os.path.dirname(__file__)
-initial_project_root_dir = os.path.abspath(os.path.join(current_dir, '..'))
-ICON_PATH = os.path.join(initial_project_root_dir, 'assets', 'icons')
+
+initial_project_root_dir = os.path.abspath(os.path.join(current_dir, '..')) 
+
+ICON_PATH = os.path.join(initial_project_root_dir, 'assets', 'icons') 
+
+# --- Settings File Path (using platformdirs) ---
+APP_NAME = "PriestyCode" # Your application's name, used by platformdirs
+
+_settings_dir = user_config_dir(appname=APP_NAME, roaming=True)
+
+os.makedirs(_settings_dir, exist_ok=True)
+
+SETTINGS_PATH = os.path.join(_settings_dir, 'settings.json')
+
 
 PROCESS_END_SIGNAL = "<<ProcessEnd>>"
 PROCESS_ERROR_SIGNAL = "<<ProcessError>>"
@@ -73,9 +88,10 @@ class PriestyCode(tk.Tk):
         self.add_terminal_button: tk.Button
         self.output_notebook: ttk.Notebook
 
-        self.autocomplete_enabled = tk.BooleanVar(value=True)
-        self.proactive_errors_enabled = tk.BooleanVar(value=True)
-        self.highlight_handled_exceptions = tk.BooleanVar(value=True)
+        # --- Settings Management ---
+        self.autosave_timer: str | None = None
+        self._initialize_settings_vars()
+        self._load_settings()
 
         self._load_icons()
         self._configure_styles()
@@ -85,10 +101,56 @@ class PriestyCode(tk.Tk):
         self._create_main_content_area()
         self._bind_shortcuts()
         
+        self.after(1, self._apply_font_size) # Apply initial font size
         self.after(50, self._process_output_queue)
         self.after(200, self._check_virtual_env)
         self.after(500, self._open_sandbox_if_empty)
     
+    def _initialize_settings_vars(self):
+        """Initializes all tk.Vars for settings with default values."""
+        self.autocomplete_enabled = tk.BooleanVar(value=True)
+        self.proactive_errors_enabled = tk.BooleanVar(value=True)
+        self.highlight_handled_exceptions = tk.BooleanVar(value=True)
+        self.fullscreen_var = tk.BooleanVar(value=False)
+        self.autosave_enabled = tk.BooleanVar(value=False)
+        self.autoindent_enabled = tk.BooleanVar(value=True)
+        self.tooltips_enabled = tk.BooleanVar(value=True)
+        self.font_size = tk.IntVar(value=10)
+
+    def _load_settings(self):
+        """Loads settings from a JSON file."""
+        try:
+            with open(SETTINGS_PATH, 'r') as f:
+                settings = json.load(f)
+            
+            self.autocomplete_enabled.set(settings.get('autocomplete_enabled', True))
+            self.proactive_errors_enabled.set(settings.get('proactive_errors_enabled', True))
+            self.highlight_handled_exceptions.set(settings.get('highlight_handled_exceptions', True))
+            self.autosave_enabled.set(settings.get('autosave_enabled', False))
+            self.autoindent_enabled.set(settings.get('autoindent_enabled', True))
+            self.tooltips_enabled.set(settings.get('tooltips_enabled', True))
+            self.font_size.set(settings.get('font_size', 10))
+        except (FileNotFoundError, json.JSONDecodeError):
+            # If file doesn't exist or is invalid, use defaults and save a new one.
+            self._save_settings()
+
+    def _save_settings(self, event=None):
+        """Saves current settings to a JSON file."""
+        settings = {
+            'autocomplete_enabled': self.autocomplete_enabled.get(),
+            'proactive_errors_enabled': self.proactive_errors_enabled.get(),
+            'highlight_handled_exceptions': self.highlight_handled_exceptions.get(),
+            'autosave_enabled': self.autosave_enabled.get(),
+            'autoindent_enabled': self.autoindent_enabled.get(),
+            'tooltips_enabled': self.tooltips_enabled.get(),
+            'font_size': self.font_size.get()
+        }
+        try:
+            with open(SETTINGS_PATH, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+
     def _load_icons(self):
         """Loads and resizes icons used throughout the IDE."""
         self.window_icon = self._load_and_resize_icon('priesty.png', is_photo_image=True)
@@ -108,7 +170,6 @@ class PriestyCode(tk.Tk):
         self.run_icon = self._load_and_resize_icon('run.png', size=24)
         self.pause_icon = self._load_and_resize_icon('pause.png', size=24)
         self.unknown_file_icon = self._load_and_resize_icon('unknwon.png')
-        self.clear_icon = self._load_and_resize_icon('clear_icon.png', size=24)
         self.python_logo_icon = self._load_and_resize_icon('python_logo.png')
         self.close_icon = self._load_and_resize_icon('close_icon.png', size=12)
         self.txt_icon = self._load_and_resize_icon('txt_icon.png')
@@ -155,7 +216,7 @@ class PriestyCode(tk.Tk):
         self.grid_columnconfigure(0, weight=1) # Main content area expands horizontally
 
     def _create_top_toolbar(self):
-        """Creates the top toolbar with IDE name, file info, and run/clear buttons."""
+        """Creates the top toolbar with IDE name, file info, and run button."""
         self.top_toolbar_frame = tk.Frame(self, bg="#3C3C3C", height=30)
         self.top_toolbar_frame.grid(row=0, column=0, sticky="ew")
         self.top_toolbar_frame.grid_propagate(False) # Prevent frame from resizing to fit contents
@@ -169,11 +230,8 @@ class PriestyCode(tk.Tk):
         self.file_name_label.pack(side="left", padx=(2, 10))
 
         btn_kwargs = {"bg": "#3C3C3C", "bd": 0, "activebackground": "#555555", "highlightthickness": 0}
-        self.clear_console_button = tk.Button(self.top_toolbar_frame, command=self._clear_active_output_view, **btn_kwargs)
-        if self.clear_icon: self.clear_console_button.config(image=self.clear_icon)
-        else: self.clear_console_button.config(text="Clear", fg="white")
-        self.clear_console_button.pack(side="right", padx=5)
-
+        
+        # The run_stop_button is now the only one packed to the right, so it will be on the far right.
         self.run_stop_button = tk.Button(self.top_toolbar_frame, command=self._run_code, **btn_kwargs)
         if self.run_icon: self.run_stop_button.config(image=self.run_icon)
         else: self.run_stop_button.config(text="Run", fg="white")
@@ -217,6 +275,7 @@ class PriestyCode(tk.Tk):
 
         refactor_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Refactor", menu=refactor_menu)
+        refactor_menu.add_command(label="Rename...", command=self._rename_active_file)
         refactor_menu.add_command(label="Move Active File...", command=self._move_active_file)
         refactor_menu.add_command(label="Duplicate Active File...", command=self._duplicate_active_file)
 
@@ -228,21 +287,40 @@ class PriestyCode(tk.Tk):
         terminal_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Terminal", menu=terminal_menu)
         terminal_menu.add_command(label="New Terminal Tab", command=self._create_new_terminal)
-        terminal_menu.add_command(label="Open External Terminal", command=self._open_external_terminal)
         terminal_menu.add_separator()
         terminal_menu.add_command(label="Clear Active Terminal/Console", command=self._clear_active_output_view)
         terminal_menu.add_command(label="Clear Errors Console", command=lambda: self.error_console.clear())
         
+        window_menu = tk.Menu(menubar, **menu_kwargs)
+        menubar.add_cascade(label="Window", menu=window_menu)
+        window_menu.add_command(label="Open New IDE Window", command=self._open_new_window)
+        window_menu.add_checkbutton(label="Full Screen", onvalue=True, offvalue=False, variable=self.fullscreen_var, command=self._toggle_fullscreen, accelerator="F11")
+        window_menu.add_separator()
+        window_menu.add_command(label="Reset Layout", command=self._reset_layout)
+        window_menu.add_separator()
+        window_menu.add_command(label="Open External Terminal", command=self._open_external_terminal)
+
         workspace_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Workspace", menu=workspace_menu)
         workspace_menu.add_command(label="Refresh Explorer", command=lambda: self.file_explorer.populate_tree())
+        workspace_menu.add_separator()
+        workspace_menu.add_command(label="Change Interpreter", command=self._change_interpreter)
         workspace_menu.add_command(label="Create Virtual Environment", command=self._create_virtual_env)
-
-        options_menu = tk.Menu(menubar, **menu_kwargs)
-        menubar.add_cascade(label="Options", menu=options_menu)
-        options_menu.add_checkbutton(label="Enable Code Completion", variable=self.autocomplete_enabled, command=self._toggle_autocomplete)
-        options_menu.add_checkbutton(label="Enable Proactive Error Checking", variable=self.proactive_errors_enabled, command=self._toggle_proactive_errors)
-        options_menu.add_checkbutton(label="Highlight Handled Exceptions", variable=self.highlight_handled_exceptions)
+        workspace_menu.add_command(label="Install Requirements", command=self._install_requirements)
+        
+        settings_menu = tk.Menu(menubar, **menu_kwargs)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        settings_menu.add_checkbutton(label="Enable Code Completion", variable=self.autocomplete_enabled, command=self._toggle_autocomplete)
+        settings_menu.add_checkbutton(label="Enable Proactive Error Checking", variable=self.proactive_errors_enabled, command=self._toggle_proactive_errors)
+        settings_menu.add_checkbutton(label="Highlight Handled Exceptions", variable=self.highlight_handled_exceptions, command=self._save_settings)
+        settings_menu.add_separator()
+        settings_menu.add_checkbutton(label="Autosave", variable=self.autosave_enabled, command=self._save_settings)
+        settings_menu.add_checkbutton(label="Auto Indentation", variable=self.autoindent_enabled, command=self._save_settings)
+        settings_menu.add_checkbutton(label="Syntax Tooltips", variable=self.tooltips_enabled, command=self._save_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Zoom In", command=self._zoom_in, accelerator="Ctrl++")
+        settings_menu.add_command(label="Zoom Out", command=self._zoom_out, accelerator="Ctrl+-")
+        settings_menu.add_command(label="Reset Zoom", command=self._reset_zoom, accelerator="Ctrl+0")
 
         help_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -250,9 +328,11 @@ class PriestyCode(tk.Tk):
 
     def _toggle_autocomplete(self):
         if self.active_editor: self.active_editor.autocomplete_active = self.autocomplete_enabled.get()
+        self._save_settings()
 
     def _toggle_proactive_errors(self):
         if self.active_editor: self.active_editor.set_proactive_error_checking(self.proactive_errors_enabled.get())
+        self._save_settings()
 
     def _create_main_content_area(self):
         self.main_paned_window = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -346,6 +426,7 @@ class PriestyCode(tk.Tk):
         
         self._switch_terminal(new_terminal)
         self.output_notebook.select(0) # Switch to Terminal page
+        self._apply_font_size() # Apply current font size to new terminal
         return new_terminal
 
     def _switch_terminal(self, terminal_to_activate: Terminal):
@@ -416,7 +497,8 @@ class PriestyCode(tk.Tk):
             self._open_new_sandbox_tab()
     
     def _open_new_sandbox_tab(self, event=None):
-        content = "# PriestyCode Sandbox\n# This is a temporary file. Save it to keep your changes.\n"
+        # FIX: Provide valid, runnable default code for the sandbox
+        content = "# PriestyCode Sandbox\n# This is a temporary file. Save it to keep your changes.\n\nprint(\"Hello, Sandbox!\")\n"
         self._add_new_tab(file_path="sandbox.py", content=content)
 
     def _check_virtual_env(self):
@@ -461,6 +543,43 @@ class PriestyCode(tk.Tk):
 
         threading.Thread(target=create, daemon=True).start()
 
+    def _change_interpreter(self):
+        """Allows user to manually select a Python interpreter."""
+        filetypes = [("Python Executable", "python.exe"), ("Python Executable", "python"), ("All files", "*.*")] if sys.platform == "win32" else [("Python Executable", "python*"), ("All files", "*.*")]
+        new_path = filedialog.askopenfilename(title="Select Python Interpreter", initialdir=os.path.dirname(self.python_executable), filetypes=filetypes)
+        
+        if new_path and os.path.exists(new_path):
+            self.python_executable = new_path
+            self.venv_warning_shown = True # User manually selected, suppress warning.
+            
+            # Update all terminals
+            for term in self.terminals:
+                term.set_python_executable(self.python_executable)
+                term.clear()
+                term.show_prompt()
+            
+            messagebox.showinfo("Interpreter Changed", f"Python interpreter set to:\n{self.python_executable}", parent=self)
+
+    def _install_requirements(self):
+        """Installs packages from a requirements.txt file in the workspace root."""
+        requirements_path = os.path.join(self.workspace_root_dir, "requirements.txt")
+        if not os.path.exists(requirements_path):
+            messagebox.showwarning("Not Found", "No requirements.txt file found in the workspace root.", parent=self)
+            return
+
+        run_terminal = self._get_run_terminal()
+        self.output_notebook.select(0) # Switch to terminal tab
+        self._switch_terminal(run_terminal)
+
+        # Ensure path to pip and requirements file are quoted
+        command = f'"{self.python_executable}" -m pip install -r "{requirements_path}"'
+        
+        run_terminal.write(f"Executing: {command}\n", ("info_tag",))
+        self.update_idletasks() # Show the message immediately
+        
+        # Use the terminal's built-in command execution
+        run_terminal._handle_shell_command(command)
+        
     def _new_file(self, extension=".py"):
         self._add_new_tab(extension=extension)
 
@@ -502,7 +621,13 @@ class PriestyCode(tk.Tk):
 
     def _add_new_tab(self, file_path=None, content="", extension=".py"):
         editor_frame = tk.Frame(self.editor_content_frame, bg="#2B2B2B")
-        editor = CodeEditor(editor_frame, error_console=self.error_console, autocomplete_icons={'snippet':self.snippet_icon, 'keyword':self.keyword_icon, 'function':self.function_icon, 'variable':self.variable_icon, 'class':self.function_icon})
+        editor = CodeEditor(
+            editor_frame, 
+            error_console=self.error_console,
+            autocomplete_icons={'snippet': self.snippet_icon, 'keyword': self.keyword_icon, 'function': self.function_icon, 'variable': self.variable_icon, 'class': self.function_icon},
+            autoindent_var=self.autoindent_enabled,
+            tooltips_var=self.tooltips_enabled
+        )
         editor.pack(fill="both", expand=True)
 
         is_sandbox = (file_path == "sandbox.py")
@@ -522,6 +647,9 @@ class PriestyCode(tk.Tk):
         editor.set_file_path(file_path); editor.text_area.insert("1.0", content)
         editor.text_area.edit_modified(is_sandbox or is_untitled) # Sandbox/Untitled starts modified
         self.after(50, editor._on_content_changed)
+        editor.text_area.bind("<<Change>>", self._schedule_autosave) # Bind for autosave
+        
+        self.after(1, lambda: editor.set_font_size(self.font_size.get())) # Apply font size
 
         tab = tk.Frame(self.tab_bar_frame, bg="#3C3C3C"); tab.pack(side="left", fill="y", padx=(0, 1))
         icon, new_index = self._get_icon_for_file(file_path), len(self.open_files)
@@ -544,6 +672,10 @@ class PriestyCode(tk.Tk):
         self.current_tab_index = index; self.current_open_file = self.open_files[index]
         new_editor_frame = self.editor_widgets[index]; new_editor_frame.pack(fill="both", expand=True)
         self.active_editor = cast(CodeEditor, new_editor_frame.winfo_children()[0])
+        
+        # Sync editor settings with global settings
+        self.active_editor.autocomplete_active = self.autocomplete_enabled.get()
+        self.active_editor.set_proactive_error_checking(self.proactive_errors_enabled.get())
 
         self._set_tab_appearance(self.tab_widgets[index], active=True)
         self.active_editor.text_area.focus_set(); self._update_file_header(self.current_open_file)
@@ -556,11 +688,16 @@ class PriestyCode(tk.Tk):
     def _close_tab(self, index_to_close, force_ask=False, force_close=False) -> bool:
         if not (0 <= index_to_close < len(self.open_files)): return False
         
+        file_path_to_close = self.open_files[index_to_close]
+        is_sandbox = os.path.basename(file_path_to_close) == "sandbox.py"
+        
         editor_to_close = cast(CodeEditor, self.editor_widgets[index_to_close].winfo_children()[0])
-        if not force_close and editor_to_close.text_area.edit_modified():
-            response = messagebox.askyesnocancel("Save on Close", f"Save changes to {os.path.basename(self.open_files[index_to_close])}?")
+        
+        # FIX: Do not ask to save for sandbox.py
+        if not force_close and editor_to_close.text_area.edit_modified() and not is_sandbox:
+            response = messagebox.askyesnocancel("Save on Close", f"Save changes to {os.path.basename(file_path_to_close)}?")
             if response is None: return False
-            if response and not self._save_file(index_to_close): return False
+            if response and not self._save_file(index=index_to_close): return False
 
         self.tab_widgets.pop(index_to_close).destroy(); self.editor_widgets.pop(index_to_close).destroy(); self.open_files.pop(index_to_close)
         
@@ -592,13 +729,18 @@ class PriestyCode(tk.Tk):
         idx = self.current_tab_index if index is None else index
         if not (0 <= idx < len(self.open_files)): return False
         file_path = self.open_files[idx]
+        editor = cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0])
+
         if file_path.startswith("Untitled-") or file_path == "sandbox.py":
             return self._save_file_as(index=idx)
         try:
-            with open(file_path, "w", encoding="utf-8") as f: f.write(cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0]).text_area.get("1.0", "end-1c"))
-            cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0]).text_area.edit_modified(False)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(editor.text_area.get("1.0", "end-1c"))
+            editor.text_area.edit_modified(False)
             return True
-        except Exception as e: messagebox.showerror("Save Error", f"Failed to save: {e}"); return False
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save: {e}")
+            return False
 
     def _save_file_as(self, event=None, index=None) -> bool:
         idx = self.current_tab_index if index is None else index
@@ -633,6 +775,18 @@ class PriestyCode(tk.Tk):
             return True
         except Exception as e: messagebox.showerror("Save Error", f"Failed to save: {e}"); return False
 
+    def _schedule_autosave(self, event=None):
+        """Schedules the autosave action after a delay."""
+        if self.autosave_timer:
+            self.after_cancel(self.autosave_timer)
+        if self.autosave_enabled.get():
+            self.autosave_timer = self.after(2000, self._perform_autosave) # 2-second delay
+
+    def _perform_autosave(self):
+        """Executes the save operation if the file is modified."""
+        if self.active_editor and self.active_editor.text_area.edit_modified():
+            self._save_file()
+            
     def _run_code(self, event=None):
         if self.is_running: self._stop_code(); return
         if not self.active_editor or not self.current_open_file:
@@ -653,7 +807,7 @@ class PriestyCode(tk.Tk):
         self.output_notebook.select(0)
         self._switch_terminal(run_terminal)
         
-        file_to_run = None
+        file_to_run = self.current_open_file
         if is_sandbox:
             try:
                 # Use a temporary file for sandbox execution
@@ -673,19 +827,29 @@ class PriestyCode(tk.Tk):
         env = os.environ.copy(); env["PYTHONUNBUFFERED"] = "1"; env["PYTHONUTF8"] = "1"
         try:
             # For sandbox, run in workspace root. For files, run in their own dir.
-            cwd = self.workspace_root_dir if os.path.basename(file_path_to_run).startswith("tmp") else os.path.dirname(file_path_to_run)
+            cwd = self.workspace_root_dir if self.temp_run_file else os.path.dirname(file_path_to_run)
 
             self.process = subprocess.Popen([executable_path, file_path_to_run], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, text=True, cwd=cwd, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0, encoding='utf-8', errors='replace', bufsize=1, env=env)
             
             # Start threads to read stdout, stderr, write stdin, and monitor process
-            threading.Thread(target=self._read_stream_to_queue, args=(self.process.stdout, "stdout_tag"), daemon=True).start()
-            threading.Thread(target=self._read_stream_to_queue, args=(self.process.stderr, "stderr_tag"), daemon=True).start()
+            stdout_thread = threading.Thread(target=self._read_stream_to_queue, args=(self.process.stdout, "stdout_tag"), daemon=True)
+            stderr_thread = threading.Thread(target=self._read_stream_to_queue, args=(self.process.stderr, "stderr_tag"), daemon=True)
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
             threading.Thread(target=self._write_to_stdin, daemon=True).start()
-            threading.Thread(target=self._monitor_process, daemon=True).start()
+            threading.Thread(target=self._monitor_process, args=(stdout_thread, stderr_thread), daemon=True).start()
         except Exception as e: self.output_queue.put((PROCESS_ERROR_SIGNAL, f"Failed to start process: {e}"))
 
-    def _monitor_process(self):
-        if self.process: self.output_queue.put((PROCESS_END_SIGNAL, self.process.wait()))
+    def _monitor_process(self, stdout_thread: threading.Thread, stderr_thread: threading.Thread):
+        if self.process:
+            return_code = self.process.wait()
+            # Wait for the reader threads to finish reading all buffered output
+            # from the closed pipes before signaling the end of the process.
+            stdout_thread.join()
+            stderr_thread.join()
+            self.output_queue.put((PROCESS_END_SIGNAL, return_code))
 
     def _execute_in_thread(self, file_to_run_override=None):
         file_path = file_to_run_override or self.current_open_file
@@ -790,13 +954,21 @@ class PriestyCode(tk.Tk):
             while not self.output_queue.empty():
                 char, tag = self.output_queue.get_nowait()
                 if char == PROCESS_END_SIGNAL:
-                    self._cleanup_after_run()
-                    run_terminal.set_interactive_mode(False)
+                    # Error handling must happen BEFORE cleanup, as cleanup resets state
+                    # like self.temp_run_file which is needed to identify sandbox runs.
                     if isinstance(tag, int): # Check if tag is the integer return code
                         full_traceback = self.stderr_buffer + self.stdout_buffer
-                        if tag != 0 and "Traceback" in self.stderr_buffer: self._handle_error_output(self.stderr_buffer, "Runtime Error", "reactive")
-                        elif tag == 0 and "Traceback" in full_traceback and self.highlight_handled_exceptions.get(): self._handle_error_output(full_traceback, "Handled Exception", "handled")
-                        elif tag != 0 and self.stderr_buffer.strip(): self.error_console.display_error("Execution Error", self.stderr_buffer.strip()); self.output_notebook.select(1)
+                        if tag != 0 and "Traceback" in self.stderr_buffer:
+                            self._handle_error_output(self.stderr_buffer, "Runtime Error", "reactive")
+                        elif tag == 0 and "Traceback" in full_traceback and self.highlight_handled_exceptions.get():
+                            self._handle_error_output(full_traceback, "Handled Exception", "handled")
+                        elif tag != 0 and self.stderr_buffer.strip():
+                            self.error_console.display_error("Execution Error", self.stderr_buffer.strip())
+                            self.output_notebook.select(1)
+                    
+                    # Now that errors have been processed, perform cleanup.
+                    self._cleanup_after_run()
+                    run_terminal.set_interactive_mode(False)
                     self.stderr_buffer, self.stdout_buffer = "", ""
                 elif char == PROCESS_ERROR_SIGNAL:
                     self._cleanup_after_run()
@@ -812,36 +984,48 @@ class PriestyCode(tk.Tk):
     def _handle_error_output(self, error_text, default_title, highlight_type):
         full_error_text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', error_text).strip()
         traceback_matches = list(re.finditer(r'File "(.*?)", line (\d+)', full_error_text))
+        
         if traceback_matches:
-            file_path, line_num = traceback_matches[-1].groups()
+            file_path, line_num_str = traceback_matches[-1].groups()
+            line_num = int(line_num_str)
             
-            # For sandbox, the path will be a temp file. We need to map it back.
             is_temp_file = self.temp_run_file and os.path.normcase(file_path) == os.path.normcase(self.temp_run_file)
             
             last_line = full_error_text.strip().split('\n')[-1]
             error_title = last_line.split(':')[0] if 'Error' in last_line or 'Exception' in last_line else default_title
             
+            # Determine the correct editor and method to call
+            editor_to_highlight = None
             if is_temp_file:
-                # Find the sandbox editor
                 for i, open_path in enumerate(self.open_files):
                     if open_path == "sandbox.py":
-                        editor = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
-                        highlight_method = getattr(editor, f"highlight_{highlight_type}_error", None)
-                        if highlight_method: self.after(0, highlight_method, int(line_num), full_error_text)
+                        editor_to_highlight = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
                         break
             else:
-                # Normal file path matching
                 norm_error_path = os.path.normcase(os.path.abspath(file_path))
                 for i, open_path in enumerate(self.open_files):
                     if open_path and os.path.normcase(os.path.abspath(open_path)) == norm_error_path:
-                        editor = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
-                        highlight_method = getattr(editor, f"highlight_{highlight_type}_error", None)
-                        if highlight_method: self.after(0, highlight_method, int(line_num), full_error_text)
+                        editor_to_highlight = cast(CodeEditor, self.editor_widgets[i].winfo_children()[0])
                         break
+            
+            if editor_to_highlight:
+                method_name = ""
+                if highlight_type == "reactive":
+                    method_name = "highlight_runtime_error"
+                elif highlight_type == "handled":
+                    method_name = "highlight_handled_exception"
+                
+                if method_name:
+                    highlight_method = getattr(editor_to_highlight, method_name, None)
+                    if highlight_method:
+                        # Schedule the UI update in the main thread
+                        self.after(0, highlight_method, line_num, full_error_text)
                         
-            self.error_console.display_error(error_title, full_error_text); self.output_notebook.select(1)
+            self.error_console.display_error(error_title, full_error_text)
+            self.output_notebook.select(1)
         else: 
-            self.error_console.display_error(default_title, full_error_text); self.output_notebook.select(1)
+            self.error_console.display_error(default_title, full_error_text)
+            self.output_notebook.select(1)
 
     def run(self): self.protocol("WM_DELETE_WINDOW", self._on_closing); self.mainloop()
         
@@ -872,6 +1056,14 @@ class PriestyCode(tk.Tk):
         if not self.current_open_file or not os.path.exists(self.current_open_file): messagebox.showinfo("Move File", "Open a saved file to move it."); return
         self.file_explorer.move_item(self.current_open_file)
         
+    def _rename_active_file(self):
+        """Renames the currently active file via a dialog."""
+        if not self.current_open_file or not os.path.exists(self.current_open_file):
+            messagebox.showinfo("Rename File", "Open a saved file to rename it.", parent=self)
+            return
+        # Reuse the file explorer's rename logic
+        self.file_explorer._rename_item(self.current_open_file)
+
     def _duplicate_active_file(self):
         if not self.active_editor or not self.current_open_file or not os.path.exists(self.current_open_file): messagebox.showinfo("Duplicate File", "An active, saved file must be open."); return
         base, ext = os.path.splitext(self.current_open_file); new_path_suggestion = f"{base}_copy{ext}"
@@ -890,25 +1082,111 @@ class PriestyCode(tk.Tk):
         self.bind_all("<Control-z>", self._handle_undo)
         self.bind_all("<Control-y>", self._handle_redo)
         if sys.platform != "darwin": self.bind_all("<Control-Shift-Z>", self._handle_redo)
+        self.bind_all("<F11>", lambda e: self._toggle_fullscreen_event())
+        self.bind_all("<Escape>", lambda e: self._escape_fullscreen_event())
+        # Zoom shortcuts
+        self.bind_all("<Control-plus>", self._zoom_in)
+        self.bind_all("<Control-equal>", self._zoom_in) # For layouts where + is shift+=
+        self.bind_all("<Control-minus>", self._zoom_out)
+        self.bind_all("<Control-0>", self._reset_zoom)
+        self.bind_all("<Control-MouseWheel>", self._handle_zoom_scroll)
             
     def _handle_undo(self, event=None):
-        if self.active_editor:
-            try: self.active_editor.text_area.edit_undo()
+        widget = self.focus_get()
+        if isinstance(widget, tk.Text):
+            try: widget.edit_undo()
             except tk.TclError: pass
         return "break"
     
     def _handle_redo(self, event=None):
-        if self.active_editor:
-            try: self.active_editor.text_area.edit_redo()
+        widget = self.focus_get()
+        if isinstance(widget, tk.Text):
+            try: widget.edit_redo()
             except tk.TclError: pass
         return "break"
 
     def _on_closing(self):
+        self._save_settings() # Save settings on close
         if self.is_running: self._stop_code() 
         while self.open_files:
             if not self._close_tab(0, force_ask=True): return
         self.destroy()
 
+    def _open_new_window(self):
+        """Launches a new instance of the IDE in a separate process."""
+        subprocess.Popen([sys.executable, sys.argv[0]])
+
+    def _toggle_fullscreen(self, event=None):
+        """Toggles the window's fullscreen state based on the menu checkbutton."""
+        self.attributes("-fullscreen", self.fullscreen_var.get())
+
+    def _toggle_fullscreen_event(self, event=None):
+        """Toggles fullscreen state and updates the checkbutton variable."""
+        self.fullscreen_var.set(not self.fullscreen_var.get())
+        self._toggle_fullscreen()
+
+    def _escape_fullscreen_event(self, event=None):
+        """Exits fullscreen mode when Escape is pressed."""
+        if self.fullscreen_var.get():
+            self.fullscreen_var.set(False)
+            self._toggle_fullscreen()
+    
+    def _reset_layout(self, event=None):
+        """Resets the positions of the main paned windows to their defaults."""
+        self.update_idletasks() # Ensure widgets have reported their sizes
+        try:
+            main_width = self.main_paned_window.winfo_width()
+            self.main_paned_window.sash_place(0, int(main_width * 0.2), 0)
+
+            right_height = self.right_pane.winfo_height()
+            self.right_pane.sash_place(0, 0, int(right_height * 0.7))
+        except tk.TclError:
+            # Can happen if window isn't fully drawn yet.
+            self.after(100, self._reset_layout)
+
+    # --- Zoom and Font Methods ---
+    def _zoom_in(self, event=None):
+        self.font_size.set(min(30, self.font_size.get() + 1))
+        self._apply_font_size()
+        return "break"
+
+    def _zoom_out(self, event=None):
+        self.font_size.set(max(6, self.font_size.get() - 1))
+        self._apply_font_size()
+        return "break"
+
+    def _reset_zoom(self, event=None):
+        self.font_size.set(10)
+        self._apply_font_size()
+        return "break"
+
+    def _handle_zoom_scroll(self, event):
+        focused_widget = self.focus_get()
+        # Only zoom if an editor, terminal, or console is focused
+        if isinstance(focused_widget, tk.Text):
+            if event.delta > 0: self._zoom_in()
+            else: self._zoom_out()
+            return "break"
+        return
+
+    def _apply_font_size(self):
+        new_size = self.font_size.get()
+        # Update all open editors
+        for editor_frame in self.editor_widgets:
+            editor = cast(CodeEditor, editor_frame.winfo_children()[0])
+            editor.set_font_size(new_size)
+        
+        # Update all terminals
+        term_font = ("Consolas", new_size)
+        for term in self.terminals:
+            term.text.config(font=term_font)
+
+        # Update error console and its specific tags
+        self.error_console.output_console.config(font=("Consolas", new_size))
+        self.error_console.output_console.tag_config("error_title_tag", font=("Consolas", new_size, "bold"))
+        
+        self._save_settings()
+        
 class FindReplaceDialog(tk.Toplevel):
     def __init__(self, parent, editor: CodeEditor):
         super().__init__(parent)
