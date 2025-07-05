@@ -7,6 +7,7 @@ import re
 import ast
 import os
 import inspect
+import keyword
 
 class LocalVariableVisitor(ast.NodeVisitor):
     """An AST visitor specifically for finding variables within a single function's scope."""
@@ -112,22 +113,18 @@ class CodeAnalyzer:
 
 
 class ScopeVisitor(ast.NodeVisitor):
+    """An AST visitor that finds all variable and parameter names in scope at a given line."""
     def __init__(self, target_line):
         self.target_line = target_line
         self.variables_in_scope = set()
-        self._current_scope_node = None
 
     def visit(self, node):
-        if (hasattr(node, 'lineno') and node.lineno <= self.target_line and #type: ignore
-            hasattr(node, 'end_lineno') and node.end_lineno >= self.target_line): #type: ignore
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Module)):
-                self._current_scope_node = node
-        
-        if self._current_scope_node and hasattr(node, 'lineno') and node.lineno < self.target_line: # type: ignore
+        if hasattr(node, 'lineno') and node.lineno < self.target_line: #type: ignore
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Param)):
                 self.variables_in_scope.add(node.id)
             elif isinstance(node, ast.arg):
                 self.variables_in_scope.add(node.arg)
+
         super().generic_visit(node)
 
 
@@ -136,6 +133,7 @@ class AutocompleteManager:
         self.editor = editor_instance
         self.text_area = editor_instance.text_area
         self.icons = icons if icons is not None else {}
+        self.current_word_for_preview = ""
         self.window = tk.Toplevel(self.text_area)
         self.window.wm_overrideredirect(True)
         self.window.withdraw()
@@ -154,13 +152,14 @@ class AutocompleteManager:
         self.preview_text.tag_config("type", foreground="#AAAAAA")
         self.preview_text.tag_config("label", foreground="white", font=("Consolas", 9, "bold"))
         self.preview_text.tag_config("detail", foreground="#AAAAAA")
+        self.preview_text.tag_config("code_preview", foreground="#B4B4B4", background="#222222", font=("Consolas", 9), relief="sunken", borderwidth=1, lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
+        self.preview_text.tag_config("preview_match_highlight", font=("Consolas", 9, "bold", "underline"))
         paned_window.add(preview_frame, weight=3)
         self.completions = []
         self._configure_treeview()
 
     def _configure_treeview(self):
         self.style.configure('Autocomplete.TPanedwindow', sashwidth=2, background="#3C3C3C")
-        # Use a font that is likely to support the Unicode symbols
         font_name = "Segoe UI Symbol" if os.name == 'nt' else "Arial"
         self.style.configure("Custom.Treeview", background="#3C3C3C", foreground="white",
                              fieldbackground="#3C3C3C", borderwidth=0, rowheight=22,
@@ -169,30 +168,36 @@ class AutocompleteManager:
         self.style.layout("Custom.Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])
         self.tree.config(style="Custom.Treeview")
         self.tree.heading('#0', text='')
-        # New tag colors based on spec
-        self.tree.tag_configure('variable', foreground='#80D0FF') # Light Blue
-        self.tree.tag_configure('snippet', foreground='#80D0FF') # Cyan
-        self.tree.tag_configure('keyword', foreground='#FFFFFF') # White
-        self.tree.tag_configure('constant', foreground='#FFA500') # Orange
-        self.tree.tag_configure('function', foreground='#A3E8A3') # Light Green
-        self.tree.tag_configure('method', foreground='#A3E8A3') # Light Green
-        self.tree.tag_configure('constructor', foreground='#C586C0') # Light Purple
-        self.tree.tag_configure('class', foreground='#4EC9B0') # Teal (default)
-        self.tree.tag_configure('module', foreground='#FFD700') # Gold
+        self.tree.tag_configure('variable', foreground='#80D0FF')
+        self.tree.tag_configure('attribute', foreground='#80D0FF') 
+        self.tree.tag_configure('snippet', foreground='#80D0FF')
+        self.tree.tag_configure('keyword', foreground='#FFFFFF')
+        self.tree.tag_configure('constant', foreground='#FFA500')
+        self.tree.tag_configure('function', foreground='#A3E8A3')
+        self.tree.tag_configure('method', foreground='#A3E8A3')
+        self.tree.tag_configure('constructor', foreground='#C586C0')
+        self.tree.tag_configure('class', foreground='#4EC9B0')
+        self.tree.tag_configure('module', foreground='#FFD700')
+        self.tree.tag_configure('text', foreground='#999999') 
         self.tree.bind('<<TreeviewSelect>>', self.update_preview)
         self.tree.bind('<Return>', self.confirm_selection)
         self.tree.bind('<Tab>', self.confirm_selection)
         self.tree.bind('<Double-1>', self.confirm_selection)
         
-    def show(self, completions, bbox):
+    def show(self, completions, current_word):
+        bbox = self.editor.text_area.bbox(tk.INSERT)
         if not completions or not bbox: self.hide(); return
+        
         self.completions = completions
+        self.current_word_for_preview = current_word
         self.tree.delete(*self.tree.get_children())
+
+        # Highlighting is now handled in the preview pane.
         for i, item in enumerate(completions):
             item_type = item.get('type', 'variable')
             symbol = self.icons.get(item_type, ' ')
             self.tree.insert('', 'end', iid=i, text=f" {symbol} {item['label']}", tags=(item_type,))
-            
+
         num_items = len(completions)
         new_height = min(num_items, 10) * 22 + 6
         if not self.window.winfo_viewable():
@@ -203,8 +208,10 @@ class AutocompleteManager:
         else:
             current_x, current_y = self.window.winfo_x(), self.window.winfo_y()
             self.window.geometry(f"550x{new_height}+{current_x}+{current_y}")
+        
         if self.tree.get_children():
-            self.tree.selection_set('0'); self.tree.focus('0')
+            self.tree.selection_set('0')
+            self.tree.focus('0')
 
     def hide(self): self.window.withdraw()
     def is_visible(self): return self.window.winfo_viewable()
@@ -214,33 +221,71 @@ class AutocompleteManager:
         self.preview_text.config(state="normal")
         self.preview_text.delete("1.0", tk.END)
         if selected_ids:
-            selected_index = int(selected_ids[0])
-            item = self.completions[selected_index]
-            source_text = item.get('type', 'suggestion').capitalize()
+            try:
+                # The iid is now just the integer index.
+                selected_index = int(selected_ids[0])
+                item = self.completions[selected_index]
+            except (ValueError, IndexError):
+                self.preview_text.config(state="disabled")
+                return
+
+            source_text_type = item.get('type', 'suggestion')
+            source_text = 'Text' if source_text_type == 'text' else source_text_type.capitalize()
             detail = item.get('detail', '')
+            
+            # Label with highlighting
             self.preview_text.insert("end", f"({source_text}) ", "type")
-            self.preview_text.insert("end", f"{item.get('label')}\n", "label")
+            label = item.get('label', '')
+            match_len = len(self.current_word_for_preview)
+            if self.current_word_for_preview and label.lower().startswith(self.current_word_for_preview.lower()):
+                self.preview_text.insert("end", label[:match_len], "preview_match_highlight")
+                self.preview_text.insert("end", label[match_len:] + "\n", "label")
+            else:
+                self.preview_text.insert("end", f"{label}\n", "label")
+
+            # Detail
             if detail:
                 self.preview_text.insert("end", "-----------------\n", "detail")
-                self.preview_text.insert("end", detail, "detail")
+                if '[code]' in detail:
+                    parts = detail.split('[code]', 1)
+                    description = parts[0].strip()
+                    code_part = parts[1].replace('[/code]', '').strip()
+                    if description: self.preview_text.insert("end", description + "\n\n", "detail")
+                    if code_part: self.preview_text.insert("end", code_part, "code_preview")
+                else:
+                    self.preview_text.insert("end", detail, "detail")
         self.preview_text.config(state="disabled")
 
     def confirm_selection(self, event=None):
         if not self.is_visible(): return 'break'
         selected_ids = self.tree.selection()
         if not selected_ids: return 'break'
-        selected_index = int(selected_ids[0])
-        item = self.completions[selected_index]
+        
+        try:
+            selected_index = int(selected_ids[0])
+            item = self.completions[selected_index]
+        except (ValueError, IndexError):
+            return 'break'
+
         self.editor.perform_autocomplete(item)
         self.hide(); return 'break'
         
     def navigate(self, direction):
         if not self.is_visible(): return
         current_focus = self.tree.focus()
-        if not current_focus: return
-        next_item = self.tree.next(current_focus) if direction > 0 else self.tree.prev(current_focus)
-        if next_item:
-            self.tree.selection_set(next_item); self.tree.focus(next_item); self.tree.see(next_item)
+        if not current_focus: 
+             if self.tree.get_children():
+                self.tree.selection_set('0'); self.tree.focus('0')
+             return 'break'
+        
+        current_index = int(current_focus)
+        new_index = current_index + direction
+        
+        children = self.tree.get_children()
+        if 0 <= new_index < len(children):
+            self.tree.selection_set(str(new_index))
+            self.tree.focus(str(new_index))
+            self.tree.see(str(new_index))
         return 'break'
 
 class CodeEditor(tk.Frame):
@@ -270,16 +315,17 @@ class CodeEditor(tk.Frame):
         self.tooltip_label = tk.Label(self.tooltip_window, text="", justify='left', background="#3C3C3C", foreground="white", relief='solid', borderwidth=1, wraplength=400, font=("Consolas", 9), padx=4, pady=2)
         self.tooltip_label.pack(ipadx=1)
         self.error_tooltip_text = ""
-        # Use a map of unicode symbols instead of image icons now
         self.autocomplete_icons = {
             'snippet': '▶', 'keyword': '🝰', 'function': 'ƒ', 'method': '𝘮',
             'constructor': '⊕', 'constant': 'π', 'variable': 'ⓥ', 'module': '📦',
-            'class': '🅒' # Default for classes
+            'class': '🅒', 'attribute': 'ⓐ', 'text': '🗛'
         }
         self.autocomplete_manager = AutocompleteManager(self, icons=self.autocomplete_icons)
         self.file_path: str | None = None
+        
         self._configure_autocomplete_data()
         self._configure_tags_and_tooltips()
+
         self.text_area.bind("<Configure>", self.update_line_numbers)
         self.text_area.bind("<KeyRelease>", self._on_key_release)
         self.text_area.bind("<<Modified>>", self._on_text_modified)
@@ -323,41 +369,6 @@ class CodeEditor(tk.Frame):
         if not is_active: self.clear_error_highlight()
         else: self._proactive_syntax_check()
     
-    def _get_local_completions(self, line_num: int, all_text: str):
-        lines = all_text.splitlines()
-        if not (0 < line_num <= len(lines)): return set()
-
-        start_line_index, func_indent = -1, -1
-        try:
-            current_line_indent = len(lines[line_num - 1]) - len(lines[line_num - 1].lstrip(' '))
-        except IndexError:
-            return set()
-
-        for i in range(line_num - 1, -1, -1):
-            line = lines[i]
-            indent = len(line) - len(line.lstrip(' '))
-            if line.strip().startswith(('def ', 'async def ')) and indent < current_line_indent:
-                func_indent, start_line_index = indent, i; break
-        
-        if start_line_index == -1: return set()
-
-        func_lines = []
-        for i in range(start_line_index, len(lines)):
-            line = lines[i]
-            if i > start_line_index:
-                indent = len(line) - len(line.lstrip(' '))
-                if line.strip() and indent <= func_indent: break
-            func_lines.append(line)
-        
-        func_code_block = "\n".join(func_lines)
-        
-        try:
-            unindented_code = re.sub(r'^\s{' + str(func_indent) + '}', '', func_code_block, flags=re.MULTILINE)
-            tree = ast.parse(unindented_code)
-            visitor = LocalVariableVisitor(); visitor.visit(tree)
-            return visitor.variables
-        except SyntaxError: return set()
-    
     def _get_self_completions(self):
         all_code = self.text_area.get("1.0", "end-1c")
         lines = all_code.splitlines()
@@ -399,25 +410,18 @@ class CodeEditor(tk.Frame):
             function_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
             for attr in sorted(list(visitor.attributes)):
                 is_method = attr in function_names
-                item_type = 'method' if is_method else 'variable'
+                item_type = 'method' if is_method else 'attribute'
                 if attr == '__init__':
                     item_type = 'constructor'
-                detail = f"{'Method' if is_method else 'Attribute'} of the current class."
+                detail_type = 'Method' if is_method else 'Attribute'
+                detail = f"{detail_type} of the current class."
                 completions.append({'label': attr, 'type': item_type, 'insert': attr, 'detail': detail, 'source': 'Class Member'})
         except SyntaxError: 
             pass 
         return completions
 
     def _update_autocomplete_display(self, manual_trigger=False):
-        # Priority Mapping:
-        # 0: Context-Aware (Locals, self, context snippets)
-        # 1: General-purpose Snippets
-        # 2: Raw Structural Keywords
-        # 3: Common Built-in Functions
-        # 4: Raw Constants
-        # 5: Project-Wide Symbols
-        # 6: Standard Library
-        # 7: "Found in Document" words
+        # Priority Mapping is unchanged
         
         if not self.autocomplete_active: self.autocomplete_manager.hide(); return
         try:
@@ -450,9 +454,7 @@ class CodeEditor(tk.Frame):
                                 })
 
                 completions.sort(key=lambda x: (x.get('priority', 99), x['label']))
-                bbox = self.text_area.bbox(tk.INSERT)
-                if completions and bbox: self.autocomplete_manager.show(completions, bbox)
-                else: self.autocomplete_manager.hide()
+                self.autocomplete_manager.show(completions, partial_member)
                 return
 
         except (tk.TclError, ValueError):
@@ -473,80 +475,67 @@ class CodeEditor(tk.Frame):
         current_word_lower = current_word.lower()
 
         def add_completion(item, priority):
-            if item.get('label') and item['label'] not in labels_so_far:
-                item['priority'] = priority; labels_so_far.add(item['label']); completions.append(item)
+            if item.get('label') and item['label'].lower() not in {l.lower() for l in labels_so_far}:
+                item['priority'] = priority
+                labels_so_far.add(item['label'])
+                completions.append(item)
 
         scope_context = self.code_analyzer.get_scope_context(current_line_num, all_text)
 
-        # A single loop over snippets ensures context is handled correctly.
+        # Priority 0: AST-derived Variables
+        if self.code_analyzer.tree:
+            visitor = ScopeVisitor(current_line_num)
+            visitor.visit(self.code_analyzer.tree)
+            for var in visitor.variables_in_scope:
+                if var.lower().startswith(current_word_lower): 
+                    add_completion({'label': var, 'type': 'variable', 'insert': var, 'detail': 'Variable or parameter in current scope.', 'source': 'Local Scope'}, 0)
+
+        # Snippets
         for s in self.snippets:
-            is_prefix_match = manual_trigger or s['match'].lower().startswith(current_word_lower)
-            if not is_prefix_match: continue
-            
-            s_context = s.get('context')
-            # If a snippet has a context, it's a high-priority context-aware item (Priority 0)
-            if s_context:
-                # Check for context match. `class_body_start` is a special case for `class` context.
-                if s_context == scope_context or (s_context == 'class' and scope_context == 'class_body_start'):
-                    add_completion({**s, 'source': 'Context Snippet'}, 0)
-            # If a snippet has NO context, it's a general-purpose item (Priority 1)
-            else:
-                add_completion({**s, 'source': 'Snippet'}, 1)
+            if s['match'].lower().startswith(current_word_lower) or manual_trigger:
+                if s.get('context'):
+                    if s['context'] == scope_context or (s['context'] == 'class' and scope_context == 'class_body_start'):
+                        add_completion({**s, 'source': 'Context Snippet'}, 0)
+                else:
+                    add_completion({**s, 'source': 'Snippet'}, 1)
 
-        # Priority 0: Local variables
-        local_vars = self._get_local_completions(current_line_num, all_text)
-        for var in local_vars:
-            if var.lower().startswith(current_word_lower): add_completion({'label': var, 'type': 'variable', 'insert': var, 'detail': 'Local variable or parameter.', 'source': 'Local Scope'}, 0)
-
-        # Priority 2: Raw structural keywords
+        # Keywords, Functions, Constants
         for k in self.raw_keywords:
-            if k['type'] == 'keyword':
-                is_prefix_match = manual_trigger or k['label'].lower().startswith(current_word_lower)
-                if is_prefix_match:
-                    add_completion(k, 2)
-        
-        # Priority 3: Common built-in functions
-        for k in self.raw_keywords:
-            if k['type'] == 'function':
-                is_prefix_match = manual_trigger or k['label'].lower().startswith(current_word_lower)
-                if is_prefix_match:
-                    add_completion(k, 3)
+            if k['label'].lower().startswith(current_word_lower) or (manual_trigger and not current_word):
+                if k['type'] == 'keyword': add_completion(k, 2)
+                elif k['type'] == 'function': add_completion(k, 3)
+                elif k['type'] == 'constant': add_completion(k, 4)
 
-        # Priority 4: Raw constants
-        for k in self.raw_keywords:
-            if k['type'] == 'constant':
-                is_prefix_match = manual_trigger or k['label'].lower().startswith(current_word_lower)
-                if is_prefix_match:
-                    add_completion(k, 4)
-
-        # Priority 5: Project-wide symbols
+        # Project-wide symbols
         user_defs = self.code_analyzer.get_definitions()
         for name, info in user_defs.items():
             if name.lower().startswith(current_word_lower): 
                 item_type = info['type']
                 if item_type == 'function':
-                    for i in range(info['lineno'] - 2, -1, -1):
-                        line = all_text.splitlines()[i]
-                        if line.strip().startswith('class '):
-                            item_type = 'method'; break
+                    lines = all_text.splitlines()
+                    if info['lineno'] > 1 and info['lineno'] -2 < len(lines):
+                      for i in range(info['lineno'] - 2, -1, -1):
+                          if lines[i].strip().startswith('class '):
+                              item_type = 'method'; break
                 if name == '__init__': item_type = 'constructor'
                 add_completion({'label': name, 'type': item_type, 'insert': name, 'detail': info['docstring'], 'source': 'User-defined'}, 5)
         
-        # Priority 6: Standard library modules
+        # Standard library modules
         for m in self.standard_libraries:
             if m.lower().startswith(current_word_lower): add_completion({'label': m, 'type': 'module', 'insert': m, 'detail': self.standard_libraries[m].get('tooltip', 'Standard library module.'), 'source': 'Standard Library'}, 6)
         
-        # Priority 7: "Found in Document" words
+        # "Found in Document" words ('text' type)
         if current_word:
-            words_in_doc = set(re.findall(r'\b[a-z_][a-z0-9_]{2,}\b', all_text, re.IGNORECASE))
+            words_in_doc = set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]{1,}\b', all_text))
             for w in sorted(list(words_in_doc)):
-                if w.lower().startswith(current_word_lower) and w not in labels_so_far: add_completion({'label': w, 'type': 'variable', 'insert': w, 'detail': 'Word found elsewhere in the document.', 'source': 'From Document'}, 7)
+                if w.lower().startswith(current_word_lower):
+                    add_completion({'label': w, 'type': 'text', 'insert': w, 'detail': 'Text found elsewhere in the document.', 'source': 'From Document'}, 7)
         
         completions.sort(key=lambda x: (x.get('priority', 99), x['label']))
         if completions:
-            bbox = self.text_area.bbox(tk.INSERT)
-            if bbox: self.autocomplete_manager.show(completions, bbox)
-        else: self.autocomplete_manager.hide()
+            self.autocomplete_manager.show(completions, current_word)
+        else:
+            self.autocomplete_manager.hide()
 
     def _on_dot_key(self, event):
         self.autocomplete_dismissed_word = None
@@ -648,80 +637,72 @@ class CodeEditor(tk.Frame):
         self.after(10, self.update_line_numbers)
 
     def _configure_autocomplete_data(self):
-        # NEW: Separate list for raw keywords to avoid conflicts with snippets
-        self.raw_keywords = [
-            # Keywords
-            {'label': 'and', 'type': 'keyword', 'insert': 'and '}, {'label': 'as', 'type': 'keyword', 'insert': 'as '},
-            {'label': 'assert', 'type': 'keyword', 'insert': 'assert '}, {'label': 'async', 'type': 'keyword', 'insert': 'async '},
-            {'label': 'await', 'type': 'keyword', 'insert': 'await '}, {'label': 'break', 'type': 'keyword', 'insert': 'break'},
-            {'label': 'class', 'type': 'keyword', 'insert': 'class '}, {'label': 'continue', 'type': 'keyword', 'insert': 'continue'},
-            {'label': 'def', 'type': 'keyword', 'insert': 'def '}, {'label': 'del', 'type': 'keyword', 'insert': 'del '},
-            {'label': 'elif', 'type': 'keyword', 'insert': 'elif '}, {'label': 'else', 'type': 'keyword', 'insert': 'else'},
-            {'label': 'except', 'type': 'keyword', 'insert': 'except '}, {'label': 'finally', 'type': 'keyword', 'insert': 'finally'},
-            {'label': 'for', 'type': 'keyword', 'insert': 'for '}, {'label': 'from', 'type': 'keyword', 'insert': 'from '},
-            {'label': 'global', 'type': 'keyword', 'insert': 'global '}, {'label': 'if', 'type': 'keyword', 'insert': 'if '},
-            {'label': 'import', 'type': 'keyword', 'insert': 'import '}, {'label': 'in', 'type': 'keyword', 'insert': 'in '},
-            {'label': 'is', 'type': 'keyword', 'insert': 'is '}, {'label': 'lambda', 'type': 'keyword', 'insert': 'lambda '},
-            {'label': 'nonlocal', 'type': 'keyword', 'insert': 'nonlocal '}, {'label': 'not', 'type': 'keyword', 'insert': 'not '},
-            {'label': 'or', 'type': 'keyword', 'insert': 'or '}, {'label': 'pass', 'type': 'keyword', 'insert': 'pass'},
-            {'label': 'raise', 'type': 'keyword', 'insert': 'raise '}, {'label': 'return', 'type': 'keyword', 'insert': 'return'},
-            {'label': 'try', 'type': 'keyword', 'insert': 'try'}, {'label': 'while', 'type': 'keyword', 'insert': 'while '},
-            {'label': 'with', 'type': 'keyword', 'insert': 'with '}, {'label': 'yield', 'type': 'keyword', 'insert': 'yield '},
-            {'label': 'self', 'type': 'keyword', 'insert': 'self'},
-            # Constants
-            {'label': 'True', 'type': 'constant', 'insert': 'True'}, {'label': 'False', 'type': 'constant', 'insert': 'False'},
-            {'label': 'None', 'type': 'constant', 'insert': 'None'},
-            # Common built-in functions
-            {'label': 'print', 'type': 'function', 'insert': 'print()'}, {'label': 'len', 'type': 'function', 'insert': 'len()'},
-            {'label': 'range', 'type': 'function', 'insert': 'range()'}, {'label': 'str', 'type': 'function', 'insert': 'str()'},
-            {'label': 'int', 'type': 'function', 'insert': 'int()'}, {'label': 'list', 'type': 'function', 'insert': 'list()'},
-            {'label': 'dict', 'type': 'function', 'insert': 'dict()'}, {'label': 'set', 'type': 'function', 'insert': 'set()'},
-            {'label': 'open', 'type': 'function', 'insert': 'open()'}, {'label': 'type', 'type': 'function', 'insert': 'type()'}
-        ]
-
-        # FIX: Snippet for __init__ now matches 'def' and has a better label and context.
-        self.snippets = [
-            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'insert': 'def function_name(params):\n    pass', 'detail': 'Define a new function.'},
-            {'label': 'class (definition)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    pass', 'detail': 'Define a new class.'},
-            {'label': 'if (statement)', 'match': 'if', 'type': 'snippet', 'insert': 'if condition:\n    pass', 'detail': 'If statement.'},
-            {'label': 'for (loop)', 'match': 'for', 'type': 'snippet', 'insert': 'for item in iterable:\n    pass', 'detail': 'For loop.'},
-            {'label': 'while (loop)', 'match': 'while', 'type': 'snippet', 'insert': 'while condition:\n    pass', 'detail': 'While loop.'},
-            {'label': 'with (context)', 'match': 'with', 'type': 'snippet', 'insert': 'with open("file.txt") as f:\n    ', 'detail': 'Context manager.'},
-            {'label': 'try/except (block)', 'match': 'try', 'type': 'snippet', 'insert': 'try:\n    pass\nexcept Exception as e:\n    print(e)', 'detail': 'Exception handling block.'},
-            {'label': 'if __name__ == "__main__"', 'match': 'ifmain', 'type': 'snippet', 'insert': 'if __name__ == "__main__":\n    pass', 'detail': 'Standard boilerplate for making a script executable.'},
-            # Context-specific snippets
-            {'label': 'def (__init__)', 'match': 'def', 'context': 'class_body_start', 'type': 'constructor', 'insert': 'def __init__(self):\n    pass', 'detail': 'Class constructor method.'},
-            {'label': 'def (method)', 'match': 'def', 'context': 'class', 'type': 'snippet', 'insert': 'def my_method(self, arg1):\n    pass', 'detail': 'Define a new class method.'}
-        ]
+        # Data dictionaries are defined first to prevent initialization errors.
+        self.keyword_tooltips = {
+            'if': "The 'if' keyword is used for conditional execution.\n\nExample:\nif x > 5:\n    print('x is greater than 5')", 'elif': "The 'elif' keyword is a contraction of 'else if'. It allows checking multiple expressions.\n\nExample:\nif x > 10:\n    print('x is large')\nelif x > 5:\n    print('x is medium')", 'else': "The 'else' keyword catches anything which isn't caught by the preceding 'if' or 'elif' clauses.\n\nExample:\nif x > 5:\n    print('x is greater than 5')\nelse:\n    print('x is 5 or less')", 'for': "The 'for' keyword is used to iterate over the items of any sequence.\n\nExample:\nfor i in range(3):\n    print(i)", 'while': "The 'while' keyword is used to execute a block of code as long as a condition is true.\n\nExample:\ncount = 0\nwhile count < 3:\n    print(count)\n    count += 1", 'break': "The 'break' statement terminates the current 'for' or 'while' loop.\n\nExample:\nfor i in range(10):\n    if i == 3:\n        break\n    print(i)", 'continue': "The 'continue' statement rejects all the remaining statements in the current iteration of the loop and moves the control back to the top of the loop.\n\nExample:\nfor i in range(5):\n    if i == 2:\n        continue\n    print(i)", 'def': "The 'def' keyword is used to define a function.\n\nExample:\ndef my_function(name):\n    print(f'Hello, {name}')", 'class': "The 'class' keyword is used to create a new user-defined class.\n\nExample:\nclass MyClass:\n    x = 5", 'return': "The 'return' statement exits a function, optionally passing back a value.\n\nExample:\ndef add(a, b):\n    return a + b", 'yield': "The 'yield' keyword is used in generator functions. It produces a value for the generator and pauses execution.\n\nExample:\ndef my_generator():\n    for i in range(3):\n        yield i", 'try': "The 'try' keyword starts a block of code that might raise an exception.\n\nExample:\ntry:\n    x = 1 / 0\nexcept ZeroDivisionError:\n    print('Cannot divide by zero!')", 'except': "The 'except' keyword catches exceptions raised in the 'try' block.\n\nExample:\ntry:\n    # ...\nexcept ValueError as e:\n    print(e)", 'finally': "The 'finally' clause is always executed before leaving the 'try' statement, whether an exception has occurred or not.\n\nExample:\nf = open('file.txt')\ntry:\n    # ...\nfinally:\n    f.close()", 'with': "The 'with' statement is used to wrap the execution of a block with methods defined by a context manager.\n\nExample:\nwith open('file.txt') as f:\n    content = f.read()", 'as': "The 'as' keyword is used to create an alias when importing modules, or in 'with' and 'except' statements.\n\nExample:\nimport numpy as np", 'import': "The 'import' statement is used to bring a module or members of a module into the current namespace.\n\nExample:\nimport math", 'from': "The 'from' keyword is used with 'import' to bring specific members of a module into the namespace.\n\nExample:\nfrom math import sqrt", 'pass': "The 'pass' statement is a null operation; nothing happens when it executes. It is useful as a placeholder.", 'assert': "The 'assert' statement is a debugging aid that tests a condition. If the condition is false, it raises an AssertionError.\n\nExample:\nassert x > 0, 'x must be positive'", 'lambda': "The 'lambda' keyword is used to create small anonymous functions.\n\nExample:\nadd = lambda a, b: a + b", 'global': "The 'global' keyword declares that a variable inside a function is global (belongs to the global scope).\n\nExample:\ndef my_func():\n    global x\n    x = 10", 'nonlocal': "The 'nonlocal' keyword is used to work with variables in the nearest enclosing scope that are not global.\n\nExample:\ndef outer():\n    x = 'local'\n    def inner():\n        nonlocal x\n        x = 'nonlocal'\n    inner()", 'del': "The 'del' statement is used to remove an object reference.\n\nExample:\na = [1, 2, 3]\ndel a[1]", 'in': "The 'in' keyword is a membership operator, testing if a sequence contains a value.\n\nExample:\nif 2 in [1, 2, 3]:\n    print('Found')", 'is': "The 'is' keyword is an identity operator, testing if two variables point to the same object.\n\nExample:\nif a is b:\n    print('a and b are the same object')", 'and': "Logical AND operator.", 'or': "Logical OR operator.", 'not': "Logical NOT operator.", 'async': "The 'async' keyword is used to declare an asynchronous function (coroutine).\n\nExample:\nasync def my_coroutine():\n    await asyncio.sleep(1)", 'await': "The 'await' keyword is used to pause the execution of a coroutine until an awaitable object completes.\n\nExample:\nresult = await some_coroutine()", 'self': "Refers to the instance of the class."
+        }
+        self.builtin_tooltips = {
+            'print': "print(*objects, sep=' ', end='\\n', ...)\n\nPrints the values to a stream, or to sys.stdout by default.", 'len': "len(s)\n\nReturn the length (the number of items) of an object.", 'str': "str(object='') -> str\n\nReturn a string version of object.", 'int': "int(x, base=10) -> integer\n\nConvert a number or string to an integer.", 'list': "list(iterable) -> new list\n\nReturn a list whose items are the same and in the same order as iterable's items.", 'dict': "dict(**kwarg) -> new dictionary\n\nCreate a new dictionary.", 'range': "range(stop) -> range object\nrange(start, stop[, step]) -> range object\n\nReturn an object that produces a sequence of integers from start (inclusive) to stop (exclusive) by step.", 'open': "open(file, mode='r', ...)\n\nOpen file and return a corresponding file object.", 'type': "type(object_or_name, bases, dict)\n\nWith one argument, return the type of an object. With three arguments, return a new type object.", 'enumerate': "enumerate(iterable, start=0)\n\nReturn an enumerate object. iterable must be a sequence, an iterator, or some other object which supports iteration.", 'zip': "zip(*iterables)\n\nMake an iterator that aggregates elements from each of the iterables.", 'sorted': "sorted(iterable, *, key=None, reverse=False)\n\nReturn a new sorted list from the items in iterable."
+        }
         
-        self.builtin_list = ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr', 'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple', 'type', 'vars', 'zip']
         self.exception_list = ['Exception', 'BaseException', 'ArithmeticError', 'AssertionError', 'AttributeError', 'EOFError', 'ImportError', 'ModuleNotFoundError', 'IndexError', 'KeyError', 'KeyboardInterrupt', 'MemoryError', 'NameError', 'NotImplementedError', 'OSError', 'OverflowError', 'RecursionError', 'RuntimeError', 'SyntaxError', 'SystemError', 'TypeError', 'ValueError', 'ZeroDivisionError', 'FileNotFoundError', 'PermissionError', 'TimeoutError', 'ConnectionError']
         self.exception_tooltips = {'Exception': 'Common base class for all non-exit exceptions.', 'BaseException': 'The base class for all built-in exceptions.', 'ArithmeticError': 'Base class for arithmetic errors.', 'AssertionError': 'Raised when an assert statement fails.', 'AttributeError': 'Raised when an attribute reference or assignment fails.', 'EOFError': 'Raised when input() hits an end-of-file condition (EOF).', 'ImportError': 'Raised when an import statement has trouble trying to load a module.', 'ModuleNotFoundError': 'A subclass of ImportError; raised when a module could not be found.', 'IndexError': 'Raised when a sequence subscript is out of range.', 'KeyError': 'Raised when a mapping (dictionary) key is not found.', 'KeyboardInterrupt': 'Raised when the user hits the interrupt key (normally Ctrl+C).', 'MemoryError': 'Raised when an operation runs out of memory.', 'NameError': 'Raised when a local or global name is not found.', 'NotImplementedError': 'Raised by abstract methods.', 'OSError': 'Raised for system-related errors.', 'OverflowError': 'Raised when the result of an arithmetic operation is too large to be represented.', 'RecursionError': 'Raised when the maximum recursion depth is exceeded.', 'RuntimeError': 'Raised when an error is detected that doesn’t fall in any of the other categories.', 'SyntaxError': 'Raised when the parser encounters a syntax error.', 'SystemError': 'Raised for interpreter-level errors.', 'TypeError': 'Raised when an operation or function is applied to an object of inappropriate type.', 'ValueError': 'Raised when a function receives an argument of the correct type but an inappropriate value.', 'ZeroDivisionError': 'Raised when the second argument of a division or modulo operation is zero.', 'FileNotFoundError': 'Raised when a file or directory is requested but doesn’t exist.', 'PermissionError': 'Raised when trying to run an operation without the adequate access rights.', 'TimeoutError': 'Raised when a system function timed out at the system level.', 'ConnectionError': 'A base class for connection-related issues.'}
-        self.standard_libraries = {'os': {'members': ['path', 'name', 'environ', 'getcwd', 'listdir', 'mkdir', 'makedirs', 'remove', 'removedirs', 'rename', 'rmdir', 'stat', 'system'], 'tooltip': 'Operating system interfaces.'}, 'sys': {'members': ['argv', 'exit', 'path', 'platform', 'stdin', 'stdout', 'stderr', 'version'], 'tooltip': 'System-specific parameters and functions.'}, 're': {'members': ['search', 'match', 'fullmatch', 'split', 'findall', 'finditer', 'sub', 'compile', 'escape'], 'tooltip': 'Regular expression operations.'}, 'json': {'members': ['dump', 'dumps', 'load', 'loads'], 'tooltip': 'JSON encoder and decoder.'}, 'datetime': {'members': ['datetime', 'date', 'time', 'timedelta', 'timezone', 'now', 'utcnow'], 'tooltip': 'Classes for manipulating dates and times.'}, 'math': {'members': ['ceil', 'floor', 'sqrt', 'pi', 'e', 'sin', 'cos', 'tan', 'log', 'log10', 'pow', 'fabs'], 'tooltip': 'Mathematical functions.'}, 'random': {'members': ['random', 'randint', 'choice', 'choices', 'shuffle', 'uniform'], 'tooltip': 'Generate pseudo-random numbers.'}, 'subprocess': {'members': ['run', 'Popen', 'call', 'check_call', 'check_output', 'PIPE', 'STDOUT'], 'tooltip': 'Subprocess management.'}, 'threading': {'members': ['Thread', 'Lock', 'Event', 'Semaphore', 'current_thread'], 'tooltip': 'Thread-based parallelism.'}, 'collections': {'members': ['defaultdict', 'Counter', 'deque', 'namedtuple', 'OrderedDict'], 'tooltip': 'High-performance container datatypes.'}, 'tkinter': {'members': ['Tk', 'Frame', 'Button', 'Label', 'Entry', 'Text', 'ttk', 'filedialog', 'messagebox'], 'tooltip': 'The standard Python interface to the Tcl/Tk GUI toolkit.'}, 'traceback': {'members': ['print_exc', 'format_exc', 'extract_stack'], 'tooltip': 'Print or retrieve a stack traceback.'}, 'time': {'members': ['time', 'sleep', 'asctime'], 'tooltip': 'Time access and conversions.'}}
-        self.standard_library_function_tooltips = {'os.path': 'Common pathname manipulations.', 'os.path.join': 'os.path.join(*paths) -> str\nJoin one or more path components intelligently.', 'os.path.exists': 'os.path.exists(path) -> bool\nReturn True if path refers to an existing path.', 'os.path.isdir': 'os.path.isdir(path) -> bool\nReturn True if path is an existing directory.', 'os.path.isfile': 'os.path.isfile(path) -> bool\nReturn True if path is an existing regular file.', 'os.getcwd': 'os.getcwd() -> str\nReturn a string representing the current working directory.', 'os.listdir': 'os.listdir(path=".") -> list\nReturn a list of entry names in the directory.', 'sys.exit': 'sys.exit(status=0)\nExit from Python by raising SystemExit.', 'sys.argv': 'A list of command-line arguments passed to a script.', 're.search': 're.search(pattern, string) -> Match or None\nScan string for a match to the pattern.', 're.match': 're.match(pattern, string) -> Match or None\nTry to apply the pattern at the start of the string.', 're.findall': 're.findall(pattern, string) -> list\nReturn all non-overlapping matches of pattern in string.', 're.sub': 're.sub(pattern, repl, string) -> str\nReturn string obtained by replacing occurrences of pattern.', 'json.loads': 'json.loads(s) -> object\nDeserialize a JSON formatted str to a Python object.', 'json.dumps': 'json.dumps(obj) -> str\nSerialize a Python object to a JSON formatted str.', 'json.load': 'json.load(fp) -> object\nDeserialize a file-like object with a JSON document.', 'json.dump': 'json.dump(obj, fp)\nSerialize a Python object to a JSON formatted stream.', 'datetime.datetime.now': 'datetime.datetime.now(tz=None) -> datetime\nReturn the current local date and time.', 'random.randint': 'random.randint(a, b) -> int\nReturn a random integer N such that a <= N <= b.', 'random.choice': 'random.choice(seq)\nReturn a random element from the non-empty sequence.', 'threading.Thread': 'A class that represents a thread of control.', 'tkinter.ttk': 'Themed widget set for Tkinter.', 'tkinter.filedialog': 'Dialogs for file/directory selection.', 'traceback.print_exc': 'traceback.print_exc()\nPrint exception information and stack trace to stderr.'}
-        self.builtin_tooltips = {'print': 'print(*objects, sep=\' \', end=\'\\n\')\nPrints objects to the text stream.', 'len': 'len(obj)\nReturns the number of items in an object.', 'str': 'str(object=\'\') -> str\nReturns a string version of an object.', 'int': 'int(x, base=10) -> integer\nConverts a value to an integer.', 'list': 'list(iterable) -> new list\nCreates a new list from an iterable.', 'dict': 'dict(**kwarg) -> new dictionary\nCreates a new dictionary.', 'range': 'range(start, stop[, step])\nReturns an immutable sequence of numbers.', 'open': 'open(file, mode=\'r\', ...) -> file object\nOpens a file.'}
+        self.standard_libraries = { 'os': {'members': ['path', 'name', 'environ', 'getcwd', 'listdir', 'mkdir', 'makedirs', 'remove', 'removedirs', 'rename', 'rmdir', 'stat', 'system'], 'tooltip': 'Operating system interfaces.'}, 'sys': {'members': ['argv', 'exit', 'path', 'platform', 'stdin', 'stdout', 'stderr', 'version'], 'tooltip': 'System-specific parameters and functions.'}, 're': {'members': ['search', 'match', 'fullmatch', 'split', 'findall', 'finditer', 'sub', 'compile', 'escape'], 'tooltip': 'Regular expression operations.'}, 'json': {'members': ['dump', 'dumps', 'load', 'loads'], 'tooltip': 'JSON encoder and decoder.'}, 'datetime': {'members': ['datetime', 'date', 'time', 'timedelta', 'timezone', 'now', 'utcnow'], 'tooltip': 'Classes for manipulating dates and times.'}, 'math': {'members': ['ceil', 'floor', 'sqrt', 'pi', 'e', 'sin', 'cos', 'tan', 'log', 'log10', 'pow', 'fabs', 'fsum', 'gcd'], 'tooltip': 'Mathematical functions.'}, 'random': {'members': ['random', 'randint', 'choice', 'choices', 'shuffle', 'uniform', 'sample'], 'tooltip': 'Generate pseudo-random numbers.'}, 'subprocess': {'members': ['run', 'Popen', 'call', 'check_call', 'check_output', 'PIPE', 'STDOUT'], 'tooltip': 'Subprocess management.'}, 'threading': {'members': ['Thread', 'Lock', 'Event', 'Semaphore', 'current_thread', 'active_count'], 'tooltip': 'Thread-based parallelism.'}, 'collections': {'members': ['defaultdict', 'Counter', 'deque', 'namedtuple', 'OrderedDict'], 'tooltip': 'High-performance container datatypes.'}, 'itertools': {'members': ['count', 'cycle', 'repeat', 'accumulate', 'chain', 'compress', 'islice', 'permutations', 'combinations'], 'tooltip': 'Functions creating iterators for efficient looping.'}, 'functools': {'members': ['lru_cache', 'partial', 'reduce', 'wraps'], 'tooltip': 'Higher-order functions and operations on callable objects.'}, 'pathlib': {'members': ['Path', 'PurePath'], 'tooltip': 'Object-oriented filesystem paths.'}, 'logging': {'members': ['basicConfig', 'getLogger', 'debug', 'info', 'warning', 'error', 'critical'], 'tooltip': 'Logging facility for Python.'}, 'tkinter': {'members': ['Tk', 'Frame', 'Button', 'Label', 'Entry', 'Text', 'ttk', 'filedialog', 'messagebox'], 'tooltip': 'The standard Python interface to the Tcl/Tk GUI toolkit.'}, 'traceback': {'members': ['print_exc', 'format_exc', 'extract_stack'], 'tooltip': 'Print or retrieve a stack traceback.'}, 'time': {'members': ['time', 'sleep', 'asctime', 'perf_counter'], 'tooltip': 'Time access and conversions.'} }
+        self.standard_library_function_tooltips = { 'os.path': 'Common pathname manipulations.', 'os.path.join': 'os.path.join(*paths) -> str\n\nJoin one or more path components intelligently.', 'os.path.exists': 'os.path.exists(path) -> bool\n\nReturn True if path refers to an existing path.', 'os.path.isdir': 'os.path.isdir(path) -> bool\n\nReturn True if path is an existing directory.', 'os.path.isfile': 'os.path.isfile(path) -> bool\n\nReturn True if path is an existing regular file.', 'os.getcwd': 'os.getcwd() -> str\n\nReturn a string representing the current working directory.', 'os.listdir': 'os.listdir(path=".") -> list\n\nReturn a list of entry names in the directory.', 'sys.exit': 'sys.exit(status=0)\n\nExit from Python by raising SystemExit.', 'sys.argv': 'A list of command-line arguments passed to a script.', 're.search': 're.search(pattern, string) -> Match or None\n\nScan string for a match to the pattern.', 're.match': 're.match(pattern, string) -> Match or None\n\nTry to apply the pattern at the start of the string.', 're.findall': 're.findall(pattern, string) -> list\n\nReturn all non-overlapping matches of pattern in string.', 're.sub': 're.sub(pattern, repl, string) -> str\n\nReturn string obtained by replacing occurrences of pattern.', 'json.loads': 'json.loads(s) -> object\n\nDeserialize a JSON formatted str to a Python object.', 'json.dumps': 'json.dumps(obj) -> str\n\nSerialize a Python object to a JSON formatted str.', 'json.load': 'json.load(fp) -> object\n\nDeserialize a file-like object with a JSON document.', 'json.dump': 'json.dump(obj, fp)\n\nSerialize a Python object to a JSON formatted stream.', 'datetime.datetime.now': 'datetime.datetime.now(tz=None) -> datetime\n\nReturn the current local date and time.', 'random.randint': 'random.randint(a, b) -> int\n\nReturn a random integer N such that a <= N <= b.', 'random.choice': 'random.choice(seq)\n\nReturn a random element from the non-empty sequence.', 'threading.Thread': 'A class that represents a thread of control.', 'pathlib.Path': 'Path(path_segment, ...)\n\nCreate a concrete path for the current OS.', 'logging.basicConfig': 'logging.basicConfig(**kwargs)\n\nDoes basic configuration for the logging system.','tkinter.ttk': 'Themed widget set for Tkinter.', 'tkinter.filedialog': 'Dialogs for file/directory selection.', 'traceback.print_exc': 'traceback.print_exc()\n\nPrint exception information and stack trace to stderr.' }
+        self.builtin_list = list(self.builtin_tooltips.keys()) + ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dir', 'divmod', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'isinstance', 'issubclass', 'iter', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'ord', 'pow', 'property', 'repr', 'reversed', 'round', 'setattr', 'slice', 'staticmethod', 'sum', 'super', 'tuple', 'vars']
+        
+        all_keywords = list(keyword.kwlist) + ['self']
+        self.raw_keywords = []
+        for kw in all_keywords:
+            detail = self.keyword_tooltips.get(kw, f'Python keyword: {kw}')
+            if kw in ['True', 'False', 'None']:
+                self.raw_keywords.append({'label': kw, 'type': 'constant', 'insert': kw, 'detail': detail})
+            elif kw in self.builtin_tooltips:
+                 self.raw_keywords.append({'label': kw, 'type': 'function', 'insert': f'{kw}()', 'detail': self.builtin_tooltips[kw]})
+            else:
+                insert_text = f'{kw} ' if kw not in ['pass', 'break', 'continue', 'return'] else kw
+                self.raw_keywords.append({'label': kw, 'type': 'keyword', 'insert': insert_text, 'detail': detail})
+        
+        self.snippets = [
+            {'label': 'class (basic)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    pass', 'detail': 'Define a simple, empty class.\n[code]class NewClass:\n    pass[/code]'},
+            {'label': 'class (with __init__)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    """Docstring for NewClass."""\n\n    def __init__(self, arg):\n        super(NewClass, self).__init__()\n        self.arg = arg\n    ', 'detail': 'Define a new class with a constructor.\n[code]class NewClass:\n    def __init__(self, arg):\n        self.arg = arg[/code]'},
+            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'insert': 'def function_name(params):\n    """Docstring for function_name."""\n    pass', 'detail': 'Define a new function.\n[code]def name(params):\n    """Docstring..."""\n    pass[/code]'},
+            {'label': 'if (statement)', 'match': 'if', 'type': 'snippet', 'insert': 'if condition:\n    pass', 'detail': 'A conditional statement.\n[code]if condition:\n    pass[/code]'},
+            {'label': 'for (loop)', 'match': 'for', 'type': 'snippet', 'insert': 'for item in iterable:\n    pass', 'detail': 'Iterate over a sequence.\n[code]for item in iterable:\n    pass[/code]'},
+            {'label': 'try/except (block)', 'match': 'try', 'type': 'snippet', 'insert': 'try:\n    pass\nexcept Exception as e:\n    print(f"An error occurred: {e}")', 'detail': 'Block for handling exceptions.\n[code]try:\n    ...\nexcept Exception as e:\n    ...[/code]'},
+            {'label': 'if __name__ == "__main__"', 'match': 'ifmain', 'type': 'snippet', 'insert': 'if __name__ == "__main__":\n    pass', 'detail': 'Standard boilerplate for making a script executable.\n[code]if __name__ == "__main__":\n    # main execution logic[/code]'},
+            {'label': 'def (__init__)', 'match': 'def', 'context': 'class_body_start', 'type': 'constructor', 'insert': 'def __init__(self):\n    pass', 'detail': 'The constructor for a class.\n[code]def __init__(self):\n    pass[/code]'},
+            {'label': 'def (method)', 'match': 'def', 'context': 'class', 'type': 'snippet', 'insert': 'def my_method(self, arg1):\n    pass', 'detail': 'Define a method within a class.\n[code]def my_method(self, arg1):\n    pass[/code]'}
+        ]
 
     def _configure_tags_and_tooltips(self):
         font_size_str = self.text_area.cget("font").split()[1]
         font_size = int(font_size_str) if font_size_str.isdigit() else 10
         bold_font = ("Consolas", font_size, "bold")
-        tag_configs = {"reactive_error_line": {"background": "#FF4C4C"}, "handled_exception_line": {"background": "#FFA500"},"proactive_error_line": {"background": "#b3b300"},"function_definition": {"foreground": "#DCDCAA"},"class_definition": {"foreground": "#4EC9B0"},"function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"}, "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"}, "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"},"priesty_keyword": {"foreground": "#DA70D6"}, "def_keyword": {"foreground": "#569CD6", "font": bold_font},"class_keyword": {"foreground": "#569CD6", "font": bold_font}, "keyword_control": {"foreground": "#C586C0"},"keyword_import": {"foreground": "#4EC9B0"},"keyword_exception": {"foreground": "#D16969"}, "keyword_boolean_null": {"foreground": "#569CD6"},"keyword_logical": {"foreground": "#DCDCAA"}, "keyword_async": {"foreground": "#FFD700"},"keyword_context": {"foreground": "#CE9178"}, "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"},"comment_tag": {"foreground": "#6A9955"}, "function_param": {"foreground": "#9CDCFE"},"bracket_tag": {"foreground": "#FFD700"}, "builtin_function": {"foreground": "#DCDCAA"},"exception_type": {"foreground": "#4EC9B0"}, "dunder_method": {"foreground": "#DA70D6"},"standard_library_module": {"foreground": "#4EC9B0"}, "custom_import": {"foreground": "#9CDCFE"},"standard_library_function": {"foreground": "#DCDCAA"}}
+        
+        tag_configs = { "reactive_error_line": {"background": "#FF4C4C"}, "handled_exception_line": {"background": "#FFA500"}, "proactive_error_line": {"background": "#b3b300"}, "function_definition": {"foreground": "#DCDCAA"}, "class_definition": {"foreground": "#4EC9B0"}, "function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"}, "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"}, "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"}, "priesty_keyword": {"foreground": "#DA70D6"}, "def_keyword": {"foreground": "#569CD6", "font": bold_font}, "class_keyword": {"foreground": "#569CD6", "font": bold_font}, "keyword_conditional": {"foreground": "#C586C0"}, "keyword_loop": {"foreground": "#C586C0"}, "keyword_return": {"foreground": "#C586C0"}, "keyword_structure": {"foreground": "#C586C0"}, "keyword_import": {"foreground": "#4EC9B0"}, "keyword_exception": {"foreground": "#D16969"}, "keyword_boolean_null": {"foreground": "#569CD6"}, "keyword_logical": {"foreground": "#DCDCAA"}, "keyword_async": {"foreground": "#FFD700"}, "keyword_context": {"foreground": "#CE9178"}, "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"}, "comment_tag": {"foreground": "#6A9955"}, "function_param": {"foreground": "#9CDCFE"}, "bracket_tag": {"foreground": "#FFD700"}, "builtin_function": {"foreground": "#DCDCAA"}, "exception_type": {"foreground": "#4EC9B0"}, "dunder_method": {"foreground": "#DA70D6"}, "standard_library_module": {"foreground": "#4EC9B0"}, "custom_import": {"foreground": "#9CDCFE"}, "standard_library_function": {"foreground": "#DCDCAA"} }
         for tag, config in tag_configs.items(): self.text_area.tag_configure(tag, **config)
-        tag_tooltips = {"def_keyword": "def function_name(params):\n    ...\n\nDefines a function.", "class_keyword": "class ClassName(ParentClass):\n    ...\n\nDefines a class.", "keyword_control": "A control flow keyword (e.g., if, for, return, global).", "keyword_import": "import module\n\nBrings a module into the current scope.", "keyword_exception": "try:\n    ...\n\nStarts a block to test for errors, or handles one.", "custom_import": "A user-defined or third-party import.", "self_keyword": "Refers to the instance of the class."}
+        
         self.dunder_tooltips = {'__init__': '__init__(self, ...)\n\nThe constructor method for a class.', '__str__': '__str__(self) -> str\n\nReturns the printable string representation of an object.'}
-        def create_tooltip_handler(tooltip_text):
-            return lambda event: self._show_tooltip(event, tooltip_text) if not any(tag in self.text_area.tag_names(f"@{event.x},{event.y}") for tag in ["reactive_error_line", "proactive_error_line"]) else None
-        for tag, text in tag_tooltips.items():
-            self.text_area.tag_bind(tag, "<Enter>", create_tooltip_handler(text)); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+
+        keyword_tags_for_tooltips = [ "def_keyword", "class_keyword", "keyword_conditional", "keyword_loop", "keyword_return", "keyword_structure", "keyword_import", "keyword_exception", "keyword_logical", "keyword_async", "keyword_context", "self_keyword" ]
+        for tag in keyword_tags_for_tooltips:
+            self.text_area.tag_bind(tag, "<Enter>", self._on_hover_keyword)
+            self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+
         def create_word_hover_handler(tooltip_dict):
             return lambda event: self._on_hover_word(event, tooltip_dict) if not any(tag in self.text_area.tag_names(f"@{event.x},{event.y}") for tag in ["reactive_error_line", "proactive_error_line"]) else None
+        
         for tag, t_dict in [("builtin_function", self.builtin_tooltips), ("exception_type", self.exception_tooltips), ("dunder_method", self.dunder_tooltips)]:
             self.text_area.tag_bind(tag, "<Enter>", create_word_hover_handler(t_dict)); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+        
         for tag in ["function_call", "class_usage"]:
             self.text_area.tag_bind(tag, "<Enter>", self._on_hover_user_defined); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+        
         for tag in ["standard_library_module", "standard_library_function"]:
             handler = self._on_hover_standard_lib_module if 'module' in tag else self._on_hover_standard_lib_function
             self.text_area.tag_bind(tag, "<Enter>", handler); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+        
         for tag in ["reactive_error_line", "proactive_error_line", "handled_exception_line"]:
             self.text_area.tag_bind(tag, "<Enter>", lambda e: self._show_tooltip(e, self.error_tooltip_text)); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
 
@@ -731,6 +712,14 @@ class CodeEditor(tk.Frame):
             definitions = self.code_analyzer.get_definitions()
             if word in definitions: self._show_tooltip(event, definitions[word]['docstring'])
         except tk.TclError: pass
+
+    def _on_hover_keyword(self, event):
+        try:
+            word = self.text_area.get(f"@{event.x},{event.y} wordstart", f"@{event.x},{event.y} wordend")
+            if word in self.keyword_tooltips:
+                self._show_tooltip(event, self.keyword_tooltips[word])
+        except tk.TclError:
+            pass
 
     def _on_hover_standard_lib_module(self, event):
         try:
@@ -960,19 +949,7 @@ class CodeEditor(tk.Frame):
             for m in re.finditer(r"\b" + re.escape(alias) + r"\b", content):
                 if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag(tag, m.start(), m.end())
         
-        static_patterns = { 
-            r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", 
-            r"\b(if|else|elif|for|while|return|break|continue|yield|pass|global|nonlocal|del)\b": "keyword_control",
-            r"\b(import|from|as)\b": "keyword_import", 
-            r"\b(try|except|finally|raise|assert)\b": "keyword_exception", 
-            r"\b(True|False|None)\b": "keyword_boolean_null", 
-            r"\b(and|or|not|in|is)\b": "keyword_logical", 
-            r"\b(async|await)\b": "keyword_async", r"\b(with|lambda)\b": "keyword_context",
-            r"\bPriesty\b": "priesty_keyword", r"\bself\b": "self_keyword",
-            r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", 
-            r"\b(" + "|".join(self.exception_list) + r")\b": "exception_type", 
-            r"[(){}[\]]": "bracket_tag", 
-            r"\b(__init__|__str__|__repr__)\b": "dunder_method"}
+        static_patterns = { r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(if|else|elif)\b": "keyword_conditional", r"\b(for|while|break|continue)\b": "keyword_loop", r"\b(return|yield)\b": "keyword_return", r"\b(pass|global|nonlocal|del)\b": "keyword_structure", r"\b(import|from|as)\b": "keyword_import", r"\b(try|except|finally|raise|assert)\b": "keyword_exception", r"\b(True|False|None)\b": "keyword_boolean_null", r"\b(and|or|not|in|is)\b": "keyword_logical", r"\b(async|await)\b": "keyword_async", r"\b(with|lambda)\b": "keyword_context", r"\bPriesty\b": "priesty_keyword", r"\bself\b": "self_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"\b(" + "|".join(self.exception_list) + r")\b": "exception_type", r"[(){}[\]]": "bracket_tag", r"\b(__init__|__str__|__repr__)\b": "dunder_method"}
         for pattern, tag in static_patterns.items():
             for m in re.finditer(pattern, content):
                 if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "standard_library_module")): self._apply_tag(tag, m.start(), m.end())
