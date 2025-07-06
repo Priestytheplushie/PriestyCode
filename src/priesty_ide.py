@@ -568,7 +568,10 @@ class PriestyCode(tk.Tk):
 
     def _switch_to_tab(self, index: int):
         if not (0 <= index < len(self.tab_widgets)): return
-        if self.active_editor: self.editor_widgets[self.current_tab_index].pack_forget(); self._set_tab_appearance(self.tab_widgets[self.current_tab_index], active=False)
+        if self.active_editor and self.current_tab_index >= 0 and self.current_tab_index < len(self.editor_widgets):
+             self.editor_widgets[self.current_tab_index].pack_forget()
+             self._set_tab_appearance(self.tab_widgets[self.current_tab_index], active=False)
+        
         self.current_tab_index, self.current_open_file = index, self.open_files[index]
         new_editor_frame = self.editor_widgets[index]; new_editor_frame.pack(fill="both", expand=True)
         self.active_editor = cast(CodeEditor, new_editor_frame.winfo_children()[0])
@@ -598,7 +601,10 @@ class PriestyCode(tk.Tk):
             for child in tab.winfo_children()[:-1]: child.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
             tab.bind("<Button-1>", lambda e, new_i=i: self._switch_to_tab(new_i))
         
-        if not self.open_files: self.active_editor = None; self._update_file_header(None)
+        if not self.open_files: 
+            self.active_editor = None
+            self.current_tab_index = -1
+            self._update_file_header(None)
         else: self._switch_to_tab(max(0, min(index_to_close, len(self.open_files) - 1)))
         return True
 

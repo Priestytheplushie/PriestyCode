@@ -4,4 +4,3 @@ from priesty_ide import PriestyCode
 
 ide = PriestyCode()
 ide.run()
-
