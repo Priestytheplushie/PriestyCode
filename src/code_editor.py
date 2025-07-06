@@ -400,6 +400,7 @@ class CodeEditor(tk.Frame):
         self.config(bg="#2B2B2B")
         self.error_console = error_console
         self.last_action_was_auto_feature = False
+        self.last_cursor_pos_before_auto_action = None
         self.autocomplete_active = True
         self.proactive_errors_active = True
         self.autocomplete_dismissed_word = None
@@ -543,6 +544,42 @@ class CodeEditor(tk.Frame):
         line_text_before_cursor = self.text_area.get(f"{insert_index} linestart", insert_index)
         stripped_line = line_text_before_cursor.strip()
 
+        # --- Exception Assistance ---
+        except_match = re.search(r'^\s*except(?:\s+(.*))?$', stripped_line)
+        if except_match:
+            captured_text = except_match.group(1) or ""
+            partial_word = ""
+            if captured_text:
+                partial_word = captured_text.split(',')[-1].lstrip().split('(')[-1]
+
+            in_tuple = '(' in captured_text
+            completions = []
+            for exc_name in self.exception_list:
+                if exc_name.lower().startswith(partial_word.lower()):
+                    completions.append({
+                        'label': exc_name, 
+                        'type': 'class', 
+                        'source': 'Exception', 
+                        'insert': exc_name,
+                        'detail': self.exception_tooltips.get(exc_name, "Built-in Exception."),
+                        'priority': 2
+                    })
+                    if not in_tuple:
+                        completions.append({
+                            'label': f"{exc_name} as e",
+                            'type': 'snippet',
+                            'source': 'Exception Snippet',
+                            'insert': f"{exc_name} as e:",
+                            'detail': f"Catch the {exc_name} and assign it to a variable 'e'.",
+                            'priority': 1
+                        })
+            if completions:
+                completions.sort(key=lambda x: (x.get('priority', 99), x['label']))
+                self.autocomplete_manager.show(completions, partial_word)
+            else:
+                self.autocomplete_manager.hide()
+            return
+
         # --- Suppress Autocomplete for Aliases ---
         if re.search(r'\bas\s+\w*$', stripped_line):
             self.autocomplete_manager.hide()
@@ -596,7 +633,7 @@ class CodeEditor(tk.Frame):
                     all_self_members = self._get_self_completions()
                     for member in all_self_members:
                         if member['label'].lower().startswith(partial_member_lower):
-                            member['priority'] = 0
+                            member['priority'] = 1
                             completions.append(member)
                 else:
                     real_module = self.imported_aliases.get(base_word)
@@ -604,7 +641,7 @@ class CodeEditor(tk.Frame):
                     if base_module_name and base_module_name in self.standard_libraries:
                         for member_name in self.standard_libraries[base_module_name].get('members', []):
                             if member_name.lower().startswith(partial_member_lower):
-                                completions.append({'label': member_name, 'type': 'function', 'insert': member_name, 'detail': self.standard_library_function_tooltips.get(f"{base_module_name}.{member_name}", "Standard library member."), 'source': 'Standard Library', 'priority': 6})
+                                completions.append({'label': member_name, 'type': 'function', 'insert': member_name, 'detail': self.standard_library_function_tooltips.get(f"{base_module_name}.{member_name}", "Standard library member."), 'source': 'Standard Library Member', 'priority': 1})
                 completions.sort(key=lambda x: (x.get('priority', 99), x['label']))
                 self.autocomplete_manager.show(completions, partial_member)
                 return
@@ -625,58 +662,89 @@ class CodeEditor(tk.Frame):
         completions, labels_so_far = [], set()
         current_word_lower = current_word.lower()
 
+        def is_module_imported(module_name):
+            if not module_name: return True
+            for real_name in self.imported_aliases.values():
+                if real_name.split('.')[0] == module_name:
+                    return True
+            return False
+
         def add_completion(item, priority):
-            if item.get('label') and item['label'].lower() not in {l.lower() for l in labels_so_far}:
+            label = item.get('label')
+            if not label:
+                return
+
+            if item.get('requires_import') and not is_module_imported(item['requires_import']):
+                return
+
+            match_text = item.get('match', label)
+
+            should_add = False
+            if manual_trigger:
+                should_add = True
+            elif match_text.lower().startswith(current_word_lower):
+                should_add = True
+
+            if should_add and label.lower() not in {l.lower() for l in labels_so_far}:
                 item['priority'] = priority
-                labels_so_far.add(item['label'])
+                labels_so_far.add(label)
                 completions.append(item)
 
         scope_context, context_line = self.code_analyzer.get_scope_context(current_line_num, all_text)
 
-        # --- GATHERING LOGIC ---
+        # --- GATHERING LOGIC (Priority Order) ---
+
+        # Priority 0: Context-Aware Snippets
+        for s in self.snippets:
+            s_context = s.get('context')
+            if s_context and s_context == scope_context:
+                if scope_context and context_line is not None:
+                    block_type = self.CONTEXT_DISPLAY_NAMES.get(scope_context, "block")
+                    context_message = f"Inside '{block_type}' on line {context_line}"
+                    context_info = {'message': context_message, 'line': context_line, 'context_name': scope_context}
+                    add_completion({**s, 'context_info': context_info}, 0)
+
+        # Priority 1: In-Scope Variables, Parameters, and Class Members
         if self.code_analyzer.tree:
             in_scope_variables = self.code_analyzer.get_scope_completions(current_line_num)
             for var_info in in_scope_variables:
-                if var_info['label'].lower().startswith(current_word_lower):
-                    scope_name = var_info.get('scope', 'Variable')
-                    line_num = var_info.get('lineno', 1)
-                    detail = self.VARIABLE_SCOPE_DESCRIPTIONS.get(scope_name, "A variable in the current scope.")
-                    context_info = {'message': f"Defined on line {line_num}", 'line': line_num}
-                    add_completion({'label': var_info['label'], 'type': 'variable', 'insert': var_info['label'], 'detail': detail, 'source': scope_name, 'context_info': context_info}, 0)
-
-        for s in self.snippets:
-            if s['match'].lower().startswith(current_word_lower) or manual_trigger:
-                s_context = s.get('context')
-                if s_context:
-                    if s_context == scope_context and scope_context is not None:
-                        block_type = self.CONTEXT_DISPLAY_NAMES.get(scope_context, "block")
-                        context_message = f"Inside '{block_type}' on line {context_line}"
-                        context_info = {'message': context_message, 'line': context_line, 'context_name': scope_context}
-                        add_completion({**s, 'source': 'Context Snippet', 'context_info': context_info}, 0)
-                elif manual_trigger or s['match'].lower().startswith(current_word_lower):
-                     add_completion({**s, 'source': 'Snippet'}, 1)
+                scope_name = var_info.get('scope', 'Variable')
+                line_num = var_info.get('lineno', 1)
+                detail = self.VARIABLE_SCOPE_DESCRIPTIONS.get(scope_name, "A variable in the current scope.")
+                context_info = {'message': f"Defined on line {line_num}", 'line': line_num}
+                add_completion({'label': var_info['label'], 'type': 'variable', 'insert': var_info['label'], 'detail': detail, 'source': scope_name, 'context_info': context_info}, 1)
         
-        for k in self.raw_keywords:
-             if k['label'].lower().startswith(current_word_lower) or manual_trigger:
-                if k['type'] == 'keyword': add_completion(k, 2)
-                elif k['type'] == 'function': add_completion(k, 3)
-                elif k['type'] == 'constant': add_completion(k, 4)
-
+        # Priority 2: User-Defined Functions & Classes
         user_defs = self.code_analyzer.get_definitions()
         for name, info in user_defs.items():
-            if name.lower().startswith(current_word_lower): 
-                item_type = info['type']
-                if item_type == 'function':
-                    lines = all_text.splitlines()
-                    if info['lineno'] > 1 and info['lineno'] -2 < len(lines):
-                      for i in range(info['lineno'] - 2, -1, -1):
-                          if lines[i].strip().startswith('class '):
-                              item_type = 'method'; break
-                if name == '__init__': item_type = 'constructor'
-                add_completion({'label': name, 'type': item_type, 'insert': name, 'detail': info['docstring'], 'source': 'User-defined'}, 5)
-        
-        for m in self.standard_libraries:
-            if m.lower().startswith(current_word_lower): add_completion({'label': m, 'type': 'module', 'insert': m, 'detail': self.standard_libraries[m].get('tooltip', 'Standard library module.')}, 6)
+            item_type = info['type']
+            if item_type == 'function':
+                lines = all_text.splitlines()
+                if info['lineno'] > 1 and info['lineno'] -2 < len(lines):
+                  for i in range(info['lineno'] - 2, -1, -1):
+                      if lines[i].strip().startswith('class '):
+                          item_type = 'method'; break
+            if name == '__init__': item_type = 'constructor'
+            add_completion({'label': name, 'type': item_type, 'insert': name, 'detail': info['docstring'], 'source': 'User-defined'}, 2)
+
+        # Priority 3: General Snippets (Promoted)
+        for s in self.snippets:
+            if not s.get('context'):
+                 add_completion(s, 3)
+
+        # Priority 4: Keywords (Demoted)
+        for k in self.raw_keywords:
+            if k['type'] == 'keyword':
+                add_completion(k, 4)
+
+        # Priority 5: Built-in Functions & Constants
+        for k in self.raw_keywords:
+            if k['type'] in ('function', 'constant'):
+                add_completion(k, 5)
+
+        # Priority 6: Standard Library Modules
+        for m, data in self.standard_libraries.items():
+            add_completion({'label': m, 'type': 'module', 'insert': m, 'detail': data.get('tooltip', 'Standard library module.'), 'source': 'Standard Library'}, 6)
         
         completions.sort(key=lambda x: (x.get('priority', 99), x['label']))
         if completions:
@@ -742,22 +810,47 @@ class CodeEditor(tk.Frame):
         self._hide_tooltip(); return None
 
     def _on_key_release(self, event=None):
-        if not event: return
+        if not event:
+            return
 
+        # Always allow manual trigger state to be cleared
         if self.manual_trigger_active:
             self.manual_trigger_active = False
             return
 
-        self.last_action_was_auto_feature = False
-        if event.keysym not in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "parenleft"):
-            self._hide_tooltip()
+        # Ignore key releases for navigation and action keys that have their own handlers.
+        # This prevents the `last_action_was_auto_feature` flag from being cleared
+        # by the release of the same key that set it (e.g., Return).
+        ignored_keys = {"Up", "Down", "Return", "Tab", "Escape", "period", 
+                        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}
+        if event.keysym in ignored_keys:
+            return
         
+        # If the key was not ignored, it's a normal character.
+        # This means any previous auto-feature action is now 'committed' by the user's typing.
+        self.last_action_was_auto_feature = False
+        self.last_auto_action_details = None
+
+        if event.keysym != "parenleft":
+             self._hide_tooltip()
+        
+        # Proactive trigger for 'except' keyword completion
+        try:
+            current_word = self.text_area.get("insert-1c wordstart", "insert")
+            if current_word == "except":
+                self.after(10, self._update_autocomplete_display)
+                return # Prevent slower, generic trigger
+        except tk.TclError:
+            pass
+        
+        # Trigger autocomplete for specific keys like space in certain contexts
         if event.keysym == "space":
-            self.after(10, self._update_autocomplete_display)
+            line_before_cursor = self.text_area.get("insert linestart", "insert")
+            if line_before_cursor.strip() in ("from", "import", "except"):
+                self.after(10, self._update_autocomplete_display)
             return
 
-        if event.keysym in ("Up", "Down", "Return", "Tab", "Escape", "period", "Control_L", "Control_R"): return
-        
+        # For all other character keys, trigger a delayed autocomplete
         self.after(50, self._update_autocomplete_display)
 
     def _on_click(self, event=None):
@@ -765,6 +858,7 @@ class CodeEditor(tk.Frame):
         self._hide_tooltip()
         self.autocomplete_dismissed_word = None
         self.last_action_was_auto_feature = False
+        self.last_auto_action_details = None
 
     def _on_arrow_up(self, event=None):
         if self.autocomplete_manager.is_visible(): return self.autocomplete_manager.navigate(-1)
@@ -776,9 +870,6 @@ class CodeEditor(tk.Frame):
         
     def _on_text_modified(self, event=None):
         if self.text_area.edit_modified():
-            if not self.last_action_was_auto_feature:
-                 self.last_action_was_auto_feature = False
-
             self.text_area.event_generate("<<Change>>")
             self._on_content_changed()
             self.text_area.edit_modified(False)
@@ -792,12 +883,18 @@ class CodeEditor(tk.Frame):
             'if': "The 'if' keyword is used for conditional execution.\n\nExample:\nif x > 5:\n    print('x is greater than 5')", 'elif': "The 'elif' keyword is a contraction of 'else if'. It allows checking multiple expressions.\n\nExample:\nif x > 10:\n    print('x is large')\nelif x > 5:\n    print('x is medium')", 'else': "The 'else' keyword catches anything which isn't caught by the preceding 'if' or 'elif' clauses.\n\nExample:\nif x > 5:\n    print('x is greater than 5')\nelse:\n    print('x is 5 or less')", 'for': "The 'for' keyword is used to iterate over the items of any sequence.\n\nExample:\nfor i in range(3):\n    print(i)", 'while': "The 'while' keyword is used to execute a block of code as long as a condition is true.\n\nExample:\ncount = 0\nwhile count < 3:\n    print(count)\n    count += 1", 'break': "The 'break' statement terminates the current 'for' or 'while' loop.\n\nExample:\nfor i in range(10):\n    if i == 3:\n        break\n    print(i)", 'continue': "The 'continue' statement rejects all the remaining statements in the current iteration of the loop and moves the control back to the top of the loop.\n\nExample:\nfor i in range(5):\n    if i == 2:\n        continue\n    print(i)", 'def': "The 'def' keyword is used to define a function.\n\nExample:\ndef my_function(name):\n    print(f'Hello, {name}')", 'class': "The 'class' keyword is used to create a new user-defined class.\n\nExample:\nclass MyClass:\n    x = 5", 'return': "The 'return' statement exits a function, optionally passing back a value.\n\nExample:\ndef add(a, b):\n    return a + b", 'yield': "The 'yield' keyword is used in generator functions. It produces a value for the generator and pauses execution.\n\nExample:\ndef my_generator():\n    for i in range(3):\n        yield i", 'try': "The 'try' keyword starts a block of code that might raise an exception.\n\nExample:\ntry:\n    x = 1 / 0\nexcept ZeroDivisionError:\n    print('Cannot divide by zero!')", 'except': "The 'except' keyword catches exceptions raised in the 'try' block.\n\nExample:\ntry:\n    # ...\nexcept ValueError as e:\n    print(e)", 'finally': "The 'finally' clause is always executed before leaving the 'try' statement, whether an exception has occurred or not.\n\nExample:\nf = open('file.txt')\ntry:\n    # ...\nfinally:\n    f.close()", 'with': "The 'with' statement is used to wrap the execution of a block with methods defined by a context manager.\n\nExample:\nwith open('file.txt') as f:\n    content = f.read()", 'as': "The 'as' keyword is used to create an alias when importing modules, or in 'with' and 'except' statements.\n\nExample:\nimport numpy as np", 'import': "The 'import' statement is used to bring a module or members of a module into the current namespace.\n\nExample:\nimport math", 'from': "The 'from' keyword is used with 'import' to bring specific members of a module into the namespace.\n\nExample:\nfrom math import sqrt", 'pass': "The 'pass' statement is a null operation; nothing happens when it executes. It is useful as a placeholder.", 'assert': "The 'assert' statement is a debugging aid that tests a condition. If the condition is false, it raises an AssertionError.\n\nExample:\nassert x > 0, 'x must be positive'", 'lambda': "The 'lambda' keyword is used to create small anonymous functions.\n\nExample:\nadd = lambda a, b: a + b", 'global': "The 'global' keyword declares that a variable inside a function is global (belongs to the global scope).\n\nExample:\ndef my_func():\n    global x\n    x = 10", 'nonlocal': "The 'nonlocal' keyword is used to work with variables in the nearest enclosing scope that are not global.\n\nExample:\ndef outer():\n    x = 'local'\n    def inner():\n        nonlocal x\n        x = 'nonlocal'\n    inner()", 'del': "The 'del' statement is used to remove an object reference.\n\nExample:\na = [1, 2, 3]\ndel a[1]", 'in': "The 'in' keyword is a membership operator, testing if a sequence contains a value.\n\nExample:\nif 2 in [1, 2, 3]:\n    print('Found')", 'is': "The 'is' keyword is an identity operator, testing if two variables point to the same object.\n\nExample:\nif a is b:\n    print('a and b are the same object')", 'and': "Logical AND operator.", 'or': "Logical OR operator.", 'not': "Logical NOT operator.", 'async': "The 'async' keyword is used to declare an asynchronous function (coroutine).\n\nExample:\nasync def my_coroutine():\n    await asyncio.sleep(1)", 'await': "The 'await' keyword is used to pause the execution of a coroutine until an awaitable object completes.\n\nExample:\nresult = await some_coroutine()", 'self': "Refers to the instance of the class."
         }
         self.builtin_tooltips = {
-            'print': "print(*objects, sep=' ', end='\\n', ...)\n\nPrints the values to a stream, or to sys.stdout by default.", 'len': "len(s)\n\nReturn the length (the number of items) of an object.", 'str': "str(object='') -> str\n\nReturn a string version of object.", 'int': "int(x, base=10) -> integer\n\nConvert a number or string to an integer.", 'list': "list(iterable) -> new list\n\nReturn a list whose items are the same and in the same order as iterable's items.", 'dict': "dict(**kwarg) -> new dictionary\n\nCreate a new dictionary.", 'range': "range(stop) -> range object\nrange(start, stop[, step]) -> range object\n\nReturn an object that produces a sequence of integers from start (inclusive) to stop (exclusive) by step.", 'open': "open(file, mode='r', ...)\n\nOpen file and return a corresponding file object.", 'type': "type(object_or_name, bases, dict)\n\nWith one argument, return the type of an object. With three arguments, return a new type object.", 'enumerate': "enumerate(iterable, start=0)\n\nReturn an enumerate object. iterable must be a sequence, an iterator, or some other object which supports iteration.", 'zip': "zip(*iterables)\n\nMake an iterator that aggregates elements from each of the iterables.", 'sorted': "sorted(iterable, *, key=None, reverse=False)\n\nReturn a new sorted list from the items in iterable."
+            'print': "print(*objects, sep=' ', end='\\n', ...)\n\nPrints the values to a stream, or to sys.stdout by default.", 'len': "len(s)\n\nReturn the length (the number of items) of an object.", 'str': "str(object='') -> str\n\nReturn a string version of object.", 'int': "int(x, base=10) -> integer\n\nConvert a number or string to an integer.", 'list': "list(iterable) -> new list\n\nReturn a list whose items are the same and in the same order as iterable's items.", 'dict': "dict(**kwarg) -> new dictionary\n\nCreate a new dictionary.", 'range': "range(stop) -> range object\nrange(start, stop[, step]) -> range object\n\nReturn an object that produces a sequence of integers from start (inclusive) to stop (exclusive) by step.", 'open': "open(file, mode='r', ...)\n\nOpen file and return a corresponding file object.", 'type': "type(object_or_name, bases, dict)\n\nWith one argument, return the type of an object. With three arguments, return a new type object.", 'enumerate': "enumerate(iterable, start=0)\n\nReturn an enumerate object. iterable must be a sequence, an iterator, or some other object which supports iteration.", 'zip': "zip(*iterables)\n\nMake an iterator that aggregates elements from each of the iterables.", 'sorted': "sorted(iterable, *, key=None, reverse=False)\n\nReturn a new sorted list from the items in iterable.", 'input': "input(prompt=None, /)\n\nRead a string from standard input. The trailing newline is stripped."
         }
         
         self.exception_list = ['Exception', 'BaseException', 'ArithmeticError', 'AssertionError', 'AttributeError', 'EOFError', 'ImportError', 'ModuleNotFoundError', 'IndexError', 'KeyError', 'KeyboardInterrupt', 'MemoryError', 'NameError', 'NotImplementedError', 'OSError', 'OverflowError', 'RecursionError', 'RuntimeError', 'SyntaxError', 'SystemError', 'TypeError', 'ValueError', 'ZeroDivisionError', 'FileNotFoundError', 'PermissionError', 'TimeoutError', 'ConnectionError']
         self.exception_tooltips = {'Exception': 'Common base class for all non-exit exceptions.', 'BaseException': 'The base class for all built-in exceptions.', 'ArithmeticError': 'Base class for arithmetic errors.', 'AssertionError': 'Raised when an assert statement fails.', 'AttributeError': 'Raised when an attribute reference or assignment fails.', 'EOFError': 'Raised when input() hits an end-of-file condition (EOF).', 'ImportError': 'Raised when an import statement has trouble trying to load a module.', 'ModuleNotFoundError': 'A subclass of ImportError; raised when a module could not be found.', 'IndexError': 'Raised when a sequence subscript is out of range.', 'KeyError': 'Raised when a mapping (dictionary) key is not found.', 'KeyboardInterrupt': 'Raised when the user hits the interrupt key (normally Ctrl+C).', 'MemoryError': 'Raised when an operation runs out of memory.', 'NameError': 'Raised when a local or global name is not found.', 'NotImplementedError': 'Raised by abstract methods.', 'OSError': 'Raised for system-related errors.', 'OverflowError': 'Raised when the result of an arithmetic operation is too large to be represented.', 'RecursionError': 'Raised when the maximum recursion depth is exceeded.', 'RuntimeError': 'Raised when an error is detected that doesn’t fall in any of the other categories.', 'SyntaxError': 'Raised when the parser encounters a syntax error.', 'SystemError': 'Raised for interpreter-level errors.', 'TypeError': 'Raised when an operation or function is applied to an object of inappropriate type.', 'ValueError': 'Raised when a function receives an argument of the correct type but an inappropriate value.', 'ZeroDivisionError': 'Raised when the second argument of a division or modulo operation is zero.', 'FileNotFoundError': 'Raised when a file or directory is requested but doesn’t exist.', 'PermissionError': 'Raised when trying to run an operation without the adequate access rights.', 'TimeoutError': 'Raised when a system function timed out at the system level.', 'ConnectionError': 'A base class for connection-related issues.'}
         
+        self.easter_egg_tooltips = {
+            "this": "The Zen of Python, by Tim Peters\n\nBeautiful is better than ugly.\nExplicit is better than implicit.\nSimple is better than complex.\nComplex is better than complicated.\nFlat is better than nested.\nSparse is better than dense.\nReadability counts.\nSpecial cases aren't special enough to break the rules.\nAlthough practicality beats purity.\nErrors should never pass silently.\nUnless explicitly silenced.\nIn the face of ambiguity, refuse the temptation to guess.\nThere should be one-- and preferably only one --obvious way to do it.\nAlthough that way may not be obvious at first unless you're Dutch.\nNow is better than never.\nAlthough never is often better than *right* now.\nIf the implementation is hard to explain, it's a bad idea.\nIf the implementation is easy to explain, it may be a good idea.\nNamespaces are one honking great idea -- let's do more of those!",
+            "antigravity": "import antigravity\n\nOpens a web browser to the classic xkcd comic about Python.",
+            "from __future__ import braces": "SyntaxError: not a chance"
+        }
+
         self.standard_libraries = {
             'os': {'members': ['path', 'name', 'environ', 'getcwd', 'listdir', 'mkdir', 'makedirs', 'remove', 'removedirs', 'rename', 'rmdir', 'stat', 'system', 'unlink', 'sep'], 'tooltip': 'Provides a way of using operating system dependent functionality. Includes tools for file and directory manipulation, process management, and environment variables. For modern, object-oriented path handling, consider `pathlib`.'}, 
             'sys': {'members': ['argv', 'exit', 'path', 'platform', 'stdin', 'stdout', 'stderr', 'version', 'version_info'], 'tooltip': 'Access to system-specific parameters and functions. Provides information about the Python interpreter, such as `sys.argv` (command-line args), `sys.path` (module search path), and `sys.exit()`.'}, 
@@ -819,42 +916,56 @@ class CodeEditor(tk.Frame):
         }
 
         self.standard_library_function_tooltips = { 'os.path': 'Submodule for common, legacy pathname manipulations. For a modern, object-oriented approach, use the `pathlib` module instead.', 'os.path.join': 'os.path.join(*paths) -> str\n\nJoin path components, inserting the correct separator for the OS.\n[code]os.path.join("data", "files", "report.txt")[/code]', 'os.path.exists': 'os.path.exists(path) -> bool\n\nReturn True if path refers to an existing file or directory.', 'os.path.isdir': 'os.path.isdir(path) -> bool\n\nReturn True if path is an existing directory.', 'os.path.isfile': 'os.path.isfile(path) -> bool\n\nReturn True if path is an existing regular file.', 'os.getcwd': 'os.getcwd() -> str\n\nReturn a string representing the current working directory (CWD).', 'os.listdir': 'os.listdir(path=".") -> list\n\nReturn a list of the names of the entries in the directory given by path.', 'sys.exit': 'sys.exit(status=0)\n\nExit from Python. This is implemented by raising the `SystemExit` exception.', 'sys.argv': 'A list of command-line arguments passed to a Python script. `sys.argv[0]` is the script name itself.', 're.search': 're.search(pattern, string) -> Match or None\n\nScan through a string, looking for the first location where the pattern produces a match.', 're.match': 're.match(pattern, string) -> Match or None\n\nTry to apply the pattern at the start of the string. Returns a match object only if the pattern matches at the beginning.', 're.findall': 're.findall(pattern, string) -> list\n\nReturn all non-overlapping matches of a pattern in a string, as a list of strings.', 're.sub': 're.sub(pattern, repl, string) -> str\n\nReturn the string obtained by replacing the leftmost non-overlapping occurrences of a pattern in a string by the replacement `repl`.', 'json.loads': 'json.loads(s) -> object\n\nDeserialize a JSON-formatted `str` to a Python object (e.g., a `dict` or `list`).\n[code]data = json.loads(\'{"key": "value"}\')[/code]', 'json.dumps': 'json.dumps(obj) -> str\n\nSerialize a Python object to a JSON-formatted `str`.\n[code]json_string = json.dumps({"key": "value"})[/code]', 'json.load': 'json.load(fp) -> object\n\nDeserialize a file-like object (e.g., from `open()`) containing a JSON document to a Python object.', 'json.dump': 'json.dump(obj, fp)\n\nSerialize a Python object as a JSON-formatted stream to a file-like object.', 'datetime.datetime.now': 'datetime.datetime.now(tz=None) -> datetime\n\nReturn the current local date and time. If `tz` is None, the returned object is naive (no timezone info).', 'random.randint': 'random.randint(a, b) -> int\n\nReturn a random integer N such that a <= N <= b (inclusive).', 'random.choice': 'random.choice(seq)\n\nReturn a random element from a non-empty sequence (like a list or tuple).', 'threading.Thread': 'A class that represents a thread of control. Create a subclass or pass a `target` callable to the constructor to specify the code to be run.', 'pathlib.Path': 'Path(*pathsegments)\n\nCreate a concrete path for the current OS. Paths can be joined with the `/` operator.\n[code]p = Path("/etc") / "hosts"[/code]', 'logging.basicConfig': 'logging.basicConfig(**kwargs)\n\nDoes basic configuration for the logging system. Should be called only once, before any calls to `logging.info`, etc.', 'tkinter.ttk': 'Themed widget set for Tkinter, providing modern-looking widgets that adapt to the native platform\'s style.', 'tkinter.filedialog': 'Module containing classes and functions for creating file/directory selection dialogs.', 'traceback.print_exc': 'traceback.print_exc()\n\nPrints exception information and a stack trace to standard error. Commonly used inside an `except` block.' }
-        self.builtin_list = list(self.builtin_tooltips.keys()) + ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dir', 'divmod', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'isinstance', 'issubclass', 'iter', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'ord', 'pow', 'property', 'repr', 'reversed', 'round', 'setattr', 'slice', 'staticmethod', 'sum', 'super', 'tuple', 'vars']
+        self.builtin_list = list(self.builtin_tooltips.keys()) + ['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dir', 'divmod', 'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'isinstance', 'issubclass', 'iter', 'locals', 'map', 'max', 'memoryview', 'min', 'next', 'object', 'oct', 'ord', 'pow', 'property', 'repr', 'reversed', 'round', 'setattr', 'slice', 'staticmethod', 'sum', 'super', 'tuple', 'vars']
         
-        all_keywords = [kw for kw in keyword.kwlist if kw not in ['break', 'continue']] + ['self']
         self.raw_keywords = []
-        for kw in all_keywords:
+        
+        # Process Keywords and built-in constants that are also keywords
+        keyword_set = set(keyword.kwlist)
+        all_keyword_like = keyword_set.union({'self'}) - {'break', 'continue'}
+
+        for kw in all_keyword_like:
             detail = self.keyword_tooltips.get(kw, f'Python keyword: {kw}')
             if kw in ['True', 'False', 'None']:
-                self.raw_keywords.append({'label': kw, 'type': 'constant', 'insert': kw, 'detail': detail})
-            elif kw in self.builtin_tooltips:
-                 self.raw_keywords.append({'label': kw, 'type': 'function', 'insert': f'{kw}()', 'detail': self.builtin_tooltips[kw]})
+                self.raw_keywords.append({'label': kw, 'type': 'constant', 'insert': kw, 'detail': detail, 'source': 'Built-in Constant'})
             else:
-                insert_text = f'{kw} ' if kw not in ['pass', 'return'] else kw
-                self.raw_keywords.append({'label': kw, 'type': 'keyword', 'insert': insert_text, 'detail': detail})
-        
+                insert_text = f'{kw} ' if kw not in ['pass', 'return', 'self'] else kw
+                self.raw_keywords.append({'label': kw, 'type': 'keyword', 'insert': insert_text, 'detail': detail, 'source': 'Keyword'})
+
+        # Process all other built-in functions
+        for b_in in self.builtin_list:
+            if b_in in keyword_set:
+                continue # Avoid duplicating True, False, None
+            
+            detail = self.builtin_tooltips.get(b_in, f"Built-in function: {b_in}")
+            self.raw_keywords.append({'label': b_in, 'type': 'function', 'insert': f'{b_in}()', 'detail': detail, 'source': 'Built-in Function'})
+
         self.snippets = [
-            {'label': 'class (basic)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    pass', 'detail': 'Define a simple, empty class.\n[code]class NewClass:\n    pass[/code]'},
-            {'label': 'class (with __init__)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    """Docstring for NewClass."""\n\n    def __init__(self, arg):\n        super(NewClass, self).__init__()\n        self.arg = arg\n    ', 'detail': 'Define a new class with a constructor.\n[code]class NewClass:\n    def __init__(self, arg):\n        self.arg = arg[/code]'},
-            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'insert': 'def function_name(params):\n    """Docstring for function_name."""\n    pass', 'detail': 'Define a new function.\n[code]def name(params):\n    """Docstring..."""\n    pass[/code]'},
-            {'label': 'for loop (for i in ...)', 'match': 'fori', 'type': 'snippet', 'insert': 'for i, item in enumerate(iterable):\n    pass', 'detail': 'Iterate over a sequence with index and value.'},
-            {'label': 'while True loop', 'match': 'while', 'type': 'snippet', 'insert': 'while True:\n    if condition:\n        break', 'detail': 'Creates an infinite loop with a break condition.'},
-            {'label': 'List Comprehension', 'match': 'lcomp', 'type': 'snippet', 'insert': '[x for x in iterable]', 'detail': 'Creates a list comprehension.\n[code][x for x in iterable if condition][/code]'},
-            {'label': 'Dict Comprehension', 'match': 'dcomp', 'type': 'snippet', 'insert': '{k: v for k, v in items}', 'detail': 'Creates a dictionary comprehension.\n[code]{key: value for item in iterable}[/code]'},
-            {'label': 'Logging Setup', 'match': 'logsetup', 'type': 'snippet', 'insert': 'import logging\nlogging.basicConfig(level=logging.INFO)', 'detail': 'Basic setup for the logging module.'},
-            {'label': 'if __name__ == "__main__"', 'match': 'ifmain', 'type': 'snippet', 'insert': 'if __name__ == "__main__":\n    pass', 'detail': 'Standard boilerplate for making a script executable.\n[code]if __name__ == "__main__":\n    # main execution logic[/code]'},
-            {'label': 'break', 'match': 'break', 'context': 'loop_body', 'type': 'keyword', 'insert': 'break', 'detail': 'Exit the current loop immediately.'},
-            {'label': 'continue', 'match': 'continue', 'context': 'loop_body', 'type': 'keyword', 'insert': 'continue', 'detail': 'Skip to the next iteration of the loop.'},
-            {'label': 'def (__init__)', 'match': 'def', 'context': 'class_body_start', 'type': 'constructor', 'insert': 'def __init__(self):\n    pass', 'detail': 'The constructor for a class.\n[code]def __init__(self):\n    pass[/code]'},
-            {'label': 'def (method)', 'match': 'def', 'context': 'class', 'type': 'snippet', 'insert': 'def my_method(self, arg1):\n    pass', 'detail': 'Define a method within a class.\n[code]def my_method(self, arg1):\n    pass[/code]'}
+            {'label': 'class (basic)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    pass', 'detail': 'Define a simple, empty class.\n[code]class NewClass:\n    pass[/code]', 'source': 'Snippet'},
+            {'label': 'class (with __init__)', 'match': 'class', 'type': 'snippet', 'insert': 'class NewClass:\n    """Docstring for NewClass."""\n\n    def __init__(self, arg):\n        super(NewClass, self).__init__()\n        self.arg = arg\n    ', 'detail': 'Define a new class with a constructor.\n[code]class NewClass:\n    def __init__(self, arg):\n        self.arg = arg[/code]', 'source': 'Snippet'},
+            {'label': 'def (function)', 'match': 'def', 'type': 'snippet', 'insert': 'def function_name(params):\n    """Docstring for function_name."""\n    pass', 'detail': 'Define a new function.\n[code]def name(params):\n    """Docstring..."""\n    pass[/code]', 'source': 'Snippet'},
+            {'label': 'for loop (for i in ...)', 'match': 'fori', 'type': 'snippet', 'insert': 'for i, item in enumerate(iterable):\n    pass', 'detail': 'Iterate over a sequence with index and value.', 'source': 'Snippet'},
+            {'label': 'while True loop', 'match': 'while', 'type': 'snippet', 'insert': 'while True:\n    if condition:\n        break', 'detail': 'Creates an infinite loop with a break condition.', 'source': 'Snippet'},
+            {'label': 'List Comprehension', 'match': 'lcomp', 'type': 'snippet', 'insert': '[x for x in iterable]', 'detail': 'Creates a list comprehension.\n[code][x for x in iterable if condition][/code]', 'source': 'Snippet'},
+            {'label': 'Dict Comprehension', 'match': 'dcomp', 'type': 'snippet', 'insert': '{k: v for k, v in items}', 'detail': 'Creates a dictionary comprehension.\n[code]{key: value for item in iterable}[/code]', 'source': 'Snippet'},
+            {'label': 'Logging Setup', 'match': 'logsetup', 'type': 'snippet', 'insert': 'import logging\nlogging.basicConfig(level=logging.INFO)', 'detail': 'Basic setup for the logging module.', 'source': 'Snippet'},
+            {'label': 'if __name__ == "__main__"', 'match': 'ifmain', 'type': 'snippet', 'insert': 'if __name__ == "__main__":\n    pass', 'detail': 'Standard boilerplate for making a script executable.\n[code]if __name__ == "__main__":\n    # main execution logic[/code]', 'source': 'Snippet'},
+            {'label': 'break', 'match': 'break', 'context': 'loop_body', 'type': 'keyword', 'insert': 'break', 'detail': 'Exit the current loop immediately.', 'source': 'Context Snippet'},
+            {'label': 'continue', 'match': 'continue', 'context': 'loop_body', 'type': 'keyword', 'insert': 'continue', 'detail': 'Skip to the next iteration of the loop.', 'source': 'Context Snippet'},
+            {'label': 'def (__init__)', 'match': 'def', 'context': 'class_body_start', 'type': 'constructor', 'insert': 'def __init__(self):\n    pass', 'detail': 'The constructor for a class.\n[code]def __init__(self):\n    pass[/code]', 'source': 'Context Snippet'},
+            {'label': 'def (method)', 'match': 'def', 'context': 'class', 'type': 'snippet', 'insert': 'def my_method(self, arg1):\n    pass', 'detail': 'Define a method within a class.\n[code]def my_method(self, arg1):\n    pass[/code]', 'source': 'Context Snippet'}
         ]
+
+    def _on_hover_custom_import(self, event):
+        """Shows a generic tooltip for user-defined imports."""
+        self._show_tooltip(event, "User-defined module or class import.")
 
     def _configure_tags_and_tooltips(self):
         font_size_str = self.text_area.cget("font").split()[1]
         font_size = int(font_size_str) if font_size_str.isdigit() else 10
         bold_font = ("Consolas", font_size, "bold")
         
-        tag_configs = { "context_highlight_line": {"background": "#3E3D32"}, "reactive_error_line": {"background": "#FF4C4C"}, "handled_exception_line": {"background": "#FFA500"}, "proactive_error_line": {"background": "#b3b300"}, "function_definition": {"foreground": "#DCDCAA"}, "class_definition": {"foreground": "#4EC9B0"}, "function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"}, "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"}, "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"}, "priesty_keyword": {"foreground": "#DA70D6"}, "def_keyword": {"foreground": "#569CD6", "font": bold_font}, "class_keyword": {"foreground": "#569CD6", "font": bold_font}, "keyword_conditional": {"foreground": "#C586C0"}, "keyword_loop": {"foreground": "#C586C0"}, "keyword_return": {"foreground": "#C586C0"}, "keyword_structure": {"foreground": "#C586C0"}, "keyword_import": {"foreground": "#4EC9B0"}, "keyword_exception": {"foreground": "#D16969"}, "keyword_boolean_null": {"foreground": "#569CD6"}, "keyword_logical": {"foreground": "#DCDCAA"}, "keyword_async": {"foreground": "#FFD700"}, "keyword_context": {"foreground": "#CE9178"}, "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"}, "comment_tag": {"foreground": "#6A9955"}, "function_param": {"foreground": "#9CDCFE"}, "bracket_tag": {"foreground": "#FFD700"}, "builtin_function": {"foreground": "#DCDCAA"}, "exception_type": {"foreground": "#4EC9B0"}, "dunder_method": {"foreground": "#DA70D6"}, "standard_library_module": {"foreground": "#4EC9B0"}, "custom_import": {"foreground": "#9CDCFE"}, "standard_library_function": {"foreground": "#DCDCAA"} }
+        tag_configs = { "context_highlight_line": {"background": "#3E3D32"}, "reactive_error_line": {"background": "#FF4C4C"}, "handled_exception_line": {"background": "#FFA500"}, "proactive_error_line": {"background": "#b3b300"}, "function_definition": {"foreground": "#DCDCAA"}, "class_definition": {"foreground": "#4EC9B0"}, "function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"}, "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"}, "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"}, "priesty_keyword": {"foreground": "#DA70D6"}, "def_keyword": {"foreground": "#569CD6", "font": bold_font}, "class_keyword": {"foreground": "#569CD6", "font": bold_font}, "keyword_conditional": {"foreground": "#C586C0"}, "keyword_loop": {"foreground": "#C586C0"}, "keyword_return": {"foreground": "#C586C0"}, "keyword_structure": {"foreground": "#C586C0"}, "keyword_import": {"foreground": "#4EC9B0"}, "keyword_exception": {"foreground": "#D16969"}, "keyword_boolean_null": {"foreground": "#569CD6"}, "keyword_logical": {"foreground": "#DCDCAA"}, "keyword_async": {"foreground": "#FFD700"}, "keyword_context": {"foreground": "#CE9178"}, "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"}, "comment_tag": {"foreground": "#6A9955"}, "function_param": {"foreground": "#9CDCFE"}, "bracket_tag": {"foreground": "#FFD700"}, "builtin_function": {"foreground": "#DCDCAA"}, "exception_type": {"foreground": "#4EC9B0"}, "dunder_method": {"foreground": "#DA70D6"}, "standard_library_module": {"foreground": "#4EC9B0"}, "custom_import": {"foreground": "#9CDCFE"}, "standard_library_function": {"foreground": "#DCDCAA"}, "easter_egg_import": {"foreground": "#FF8C00"} }
         for tag, config in tag_configs.items(): self.text_area.tag_configure(tag, **config)
         
         self.dunder_tooltips = {'__init__': '__init__(self, ...)\n\nThe constructor method for a class.', '__str__': '__str__(self) -> str\n\nReturns the printable string representation of an object.'}
@@ -873,8 +984,12 @@ class CodeEditor(tk.Frame):
         for tag in ["function_call", "class_usage"]:
             self.text_area.tag_bind(tag, "<Enter>", self._on_hover_user_defined); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
         
-        for tag in ["standard_library_module", "standard_library_function"]:
-            handler = self._on_hover_standard_lib_module if 'module' in tag else self._on_hover_standard_lib_function
+        for tag in ["standard_library_module", "easter_egg_import"]:
+            self.text_area.tag_bind(tag, "<Enter>", self._on_hover_standard_lib_module)
+            self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+        
+        for tag in ["standard_library_function"]:
+            handler = self._on_hover_standard_lib_function
             self.text_area.tag_bind(tag, "<Enter>", handler); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
         
         for tag in ["reactive_error_line", "proactive_error_line", "handled_exception_line"]:
@@ -924,12 +1039,30 @@ class CodeEditor(tk.Frame):
 
     def _on_hover_standard_lib_module(self, event):
         try:
+            # Check for multi-word easter egg first
+            line_start_index = self.text_area.index(f"@{event.x},{event.y} linestart")
+            line_text = self.text_area.get(line_start_index, f"{line_start_index} lineend")
+            braces_key = "from __future__ import braces"
+            if braces_key in line_text:
+                self._show_tooltip(event, self.easter_egg_tooltips[braces_key])
+                return
+
             word = self.text_area.get(f"@{event.x},{event.y} wordstart", f"@{event.x},{event.y} wordend")
+            
+            # Check for single-word easter eggs
+            if word in self.easter_egg_tooltips:
+                self._show_tooltip(event, self.easter_egg_tooltips[word])
+                return
+
             real_module = self.imported_aliases.get(word)
             base_module = real_module.split('.')[0] if real_module else None
             if base_module and base_module in self.standard_libraries:
+                self.text_area.config(cursor="hand2")
                 self._show_tooltip(event, self.standard_libraries[base_module].get('tooltip', 'Standard library module.'))
-        except tk.TclError: pass
+        except tk.TclError:
+            pass
+        finally:
+            self.text_area.tag_bind("standard_library_module", "<Leave>", lambda e: self.text_area.config(cursor="xterm"))
 
     def _on_hover_standard_lib_function(self, event):
         try:
@@ -955,12 +1088,13 @@ class CodeEditor(tk.Frame):
         
         current_line = self.text_area.get("insert linestart", "insert")
         stripped_line = current_line.strip()
-
+        
         if stripped_line.startswith("from ") and " import " in stripped_line:
             parts = current_line.split(" import ")
             base = parts[0] + " import "
             members_part = parts[1].lstrip()
             
+            start_index = self.text_area.index("insert linestart")
             if members_part.strip():
                 members = [m.strip() for m in members_part.split(',')]
                 members[-1] = item['insert']
@@ -968,60 +1102,97 @@ class CodeEditor(tk.Frame):
             else:
                 new_line = base + item['insert']
             
-            self.text_area.delete("insert linestart", "insert lineend")
-            self.text_area.insert("insert linestart", new_line)
+            self.text_area.delete(start_index, "insert lineend")
+            self.text_area.insert(start_index, new_line)
+            end_index = self.text_area.index(tk.INSERT)
 
         elif stripped_line.startswith(("import ", "from ")):
+             start_index = self.text_area.index("insert linestart")
              words = current_line.split()
              words[-1] = item['insert']
              new_line = " ".join(words)
-             self.text_area.delete("insert linestart", "insert lineend")
-             self.text_area.insert("insert linestart", new_line)
+             self.text_area.delete(start_index, "insert lineend")
+             self.text_area.insert(start_index, new_line)
+             end_index = self.text_area.index(tk.INSERT)
 
         else:
             text_to_insert = item['insert']
-            replace_start_index = "insert-1c wordstart"
+            word_before_cursor = ""
             try:
-                text_before_cursor = self.text_area.get("insert linestart", "insert")
-                dot_match = re.search(r'\.([\w_]*)$', text_before_cursor)
-                if dot_match:
-                    start_offset = dot_match.start(1)
-                    line_start_index = self.text_area.index("insert linestart")
-                    replace_start_index = f"{line_start_index} + {start_offset} chars"
-            except tk.TclError:
-                 pass
+                word_before_cursor = self.text_area.get("insert-1c wordstart", "insert")
+            except tk.TclError: pass
 
-            current_word_start = self.text_area.index(replace_start_index)
-            
-            if '\n' in text_to_insert:
+            # Special case for completing right after the 'except' keyword.
+            if item.get('source') in ('Exception', 'Exception Snippet') and word_before_cursor == 'except':
+                start_index = self.text_area.index("insert")
+                self.text_area.insert(start_index, " " + text_to_insert)
+                end_index = self.text_area.index(tk.INSERT)
+            else:
+                # Default replacement logic for all other scenarios.
+                replace_start_index = "insert-1c wordstart"
                 try:
-                    line_start = self.text_area.index(f"{current_word_start} linestart")
-                    line_text = self.text_area.get(line_start, current_word_start)
-                    indent_match = re.match(r'^(\s*)', line_text)
-                    current_indent = indent_match.group(1) if indent_match else ""
-                    lines = text_to_insert.split('\n')
-                    processed_text = lines[0] + '\n' + '\n'.join([current_indent + l for l in lines[1:]])
-                    text_to_insert = processed_text
-                except tk.TclError: pass 
+                    text_before_cursor = self.text_area.get("insert linestart", "insert")
+                    dot_match = re.search(r'\.([\w_]*)$', text_before_cursor)
+                    if dot_match:
+                        start_offset = dot_match.start(1)
+                        line_start_index = self.text_area.index("insert linestart")
+                        replace_start_index = f"{line_start_index} + {start_offset} chars"
+                except (tk.TclError, IndexError):
+                     pass
 
-            self.text_area.delete(current_word_start, "insert")
-            self.text_area.insert(current_word_start, text_to_insert)
-
+                start_index = self.text_area.index(replace_start_index)
+                self.text_area.delete(start_index, "insert")
+                self.text_area.insert(start_index, text_to_insert)
+                end_index = self.text_area.index(tk.INSERT)
+        
+        self.last_auto_action_details = {'start': start_index, 'end': end_index}
         self.last_action_was_auto_feature = True
-        self.text_area.focus_set(); self.after_idle(self._on_content_changed)
+        self.text_area.focus_set()
+        self.after_idle(self._on_content_changed)
 
     def _on_backspace(self, event):
-        if self.last_action_was_auto_feature:
+        # Handle custom undo for auto-features before default backspace behavior.
+        if self.last_action_was_auto_feature and self.last_auto_action_details is None:
+            
+            # Check for the specific case of undoing an auto-indent on an empty line.
+            try:
+                cursor_index = self.text_area.index(tk.INSERT)
+                line_start = self.text_area.index(f"{cursor_index} linestart")
+                text_on_line_before_cursor = self.text_area.get(line_start, cursor_index)
+                
+                # Condition: The line up to the cursor contains only whitespace, and is not empty.
+                # This identifies a line that was just auto-indented.
+                if text_on_line_before_cursor and text_on_line_before_cursor.isspace():
+                    self.last_action_was_auto_feature = False # Consume the flag
+                    
+                    # Manually delete one level of indentation (4 spaces) without removing the newline.
+                    self.text_area.delete("insert-4c", "insert")
+                    
+                    self.autocomplete_manager.hide()
+                    return "break" # Prevent default backspace behavior.
+            except tk.TclError:
+                # If an error occurs (e.g., trying to delete past the start of the line),
+                # fall through to the generic undo which is safer for other cases like auto-brackets.
+                pass
+
+            # If it wasn't an auto-indent (or the check failed), it's likely another
+            # auto-feature like bracketing. Use the original, broad undo logic for that.
             self.last_action_was_auto_feature = False
             try:
                 self.text_area.edit_undo()
+                if self.last_cursor_pos_before_auto_action:
+                    self.text_area.mark_set(tk.INSERT, self.last_cursor_pos_before_auto_action)
             except tk.TclError:
-                pass
+                pass # Ignore errors if undo stack is empty.
             self.autocomplete_manager.hide()
             return "break"
+
+        # Reset the flag if a normal backspace occurs outside of the auto-feature undo logic.
+        self.last_action_was_auto_feature = False
+        self.last_cursor_pos_before_auto_action = None
         
         self.after(50, self._update_autocomplete_display)
-        return None
+        return None # Allow default backspace behavior to proceed.
     
     def _on_ctrl_backspace(self, event):
         self.text_area.delete("insert-1c wordstart", "insert")
@@ -1034,10 +1205,14 @@ class CodeEditor(tk.Frame):
     
     def _on_return_key(self, event):
         if self.autocomplete_manager.is_visible():
+            self.last_auto_action_details = None
+            self.last_cursor_pos_before_auto_action = None
             return self.autocomplete_manager.confirm_selection()
 
         self.autocomplete_dismissed_word = None
         if self.autoindent_var and self.autoindent_var.get():
+            self.last_cursor_pos_before_auto_action = self.text_area.index(tk.INSERT)
+            self.last_auto_action_details = None # Ensure this is cleared for indent actions
             try:
                 cursor_index = self.text_area.index(tk.INSERT)
                 char_before = self.text_area.get(f"{cursor_index}-1c")
@@ -1046,14 +1221,18 @@ class CodeEditor(tk.Frame):
                 bracket_pairs = {'(': ')', '[': ']', '{': '}'}
                 if char_before in bracket_pairs and bracket_pairs[char_before] == char_after:
                     self.text_area.edit_separator()
+                    
                     line_start = self.text_area.index(f"{cursor_index} linestart")
                     current_line = self.text_area.get(line_start, f"{cursor_index} lineend")
                     indent_match = re.match(r'^(\s*)', current_line)
                     base_indent = indent_match.group(1) if indent_match else ""
                     
-                    self.text_area.insert(tk.INSERT, f"\n{base_indent}    \n{base_indent}")
-                    self.text_area.mark_set(tk.INSERT, f"{cursor_index}+{len(base_indent)+5}c")
+                    inserted_text = f"\n{base_indent}    \n{base_indent}"
+                    self.text_area.insert(tk.INSERT, inserted_text)
+                    
                     self.last_action_was_auto_feature = True
+
+                    self.text_area.mark_set(tk.INSERT, f"{cursor_index}+{len(base_indent)+5}c")
                     self.after_idle(self._on_content_changed)
                     return "break"
             except tk.TclError:
@@ -1083,25 +1262,33 @@ class CodeEditor(tk.Frame):
     def _auto_complete_brackets(self, event, open_char, close_char, show_signature=False):
         self.autocomplete_dismissed_word = None
         self.text_area.edit_separator()
+        self.last_cursor_pos_before_auto_action = self.text_area.index(tk.INSERT)
+        self.last_auto_action_details = None # Clear this for bracket completion
+
         if self.text_area.tag_ranges("sel"):
             sel_start, sel_end = self.text_area.index("sel.first"), self.text_area.index("sel.last")
             selected_text = self.text_area.get(sel_start, sel_end)
             self.text_area.delete(sel_start, sel_end)
             self.text_area.insert(sel_start, open_char + selected_text + close_char)
+            self.last_action_was_auto_feature = False
         else:
             self.text_area.insert(tk.INSERT, open_char + close_char)
+            self.last_action_was_auto_feature = True
             self.text_area.mark_set(tk.INSERT, "insert-1c")
+
         if show_signature: self.after(20, self._show_signature_help)
-        self.last_action_was_auto_feature = True
         return "break"
 
     def _auto_indent(self, event):
         self.text_area.edit_separator()
-
+        
         cursor_index = self.text_area.index(tk.INSERT)
         line_number = int(cursor_index.split('.')[0])
         current_line_content = self.text_area.get(f"{line_number}.0", f"{line_number}.end")
         stripped_line = current_line_content.strip()
+        
+        current_indent_str_match = re.match(r'^(\s*)', current_line_content)
+        current_indent_str = current_indent_str_match.group(1) if current_indent_str_match else ""
         
         parent_indent_str = ""
         for i in range(line_number - 1, 0, -1):
@@ -1111,24 +1298,15 @@ class CodeEditor(tk.Frame):
                 parent_indent_str = indent_match.group(1) if indent_match else ""
                 break
         
-        dedent_and_indent_keywords = ('elif', 'else:', 'except', 'finally:')
-        
-        current_indent_str_match = re.match(r'^(\s*)', current_line_content)
-        current_indent_str = current_indent_str_match.group(1) if current_indent_str_match else ""
-        
         next_line_indent_str = current_indent_str
-        
-        if stripped_line.endswith(':'):
-            next_line_indent_str += "    "
-            
-        if any(stripped_line.startswith(k) for k in dedent_and_indent_keywords):
-            self.text_area.delete(f"{line_number}.0", f"{line_number}.{len(current_indent_str)}")
-            self.text_area.insert(f"{line_number}.0", parent_indent_str)
-            
-            next_line_indent_str = parent_indent_str
-            if stripped_line.endswith(':'):
-                next_line_indent_str += "    "
 
+        # Rule 1: De-dent after a block-ending statement or on a blank line
+        if not stripped_line or stripped_line in ('pass', 'break', 'continue') or stripped_line.startswith('return'):
+            next_line_indent_str = parent_indent_str
+        # Rule 2: Increase indent after a colon
+        elif stripped_line.endswith(':'):
+            next_line_indent_str += "    "
+        
         self.text_area.insert(tk.INSERT, f'\n{next_line_indent_str}')
         
         self.last_action_was_auto_feature = True
@@ -1170,15 +1348,28 @@ class CodeEditor(tk.Frame):
         for m in re.finditer(string_regex, content):
             if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag("string_literal", m.start(), m.end())
         self._parse_imports(content)
+        
+        # Handle Easter Egg highlighting first
+        for egg in self.easter_egg_tooltips.keys():
+            if ' ' in egg: # Special case for 'from __future__ import braces'
+                for m in re.finditer(re.escape(egg), content):
+                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
+                        self._apply_tag("easter_egg_import", m.start(), m.end())
+            else: # Handle single-word easter eggs
+                for m in re.finditer(r"\b" + re.escape(egg) + r"\b", content):
+                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
+                        self._apply_tag("easter_egg_import", m.start(), m.end())
+
         for alias, source in self.imported_aliases.items():
             tag = "standard_library_module" if source.split('.')[0] in self.standard_libraries else "custom_import"
             for m in re.finditer(r"\b" + re.escape(alias) + r"\b", content):
-                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag(tag, m.start(), m.end())
+                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "easter_egg_import")): 
+                    self._apply_tag(tag, m.start(), m.end())
         
         static_patterns = { r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(if|else|elif)\b": "keyword_conditional", r"\b(for|while|break|continue)\b": "keyword_loop", r"\b(return|yield)\b": "keyword_return", r"\b(pass|global|nonlocal|del)\b": "keyword_structure", r"\b(import|from|as)\b": "keyword_import", r"\b(try|except|finally|raise|assert)\b": "keyword_exception", r"\b(True|False|None)\b": "keyword_boolean_null", r"\b(and|or|not|in|is)\b": "keyword_logical", r"\b(async|await)\b": "keyword_async", r"\b(with|lambda)\b": "keyword_context", r"\bPriesty\b": "priesty_keyword", r"\bself\b": "self_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"\b(" + "|".join(self.exception_list) + r")\b": "exception_type", r"[(){}[\]]": "bracket_tag", r"\b(__init__|__str__|__repr__)\b": "dunder_method"}
         for pattern, tag in static_patterns.items():
             for m in re.finditer(pattern, content):
-                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "standard_library_module")): self._apply_tag(tag, m.start(), m.end())
+                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "standard_library_module", "easter_egg_import")): self._apply_tag(tag, m.start(), m.end())
 
         for alias, source in self.imported_aliases.items():
             if source.split('.')[0] in self.standard_libraries:
