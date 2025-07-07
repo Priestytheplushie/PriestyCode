@@ -1,13 +1,114 @@
 # code_editor.py
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, font
 from tkinter import scrolledtext
 import re
 import ast
 import os
 import inspect
 import keyword
+
+class Gutter(tk.Canvas):
+    """A canvas for drawing line numbers and gutter markers (e.g., for errors)."""
+    def __init__(self, master, text_area, **kwargs):
+        super().__init__(master, **kwargs)
+        self.text_area = text_area
+        self.font = text_area.cget("font")
+        self.markers = {}
+        self.config(width=45, bg="#2B2B2B", highlightthickness=0)
+
+    def set_font(self, font):
+        self.font = font
+        self.redraw()
+
+    def set_marker(self, line_num, m_type):
+        if m_type: self.markers[line_num] = m_type
+        elif line_num in self.markers: del self.markers[line_num]
+
+    def clear_markers(self):
+        self.markers.clear()
+
+    def redraw(self, *args):
+        self.delete("all")
+        try:
+            first_line = int(self.text_area.index("@0,0").split('.')[0])
+        except (ValueError, tk.TclError):
+            return
+
+        for i in range(500): # Limit redraw loop to prevent freezing on huge files
+            line_num = first_line + i
+            dline = self.text_area.dlineinfo(f"{line_num}.0")
+            if not dline: break
+            x, y, _, h, _ = dline
+            if y > self.winfo_height(): break
+            
+            # Draw line number
+            self.create_text(40, y + h / 2, text=str(line_num), anchor=tk.E, fill="#888888", font=self.font)
+
+            # Draw marker
+            if line_num in self.markers:
+                color = "#E51400"
+                self.create_oval(6, y + h/2 - 3, 12, y + h/2 + 3, fill=color, outline=color)
+
+class Minimap(tk.Canvas):
+    """A canvas for displaying a high-level overview of the code."""
+    def __init__(self, master, text_area, **kwargs):
+        super().__init__(master, **kwargs)
+        self.text_area = text_area
+        self.config(highlightthickness=0, width=120, bg="#252526")
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonPress-1>", self._on_click)
+
+    def redraw(self):
+        self.delete("all")
+        try:
+            all_lines = self.text_area.get("1.0", "end-1c").split('\n')
+            total_lines = len(all_lines)
+            if total_lines == 0: return
+
+            canvas_h = self.winfo_height()
+            line_h = max(1, canvas_h / total_lines) if canvas_h > 1 else 1
+            canvas_w = self.winfo_width()
+
+            for i, line_text in enumerate(all_lines):
+                y0 = i * line_h; y1 = y0 + line_h
+                color = self._get_line_color(f"{i+1}.0", line_text)
+                indent_len = len(line_text) - len(line_text.lstrip())
+                text_len = len(line_text.strip())
+                x0 = indent_len * 2
+                x1 = x0 + text_len * 1.2
+                self.create_rectangle(min(x0, canvas_w - 5), y0, min(x1, canvas_w - 5), y1, fill=color, outline="")
+        except (tk.TclError, IndexError):
+            pass
+        self.update_viewport()
+
+    def _get_line_color(self, index, line_text):
+        tags = self.text_area.tag_names(index)
+        stripped_line = line_text.strip()
+        if "proactive_error_squiggle" in tags: return "#E51400"
+        if "comment_tag" in tags or (stripped_line and stripped_line.startswith('#')): return "#6A9955"
+        if stripped_line.startswith(('def ', 'class ')): return "#4EC9B0"
+        return "#777777"
+
+    def update_viewport(self):
+        self.delete("viewport")
+        try:
+            canvas_h = self.winfo_height()
+            if canvas_h <= 1: return
+            top_frac, bottom_frac = self.text_area.yview()
+            y0 = top_frac * canvas_h; y1 = bottom_frac * canvas_h
+            self.create_rectangle(0, y0, self.winfo_width(), y1,
+                                  fill="white", stipple="gray25", outline="", tags="viewport")
+        except (tk.TclError, ValueError): pass
+
+    def _on_click(self, event): self._scroll_to(event.y)
+    def _on_drag(self, event): self._scroll_to(event.y)
+    def _scroll_to(self, y):
+        canvas_h = self.winfo_height()
+        if canvas_h == 0: return
+        fraction = max(0, min(1, y / canvas_h))
+        self.text_area.yview_moveto(fraction)
 
 class ClassAttributeVisitor(ast.NodeVisitor):
     """An AST visitor specifically for finding 'self.attribute' assignments and method defs."""
@@ -39,7 +140,8 @@ class CodeAnalyzer:
         parsed_tree = None
         for _ in range(10): # Limit attempts
             try:
-                parsed_tree = ast.parse(temp_code)
+                # Use end_lineno and end_col_offset which are available in Python 3.8+
+                parsed_tree = ast.parse(temp_code, feature_version=(3, 9))
                 break 
             except SyntaxError as e:
                 if e.lineno is None: break
@@ -62,10 +164,12 @@ class CodeAnalyzer:
     def _traverse(self, node):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             docstring = ast.get_docstring(node) or f"User-defined {type(node).__name__.replace('Def', '').lower()}."
+            # Store end_lineno for features like active scope highlighting
             self.definitions[node.name] = {
                 'type': 'class' if isinstance(node, ast.ClassDef) else 'function',
                 'docstring': docstring,
-                'lineno': node.lineno
+                'lineno': node.lineno,
+                'end_lineno': getattr(node, 'end_lineno', node.lineno)
             }
         for child in ast.iter_child_nodes(node):
             self._traverse(child)
@@ -151,6 +255,7 @@ class ScopeVisitor(ast.NodeVisitor):
 
     def _is_in_node_scope(self, node):
         start_line = node.lineno
+        # Use getattr for safety on older AST node versions
         end_line = getattr(node, 'end_lineno', 0) or getattr(node.body[-1], 'end_lineno', node.body[-1].lineno) if hasattr(node, 'body') and node.body else start_line
         return start_line <= self.target_line <= end_line
 
@@ -393,13 +498,14 @@ class AutocompleteManager:
         self.editor.perform_autocomplete(item)
         self.hide(); return 'break'
         
+# In class AutocompleteManager
     def navigate(self, direction):
         if not self.is_visible(): return
         current_focus = self.tree.focus()
         if not current_focus: 
              if self.tree.get_children():
                 self.tree.selection_set('0'); self.tree.focus('0')
-             return 'break'
+             return 'break' # Stop event
         try:
             current_index = int(current_focus)
             new_index = current_index + direction
@@ -411,74 +517,81 @@ class AutocompleteManager:
         except (ValueError, tk.TclError):
              if self.tree.get_children():
                 self.tree.selection_set('0'); self.tree.focus('0')
-        return 'break'
+        return 'break' # Explicitly stop the event after handling
+
 class CodeEditor(tk.Frame):
     def __init__(self, master=None, error_console=None, autocomplete_icons=None, 
                  autoindent_var=None, tooltips_var=None, **kwargs):
         super().__init__(master, **kwargs)
         self.config(bg="#2B2B2B")
+        
+        # Core State & Feature States (Unchanged)
+        self.file_path: str | None = None
         self.error_console = error_console
-        self.last_action_was_auto_feature = False
-        self.last_cursor_pos_before_auto_action = None
-        self.last_auto_action_details = None
+        self.autoindent_var = autoindent_var
+        self.tooltips_var = tooltips_var
         self.autocomplete_active = True
         self.proactive_errors_active = True
-        self.autocomplete_dismissed_word = None
-        self.manual_trigger_active = False
         self.just_completed_with_tab = False
-        # Snippet session state
+        self.manual_trigger_active = False
         self.active_snippet_session = False
+        self.last_action_was_auto_feature = False
+        self.autocomplete_dismissed_word = None
+        self.last_auto_action_details = None
+        self.last_cursor_pos_before_auto_action = None
+        self.line_error_messages = {}
         self.snippet_placeholders = []
         self.current_placeholder_index = -1
         self.snippet_exit_point = None
-        
+        self.autocomplete_just_navigated = False
         self.imported_aliases = {}
         self.code_analyzer = CodeAnalyzer()
-        self.autoindent_var = autoindent_var
-        self.tooltips_var = tooltips_var
-        self.line_error_messages = {}
+        self.CONTEXT_DISPLAY_NAMES = { "loop_body": "Loop", "class": "Class", "function": "Function", "global_scope": "Global Scope", "try": "Try Block" }
+        self.VARIABLE_SCOPE_DESCRIPTIONS = { "Global Variable": "A variable defined at the top level of the module.", "Local Variable": "A variable defined within the current function.", "Parameter": "A variable passed as an argument to the current function."}
 
-        self.CONTEXT_DISPLAY_NAMES = {
-            "loop_body": "Loop",
-            "class": "Class",
-            "function": "Function",
-            "global_scope": "Global Scope",
-            "try": "Try Block"
-        }
+        self.text_area = scrolledtext.ScrolledText(self, wrap="none", bg="#2B2B2B", fg="white", 
+                                                   insertbackground="white", selectbackground="#4E4E4E", 
+                                                   font=("Consolas", 10), undo=True, borderwidth=0, 
+                                                   highlightthickness=0, padx=5, pady=5)
         
-        self.VARIABLE_SCOPE_DESCRIPTIONS = {
-            "Global Variable": "A variable defined at the top level of the module.",
-            "Local Variable": "A variable defined within the current function.",
-            "Parameter": "A variable passed as an argument to the current function."
-        }
+        self.gutter = Gutter(self, self.text_area)
+        self.minimap = Minimap(self, self.text_area, bg="#252526")
 
-        self.editor_frame = tk.Frame(self, bg="#2B2B2B")
-        self.editor_frame.pack(fill="both", expand=True)
-        self.linenumbers = tk.Text(self.editor_frame, width=4, padx=3, takefocus=0, border=0, background="#2B2B2B", foreground="#888888", state="disabled", wrap="none", font=("Consolas", 10))
-        self.linenumbers.pack(side="left", fill="y")
-        self.text_area = scrolledtext.ScrolledText(self.editor_frame, wrap="word", bg="#2B2B2B", fg="white", insertbackground="white", selectbackground="#4E4E4E", font=("Consolas", 10), undo=True)
-        self.text_area.pack(side="right", fill="both", expand=True)
+        self.gutter.pack(side="left", fill="y")
+        self.minimap.pack(side="right", fill="y")
+        self.text_area.pack(side="left", fill="both", expand=True)
+
+        # Correctly link scrollbar and custom components
+        original_set = self.text_area.vbar.set
+        def _on_scroll(*args):
+            original_set(*args)
+            self.gutter.redraw()
+            self.minimap.update_viewport()
+        
+        self.text_area.config(yscrollcommand=_on_scroll)
+        self.text_area.vbar.config(command=self.text_area.yview) # Ensure vbar scrolls the text_area
+
+        def _gutter_scroll(event):
+            self.text_area.yview_scroll(-1 if (event.num == 4 or event.delta > 0) else 1, "units")
+            return "break"
+        self.gutter.bind("<MouseWheel>", _gutter_scroll)
+        self.gutter.bind("<Button-4>", _gutter_scroll)
+        self.gutter.bind("<Button-5>", _gutter_scroll)
+
         self.tooltip_window = tk.Toplevel(self.text_area)
         self.tooltip_window.wm_overrideredirect(True)
         self.tooltip_window.wm_withdraw()
         self.tooltip_label = tk.Label(self.tooltip_window, text="", justify='left', background="#3C3C3C", foreground="white", relief='solid', borderwidth=1, wraplength=400, font=("Consolas", 9), padx=4, pady=2)
         self.tooltip_label.pack(ipadx=1)
-
-        self.autocomplete_icons = {
-            'snippet': '▶', 'keyword': '🝰', 'function': 'ƒ', 'method': '𝘮',
-            'constructor': '⊕', 'constant': 'π', 'variable': 'ⓥ', 'module': '📦',
-            'class': '🅒', 'attribute': 'ⓐ', 'text': '🗛'
-        }
+        self.autocomplete_icons = { 'snippet': '▶', 'keyword': '🝰', 'function': 'ƒ', 'method': '𝘮', 'constructor': '⊕', 'constant': 'π', 'variable': 'ⓥ', 'module': '📦', 'class': '🅒', 'attribute': 'ⓐ', 'text': '🗛'}
         self.autocomplete_manager = AutocompleteManager(self, icons=self.autocomplete_icons)
-        self.file_path: str | None = None
         self._configure_autocomplete_data()
         self._configure_tags_and_tooltips()
-        self.text_area.bind("<Configure>", self.update_line_numbers)
+        self.set_font_size(10)
+        
         self.text_area.bind("<KeyRelease>", self._on_key_release)
+        self.text_area.bind("<ButtonRelease-1>", self._on_release_or_click)
         self.text_area.bind("<<Modified>>", self._on_text_modified)
-        self.text_area.bind("<MouseWheel>", self._on_mouse_scroll)
-        self.text_area.bind("<Button-4>", self._on_mouse_scroll)
-        self.text_area.bind("<Button-5>", self._on_mouse_scroll)
         self.text_area.bind("<Button-1>", self._on_click)
         self.text_area.bind("<Return>", self._on_return_key)
         self.text_area.bind("<Tab>", self._on_tab)
@@ -495,13 +608,17 @@ class CodeEditor(tk.Frame):
         self.text_area.bind("<Down>", self._on_arrow_down)
         self.text_area.bind("<Control-space>", self._on_manual_autocomplete_trigger)
         self.text_area.bind("<Control-j>", self._on_manual_autocomplete_trigger)
+        self.bind("<Configure>", self._on_content_changed)
+        
         self.text_area.edit_modified(False)
-        self.apply_syntax_highlighting()
+        self.after(100, self._on_content_changed)
 
     def set_font_size(self, size: int):
         new_font = ("Consolas", size)
         self.text_area.config(font=new_font)
-        self.linenumbers.config(font=new_font)
+        self.gutter.set_font(new_font)
+        # self.indent_guide.set_font(new_font) # <-- REMOVED THIS LINE
+
         ac_preview_font = ("Consolas", max(8, size - 1))
         ac_preview_bold_font = ("Consolas", max(8, size - 1), "bold", "underline")
         ac_context_font = ("Consolas", max(7, size-2))
@@ -511,15 +628,18 @@ class CodeEditor(tk.Frame):
         self.autocomplete_manager.context_label.config(font=ac_context_font)
         tooltip_font = ("Consolas", max(8, size - 1))
         self.tooltip_label.config(font=tooltip_font)
-        self.update_line_numbers()
+        
+        self.after(50, self._on_content_changed)
         
     def set_file_path(self, path: str):
         self.file_path = path
 
     def set_proactive_error_checking(self, is_active: bool):
         self.proactive_errors_active = is_active
-        if not is_active: self.clear_error_highlight()
-        else: self._proactive_syntax_check()
+        if not is_active:
+            self.clear_error_highlight()
+        else:
+            self._proactive_syntax_check()
     
     def _class_has_init(self) -> bool:
         """Checks if the class currently containing the cursor already has an __init__ method."""
@@ -867,7 +987,6 @@ class CodeEditor(tk.Frame):
         # Pass 2: Find all numbered placeholders
         numbered_placeholder_pattern = re.compile(r'\$\{(\d+):(.+?)\}')
         for match in numbered_placeholder_pattern.finditer(raw_insert_text):
-            # This is now safe, int() will not receive None
             order = int(match.group(1))
             text = match.group(2)
             placeholders.append({'order': order, 'text': text})
@@ -1012,6 +1131,7 @@ class CodeEditor(tk.Frame):
         self.last_cursor_pos_before_auto_action = None
         
         self.after(50, self._update_autocomplete_display)
+        self.after(50, self._on_release_or_click)
         return None
     
     def _on_ctrl_backspace(self, event):
@@ -1020,7 +1140,6 @@ class CodeEditor(tk.Frame):
         self.autocomplete_manager.hide(); return "break"
 
     def _on_tab(self, event):
-        # Consume the flag if it was set by the autocomplete manager
         if self.just_completed_with_tab:
             self.just_completed_with_tab = False
             return "break"
@@ -1030,7 +1149,6 @@ class CodeEditor(tk.Frame):
             return "break"
 
         if self.autocomplete_manager.is_visible(): 
-            # Manually tell the manager it was a Tab event
             self.autocomplete_manager.confirm_selection(event)
             return "break"
         
@@ -1083,20 +1201,14 @@ class CodeEditor(tk.Frame):
             self.after_idle(self._on_content_changed)
             return "break"
             
-    def update_line_numbers(self, event=None):
-        self.linenumbers.config(state="normal"); self.linenumbers.delete("1.0", tk.END)
-        num_lines_str = self.text_area.index("end-1c").split('.')[0]
-        if not num_lines_str.isdigit(): return
-        self.linenumbers.insert("1.0", "\n".join(str(i) for i in range(1, int(num_lines_str) + 1)))
-        self.linenumbers.config(state="disabled")
-        try: self.linenumbers.yview_moveto(self.text_area.yview()[0])
-        except tk.TclError: pass
 
     def _on_content_changed(self, event=None):
-        self.update_line_numbers()
         self.code_analyzer.analyze(self.text_area.get("1.0", tk.END))
         self.apply_syntax_highlighting()
         self._proactive_syntax_check()
+        self.after(5, self._on_release_or_click)
+        self.gutter.redraw()
+        self.minimap.redraw()
         
     def _auto_complete_brackets(self, event, open_char, close_char, show_signature=False):
         self._end_snippet_session()
@@ -1117,6 +1229,7 @@ class CodeEditor(tk.Frame):
             self.text_area.mark_set(tk.INSERT, "insert-1c")
 
         if show_signature: self.after(20, self._show_signature_help)
+        self.after(20, self._update_bracket_matching)
         return "break"
 
     def _auto_indent(self, event):
@@ -1153,28 +1266,89 @@ class CodeEditor(tk.Frame):
         self.after_idle(self._on_content_changed)
         return "break"
 
-    def _apply_error_highlight(self, line_number, error_message, tag):
-        self.text_area.tag_add(tag, f"{line_number}.0", f"{line_number}.end")
-        self.line_error_messages[line_number] = error_message
+# In class CodeEditor
+    def _apply_error_highlight(self, error: SyntaxError):
+        tag = "proactive_error_squiggle"
+        line_num = error.lineno
+        if line_num is None: return
+
+        # New, more robust algorithm using search
+        try:
+            line_content = self.text_area.get(f"{line_num}.0", f"{line_num}.end")
+            token_to_find = ""
+
+            # Case 1: error.text and offset are available (most common)
+            if error.text is not None and error.offset is not None:
+                # The token is the text leading up to the error column
+                token_to_find = error.text[:error.offset].strip().split()[-1]
+
+            # Fallback for weird cases where token is not found
+            if not token_to_find:
+                col_start = max(0, error.offset -1) if error.offset else 0
+                start_index = f"{line_num}.{col_start}"
+                end_index = f"{start_index}+1c"
+            else:
+                # Search for the found token within the line
+                match_pos = line_content.find(token_to_find)
+                if match_pos != -1:
+                    start_index = f"{line_num}.{match_pos}"
+                    end_index = f"{start_index} + {len(token_to_find)}c"
+                else:
+                    # Failsafe if token can't be found, highlight the column
+                    col_start = max(0, error.offset -1) if error.offset else 0
+                    start_index = f"{line_num}.{col_start}"
+                    end_index = f"{start_index}+1c"
+
+            self.text_area.tag_add(tag, start_index, end_index)
+            self.line_error_messages[line_num] = f"Syntax Error: {error.msg}"
+            self.gutter.set_marker(line_num, 'error')
+        except (tk.TclError, IndexError):
+            pass # Fails gracefully if editor state is weird
 
     def highlight_runtime_error(self, line_number, error_message):
         self.clear_error_highlight()
-        self._apply_error_highlight(line_number, error_message, "reactive_error_line")
-
+        self.text_area.tag_add("reactive_error_line_bg", f"{line_number}.0", f"{line_number}.end")
+        self.line_error_messages[line_number] = error_message
+        self.gutter.set_marker(line_number, 'error')
+    
     def highlight_handled_exception(self, line_number, error_message):
         self.clear_error_highlight()
-        self._apply_error_highlight(line_number, error_message, "handled_exception_line")
+        self.text_area.tag_add("handled_exception_line_bg", f"{line_number}.0", f"{line_number}.end")
+        self.line_error_messages[line_number] = error_message
+        self.gutter.set_marker(line_number, 'error')
+
+    def _show_error_tooltip(self, line_number, error_message):
+        try:
+            bbox = self.text_area.bbox(f"{line_number}.0")
+            if bbox: self._show_tooltip(None, error_message, bbox=bbox)
+        except tk.TclError:
+            pass
 
     def clear_error_highlight(self):
-        for tag in ["reactive_error_line", "proactive_error_line", "handled_exception_line"]:
-            self.text_area.tag_remove(tag, "1.0", tk.END)
+        for tag in ["reactive_error_line_bg", "handled_exception_line_bg"]:
+             self.text_area.tag_remove(tag, "1.0", tk.END)
+        self.text_area.tag_remove("proactive_error_squiggle", "1.0", tk.END)
         self.line_error_messages.clear()
+        self.gutter.clear_markers()
+
+    def _convert_ast_pos_to_indices(self, node):
+        start_index = f"{node.lineno}.{node.col_offset}"
+        # Make sure end line and col exist, otherwise fall back to something safe
+        end_lineno = getattr(node, 'end_lineno', node.lineno)
+        end_col_offset = getattr(node, 'end_col_offset', node.col_offset + 1)
+        end_index = f"{end_lineno}.{end_col_offset}"
+        return start_index, end_index
 
     def apply_syntax_highlighting(self):
-        preserved = ("sel", "insert", "current", "reactive_error_line", "proactive_error_line", "handled_exception_line", "context_highlight_line")
+        # Add new semantic tags to the preserved list
+        preserved = ("sel", "insert", "current", "reactive_error_line_bg", 
+                     "handled_exception_line_bg", "proactive_error_squiggle", "context_highlight_line",
+                     "active_scope_tag", "bracket_match_tag", "bracket_mismatch_tag")
         for tag in self.text_area.tag_names():
             if tag not in preserved: self.text_area.tag_remove(tag, "1.0", tk.END)
+        
         content = self.text_area.get("1.0", tk.END)
+        # --- Start Regex-based highlighting (fastest) ---
         for match in re.finditer(r"(#.*)", content): self._apply_tag("comment_tag", match.start(), match.end())
         for pattern in [r"f'''(.*?)'''", r'f"""(.*?)"""', r"'''(.*?)'''", r'"""(.*?)"""']:
             for match in re.finditer(pattern, content, re.DOTALL): 
@@ -1186,24 +1360,32 @@ class CodeEditor(tk.Frame):
         string_regex = r"""(f?r?|r?f?)'[^'\\\n]*(?:\\.[^'\\\n]*)*'|(f?r?|r?f?)\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\""""
         for m in re.finditer(string_regex, content):
             if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag("string_literal", m.start(), m.end())
+        
         self._parse_imports(content)
         
         for egg in self.easter_egg_tooltips.keys():
             if ' ' in egg:
                 for m in re.finditer(re.escape(egg), content):
-                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
-                        self._apply_tag("easter_egg_import", m.start(), m.end())
+                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag("easter_egg_import", m.start(), m.end())
             else:
                 for m in re.finditer(r"\b" + re.escape(egg) + r"\b", content):
-                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
-                        self._apply_tag("easter_egg_import", m.start(), m.end())
+                    if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag("easter_egg_import", m.start(), m.end())
 
         for alias, source in self.imported_aliases.items():
             tag = "standard_library_module" if source.split('.')[0] in self.standard_libraries else "custom_import"
             for m in re.finditer(r"\b" + re.escape(alias) + r"\b", content):
-                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "easter_egg_import")): 
-                    self._apply_tag(tag, m.start(), m.end())
+                if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", "easter_egg_import")): self._apply_tag(tag, m.start(), m.end())
         
+        # Add new regex patterns for decorators and constants
+        for m in re.finditer(r"@([\w\.]+)", content):
+             if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
+                self._apply_tag("decorator_tag", m.start(1), m.end(1))
+
+        for m in re.finditer(r"\b([A-Z_][A-Z0-9_]+)\b", content):
+             if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")):
+                 if m.group(1) not in keyword.kwlist and m.group(1) not in ['True', 'False', 'None']:
+                    self._apply_tag("constant_tag", m.start(), m.end())
+
         static_patterns = { r"\bdef\b": "def_keyword", r"\bclass\b": "class_keyword", r"\b(if|else|elif)\b": "keyword_conditional", r"\b(for|while|break|continue)\b": "keyword_loop", r"\b(return|yield)\b": "keyword_return", r"\b(pass|global|nonlocal|del)\b": "keyword_structure", r"\b(import|from|as)\b": "keyword_import", r"\b(try|except|finally|raise|assert)\b": "keyword_exception", r"\b(True|False|None)\b": "keyword_boolean_null", r"\b(and|or|not|in|is)\b": "keyword_logical", r"\b(async|await)\b": "keyword_async", r"\b(with|lambda)\b": "keyword_context", r"\bPriesty\b": "priesty_keyword", r"\bself\b": "self_keyword", r"\b(" + "|".join(self.builtin_list) + r")\b": "builtin_function", r"\b(" + "|".join(self.exception_list) + r")\b": "exception_type", r"[(){}[\]]": "bracket_tag", r"\b(__init__|__str__|__repr__)\b": "dunder_method"}
         for pattern, tag in static_patterns.items():
             for m in re.finditer(pattern, content):
@@ -1225,6 +1407,34 @@ class CodeEditor(tk.Frame):
                     if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal", def_tag)): self._apply_tag(usage_tag, m.start(), m.end())
         for m in re.finditer(r'\b(0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|\d+(\.\d*)?([eE][+-]?\d+)?)\b', content):
             if not self._is_inside_tag(m.start(), ("comment_tag", "string_literal")): self._apply_tag("number_literal", m.start(), m.end())
+
+        # --- AST-based semantic highlighting ---
+        if self.code_analyzer.tree:
+            for node in ast.walk(self.code_analyzer.tree):
+                if isinstance(node, ast.FunctionDef):
+                    # Highlight parameters and type hints
+                    for arg in node.args.args:
+                        # Highlight the parameter name
+                        start, end = self._convert_ast_pos_to_indices(arg)
+                        if not self._is_inside_tag_indices(start, ("comment_tag", "string_literal")):
+                            self.text_area.tag_add("function_parameter", start, end)
+                        
+                        # Highlight the type hint if it exists
+                        if arg.annotation:
+                            start, end = self._convert_ast_pos_to_indices(arg.annotation)
+                            if not self._is_inside_tag_indices(start, ("comment_tag", "string_literal")):
+                                self.text_area.tag_add("type_hint_tag", start, end)
+                    
+                    # Highlight return type hint
+                    if node.returns:
+                        start, end = self._convert_ast_pos_to_indices(node.returns)
+                        if not self._is_inside_tag_indices(start, ("comment_tag", "string_literal")):
+                            self.text_area.tag_add("type_hint_tag", start, end)
+
+    def _is_inside_tag_indices(self, index, tag_names):
+        """Checks if a given tk index is inside any of the specified tags."""
+        try: return any(tag in self.text_area.tag_names(index) for tag in tag_names)
+        except tk.TclError: return False
 
     def _parse_imports(self, content):
         self.imported_aliases.clear()
@@ -1259,9 +1469,10 @@ class CodeEditor(tk.Frame):
         try: return any(tag in self.text_area.tag_names(f"1.0 + {offset} chars") for tag in tag_names)
         except tk.TclError: return False
 
+# In class CodeEditor
     def _proactive_syntax_check(self):
         if not self.proactive_errors_active:
-            if self.error_console: self.error_console.clear()
+            if self.error_console: self.error_console.clear(proactive_only=True)
             self.clear_error_highlight()
             return
 
@@ -1269,60 +1480,40 @@ class CodeEditor(tk.Frame):
         self.clear_error_highlight()
 
         if not code_to_check.strip():
-            if self.error_console and hasattr(self.error_console, 'clear'):
-                self.error_console.clear(proactive_only=True)
+            if self.error_console and hasattr(self.error_console, 'clear'): self.error_console.clear(proactive_only=True)
             return
-
-        collected_errors = []
-        max_errors = 10
         
-        for _ in range(max_errors):
+        collected_errors = []
+        temp_code = code_to_check
+        for _ in range(10): 
             try:
-                ast.parse(code_to_check)
+                ast.parse(temp_code, feature_version=(3, 9))
                 break 
             except SyntaxError as e:
-                try: 
+                try:
                     cursor_line = int(self.text_area.index(tk.INSERT).split('.')[0])
                     if e.lineno == cursor_line: break
                 except (ValueError, IndexError): pass
-                
                 collected_errors.append(e)
-                
-                lines = code_to_check.splitlines()
-                if e.lineno and e.lineno <= len(lines):
-                    error_line = lines[e.lineno - 1]
-                    indent = len(error_line) - len(error_line.lstrip())
-                    lines[e.lineno - 1] = " " * indent + "pass"
-                    code_to_check = "\n".join(lines)
+                lines = temp_code.splitlines()
+                if e.lineno and 0 < e.lineno <= len(lines):
+                    lines[e.lineno - 1] = " " * (len(lines[e.lineno-1]) - len(lines[e.lineno-1].lstrip())) + "pass"
+                    temp_code = "\n".join(lines)
                 else: break
             except Exception: break
-
-        if not collected_errors:
-            if self.error_console and hasattr(self.error_console, 'clear'):
-                self.error_console.clear(proactive_only=True)
-            return
-
+        
         error_list_for_console = []
         for error in collected_errors:
-            line = error.lineno or 1
-            col = error.offset or 1
-            error_title = f"Syntax Error: {error.msg}"
-            
-            self._apply_error_highlight(line, error_title, "proactive_error_line")
+            # HERE is the change: pass the whole error object
+            self._apply_error_highlight(error)
             
             error_line_text = error.text.strip() if error.text else ""
-            details = f"File: {self.file_path}\nLine {line}, Column {col}\n\n{error_line_text}\n{' ' * (col - 1)}^"
-            
-            error_list_for_console.append({
-                'title': error_title,
-                'details': details,
-                'file_path': self.file_path,
-                'line': line,
-                'col': col
-            })
+            details = f"File: {self.file_path or 'Unsaved File'}\nLine {error.lineno}, Column {error.offset}\n\n{error_line_text}\n{' ' * (max(0,error.offset-1))}^"
+            error_list_for_console.append({'title': f"Syntax Error: {error.msg}",'details': details,'file_path': self.file_path,'line': error.lineno,'col': error.offset})
 
-        if self.error_console and hasattr(self.error_console, 'display_errors'):
+        if error_list_for_console and self.error_console and hasattr(self.error_console, 'display_errors'):
             self.error_console.display_errors(error_list_for_console, proactive_only=True)
+
 
     def _configure_autocomplete_data(self):
         self.keyword_tooltips = {
@@ -1387,38 +1578,70 @@ class CodeEditor(tk.Frame):
         ]
         
     def _configure_tags_and_tooltips(self):
-        font_size_str = self.text_area.cget("font").split()[1]
+        font_size_str = self.text_area.cget("font").split()[-1]
         font_size = int(font_size_str) if font_size_str.isdigit() else 10
-        bold_font = ("Consolas", font_size, "bold")
-        
-        tag_configs = { "context_highlight_line": {"background": "#3E3D32"}, "reactive_error_line": {"background": "#FF4C4C"}, "handled_exception_line": {"background": "#FFA500"}, "proactive_error_line": {"background": "#b3b300"}, "function_definition": {"foreground": "#DCDCAA"}, "class_definition": {"foreground": "#4EC9B0"}, "function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"}, "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"}, "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"}, "priesty_keyword": {"foreground": "#DA70D6"}, "def_keyword": {"foreground": "#569CD6", "font": bold_font}, "class_keyword": {"foreground": "#569CD6", "font": bold_font}, "keyword_conditional": {"foreground": "#C586C0"}, "keyword_loop": {"foreground": "#C586C0"}, "keyword_return": {"foreground": "#C586C0"}, "keyword_structure": {"foreground": "#C586C0"}, "keyword_import": {"foreground": "#4EC9B0"}, "keyword_exception": {"foreground": "#D16969"}, "keyword_boolean_null": {"foreground": "#569CD6"}, "keyword_logical": {"foreground": "#DCDCAA"}, "keyword_async": {"foreground": "#FFD700"}, "keyword_context": {"foreground": "#CE9178"}, "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"}, "comment_tag": {"foreground": "#6A9955"}, "function_param": {"foreground": "#9CDCFE"}, "bracket_tag": {"foreground": "#FFD700"}, "builtin_function": {"foreground": "#DCDCAA"}, "exception_type": {"foreground": "#4EC9B0"}, "dunder_method": {"foreground": "#DA70D6"}, "standard_library_module": {"foreground": "#4EC9B0"}, "custom_import": {"foreground": "#9CDCFE"}, "standard_library_function": {"foreground": "#DCDCAA"}, "easter_egg_import": {"foreground": "#FF8C00"} }
+        bold_font = ("Consolas", font_size, "bold"); italic_font = ("Consolas", font_size, "italic")
+
+        tag_configs = {
+            "context_highlight_line": {"background": "#3E3D32"},
+            "reactive_error_line_bg": {"background": "#581818"}, 
+            "handled_exception_line_bg": {"background": "#725A00"},
+            "proactive_error_squiggle": {"foreground": "#FF4C4C", "underline": True},
+            "function_definition": {"foreground": "#DCDCAA"}, "class_definition": {"foreground": "#4EC9B0"},
+            "function_call": {"foreground": "#DCDCAA"}, "class_usage": {"foreground": "#4EC9B0"},
+            "fstring_expression": {"foreground": "#CE9178", "background": "#3a3a3a"},
+            "self_keyword": {"foreground": "#DA70D6"}, "self_method_call": {"foreground": "#9CDCFE"},
+            "def_keyword": {"foreground": "#569CD6", "font": bold_font}, "class_keyword": {"foreground": "#569CD6", "font": bold_font},
+            "keyword_conditional": {"foreground": "#C586C0"}, "keyword_loop": {"foreground": "#C586C0"},
+            "keyword_return": {"foreground": "#C586C0"}, "keyword_structure": {"foreground": "#C586C0"},
+            "keyword_import": {"foreground": "#4EC9B0"}, "keyword_exception": {"foreground": "#D16969"},
+            "keyword_boolean_null": {"foreground": "#569CD6"}, "keyword_logical": {"foreground": "#DCDCAA"},
+            "string_literal": {"foreground": "#A3C78B"}, "number_literal": {"foreground": "#B5CEA8"},
+            "comment_tag": {"foreground": "#6A9955"}, "bracket_tag": {"foreground": "#FFD700"},
+            "builtin_function": {"foreground": "#DCDCAA"}, "exception_type": {"foreground": "#4EC9B0"},
+            "dunder_method": {"foreground": "#DA70D6"}, "standard_library_module": {"foreground": "#4EC9B0"},
+            "custom_import": {"foreground": "#9CDCFE"}, "standard_library_function": {"foreground": "#DCDCAA"},
+            "active_scope_tag": {"background": "#333338"},
+            "bracket_match_tag": {"background": "#505050", "font": bold_font},
+            "bracket_mismatch_tag": {"foreground": "white", "background": "red"},
+            "decorator_tag": {"foreground": "#DCDCAA", "font": italic_font},
+            "constant_tag": {"foreground": "#FFA500"},
+            "type_hint_tag": {"foreground": "#4EC9B0", "font": italic_font},
+            "function_parameter": {"foreground": "#80D0FF"},
+        }
         for tag, config in tag_configs.items(): self.text_area.tag_configure(tag, **config)
         
-        self.dunder_tooltips = {'__init__': '__init__(self, ...)\n\nThe constructor method for a class.', '__str__': '__str__(self) -> str\n\nReturns the printable string representation of an object.'}
-
-        keyword_tags_for_tooltips = [ "def_keyword", "class_keyword", "keyword_conditional", "keyword_loop", "keyword_return", "keyword_structure", "keyword_import", "keyword_exception", "keyword_logical", "keyword_async", "keyword_context", "self_keyword" ]
+        # Raise highlight tags so they appear above the active scope
+        self.text_area.tag_raise("bracket_match_tag")
+        self.text_area.tag_raise("bracket_mismatch_tag")
+        self.text_area.tag_raise("context_highlight_line") # <--- ADDED THIS LINE
+        
+        self.dunder_tooltips = {'__init__': '__init__(self, ...)', '__str__': '__str__(self) -> str'}
+        keyword_tags_for_tooltips = ["def_keyword", "class_keyword", "keyword_conditional", "keyword_loop", "keyword_return", "keyword_structure", "keyword_import", "keyword_exception", "keyword_logical"]
         for tag in keyword_tags_for_tooltips:
             self.text_area.tag_bind(tag, "<Enter>", self._on_hover_keyword)
             self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
-
-        def create_word_hover_handler(tooltip_dict):
-            return lambda event: self._on_hover_word(event, tooltip_dict) if not any(tag in self.text_area.tag_names(f"@{event.x},{event.y}") for tag in ["reactive_error_line", "proactive_error_line"]) else None
         
-        for tag, t_dict in [("builtin_function", self.builtin_tooltips), ("exception_type", self.exception_tooltips), ("dunder_method", self.dunder_tooltips)]:
-            self.text_area.tag_bind(tag, "<Enter>", create_word_hover_handler(t_dict)); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+        def create_word_hover_handler(tdict):
+             return lambda e: self._on_hover_word(e, tdict) if not any(t in self.text_area.tag_names(f"@{e.x},{e.y}") for t in ["proactive_error_squiggle"]) else None
         
+        for tag, tdict in [("builtin_function", self.builtin_tooltips), ("exception_type", self.exception_tooltips), ("dunder_method", self.dunder_tooltips)]:
+            self.text_area.tag_bind(tag, "<Enter>", create_word_hover_handler(tdict))
+            self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+            
         for tag in ["function_call", "class_usage"]:
-            self.text_area.tag_bind(tag, "<Enter>", self._on_hover_user_defined); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
-        
-        for tag in ["standard_library_module", "easter_egg_import"]:
+            self.text_area.tag_bind(tag, "<Enter>", self._on_hover_user_defined)
+            self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+            
+        for tag in ["standard_library_module"]:
             self.text_area.tag_bind(tag, "<Enter>", self._on_hover_standard_lib_module)
             self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
-        
+            
         for tag in ["standard_library_function"]:
-            handler = self._on_hover_standard_lib_function
-            self.text_area.tag_bind(tag, "<Enter>", handler); self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
-        
-        for tag in ["reactive_error_line", "proactive_error_line", "handled_exception_line"]:
+            self.text_area.tag_bind(tag, "<Enter>", self._on_hover_standard_lib_function)
+            self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
+            
+        for tag in ["proactive_error_squiggle", "reactive_error_line_bg", "handled_exception_line_bg"]:
             self.text_area.tag_bind(tag, "<Enter>", self._on_hover_error_line)
             self.text_area.tag_bind(tag, "<Leave>", self._hide_tooltip)
 
@@ -1519,6 +1742,8 @@ class CodeEditor(tk.Frame):
         
     def _show_tooltip(self, event, text, bbox=None):
         if not text or (self.tooltips_var and not self.tooltips_var.get()): return
+        if self.autocomplete_manager.is_visible(): return # Don't show tooltip when autocomplete is up
+
         if event:
             x, y = self.winfo_rootx() + self.text_area.winfo_x() + event.x + 20, self.winfo_rooty() + self.text_area.winfo_y() + event.y + 20
         elif bbox:
@@ -1566,35 +1791,26 @@ class CodeEditor(tk.Frame):
         self._hide_tooltip(); return None
 
     def _on_key_release(self, event=None):
-        if not event:
-            return
+        if not event: return
 
-        if self.manual_trigger_active:
-            self.manual_trigger_active = False
-            return
-
-        ignored_keys = {"Up", "Down", "Return", "Tab", "Escape", "period", 
-                        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}
+        # This is a general handler. Navigational keys like up/down/return/tab
+        # are handled by their own specific on-press bindings. We should avoid
+        # running complex logic here for those keys.
+        ignored_keys = {"Up", "Down", "Left", "Right", "Return", "Tab", "Escape", "period", 
+                        "Shift_L", "Shift_R", "Control_L", "Control_R", 
+                        "Alt_L", "Alt_R", "Super_L", "Super_R"}
         if event.keysym in ignored_keys:
             return
-        
-        # The faulty logic that prematurely ended the snippet session has been removed from here.
-        # The session is now correctly ended only by Tab (at the end), Escape, or clicking away.
+
+        # Update highlights for any other key release
+        self._on_release_or_click()
 
         self.last_action_was_auto_feature = False
         self.last_auto_action_details = None
 
-        if event.keysym != "parenleft":
-             self._hide_tooltip()
+        if event.keysym != "parenleft": self._hide_tooltip()
         
-        try:
-            current_word = self.text_area.get("insert-1c wordstart", "insert")
-            if current_word == "except":
-                self.after(10, self._update_autocomplete_display)
-                return
-        except tk.TclError:
-            pass
-        
+        # Default action: update autocomplete for normal character typing
         if event.keysym == "space":
             line_before_cursor = self.text_area.get("insert linestart", "insert")
             if line_before_cursor.strip() in ("from", "import", "except"):
@@ -1602,7 +1818,12 @@ class CodeEditor(tk.Frame):
             return
 
         self.after(50, self._update_autocomplete_display)
-
+        
+    def _on_release_or_click(self, event=None):
+        """Combined handler for actions that should trigger UI updates."""
+        self._update_bracket_matching()
+        self._update_active_scope()
+    
     def _on_click(self, event=None):
         self._end_snippet_session()
         self.autocomplete_manager.hide()
@@ -1610,16 +1831,27 @@ class CodeEditor(tk.Frame):
         self.autocomplete_dismissed_word = None
         self.last_action_was_auto_feature = False
         self.last_auto_action_details = None
+        self._on_release_or_click()
 
     def _on_arrow_up(self, event=None):
-        if self.autocomplete_manager.is_visible(): return self.autocomplete_manager.navigate(-1)
-        self._end_snippet_session()
-        return None
+        if self.autocomplete_manager.is_visible():
+            self.autocomplete_manager.navigate(-1)
+            return "break"  # This stops the event completely.
 
-    def _on_arrow_down(self, event=None):
-        if self.autocomplete_manager.is_visible(): return self.autocomplete_manager.navigate(1)
+        # This code only runs if autocomplete is NOT visible
         self._end_snippet_session()
-        return None
+        self.after(5, self._on_release_or_click)
+        return None # Allows default text widget behavior (move cursor)
+    
+    def _on_arrow_down(self, event=None):
+        if self.autocomplete_manager.is_visible():
+            self.autocomplete_manager.navigate(1)
+            return "break"  # This stops the event completely.
+
+        # This code only runs if autocomplete is NOT visible
+        self._end_snippet_session()
+        self.after(5, self._on_release_or_click)
+        return None # Allows default text widget behavior (move cursor)
         
     def _on_text_modified(self, event=None):
         if self.text_area.edit_modified():
@@ -1627,7 +1859,58 @@ class CodeEditor(tk.Frame):
             self._on_content_changed()
             self.text_area.edit_modified(False)
 
-    def _on_mouse_scroll(self, event):
-        self._end_snippet_session()
-        self.autocomplete_manager.hide()
-        self.after(10, self.update_line_numbers)
+    def _update_bracket_matching(self):
+        """Highlights matching brackets near the cursor."""
+        self.text_area.tag_remove("bracket_match_tag", "1.0", tk.END)
+        self.text_area.tag_remove("bracket_mismatch_tag", "1.0", tk.END)
+        
+        cursor_index = self.text_area.index(tk.INSERT)
+        char_before = self.text_area.get(f"{cursor_index}-1c")
+        
+        pairs = {'(': ')', '[': ']', '{': '}'}
+        
+        if char_before in pairs: # Cursor is after an opening bracket
+            start_index = f"{cursor_index}-1c"
+            match_index = self.text_area.search(pairs[char_before], start_index, tk.END, forwards=True, regexp=False)
+        elif char_before in pairs.values(): # Cursor is after a closing bracket
+            # Need to find the corresponding opener
+            opener = [k for k, v in pairs.items() if v == char_before][0]
+            start_index = f"{cursor_index}-1c"
+            match_index = self.text_area.search(opener, start_index, "1.0", backwards=True, regexp=False)
+        else:
+            return
+
+        if match_index:
+            self.text_area.tag_add("bracket_match_tag", start_index, f"{start_index}+1c")
+            self.text_area.tag_add("bracket_match_tag", match_index, f"{match_index}+1c")
+        elif char_before in "()[]{}":
+            start_index = f"{cursor_index}-1c"
+            self.text_area.tag_add("bracket_mismatch_tag", start_index, f"{start_index}+1c")
+            
+    def _update_active_scope(self):
+        """Applies a background highlight to the current function or class scope."""
+        self.text_area.tag_remove("active_scope_tag", "1.0", tk.END)
+        try:
+            current_line = int(self.text_area.index(tk.INSERT).split('.')[0])
+        except (ValueError, IndexError):
+            return
+
+        definitions = self.code_analyzer.get_definitions()
+        best_match = None
+        
+        for name, info in definitions.items():
+            start_line = info['lineno']
+            end_line = info.get('end_lineno', start_line)
+            
+            if start_line <= current_line <= end_line:
+                # Find the smallest (most specific) scope containing the cursor
+                if best_match is None or (end_line - start_line) < (best_match['end_lineno'] - best_match['lineno']):
+                    best_match = info
+
+        if best_match:
+            start_index = f"{best_match['lineno']}.0"
+            end_index = f"{best_match['end_lineno']}.end"
+            self.text_area.tag_add("active_scope_tag", start_index, end_index)
+            # Lift bracket tags above the scope highlight
+            self.text_area.tag_raise("bracket_match_tag")
+            self.text_area.tag_raise("bracket_mismatch_tag")
