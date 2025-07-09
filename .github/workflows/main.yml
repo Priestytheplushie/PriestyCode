@@ -12,7 +12,7 @@ permissions:
   checks: write
 
 jobs:
-  # JOB 1: Handles simple, lightweight commands that don't need a full review.
+  # JOB 1: Handles simple comments.
   command-handler:
     name: Handle Comment Commands
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
@@ -27,24 +27,22 @@ jobs:
           RAW_COMMENT="${{ env.COMMENT_BODY }}"
           if [[ "$RAW_COMMENT" == /approve* ]]; then
             BODY="${RAW_COMMENT#*/approve}"; BODY=$(echo "$BODY" | xargs)
-            if [ -z "$BODY" ]; then BODY="Approved as requested."; fi
+            if [ -z "$BODY" ]; then BODY="Alright, approved as you asked!"; fi
           else
-            BODY="Consider it done! I've approved this pull request. 👍"
+            BODY="You got it! I've approved this pull request. 👍"
           fi
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
-
-      # THE GUIDANCE BOT: This step guides the user instead of trying to run a broken command.
       - name: Handle /review and /dismiss commands
         if: |
           startsWith(env.COMMENT_BODY, '/review') ||
           startsWith(env.COMMENT_BODY, '/dismiss') ||
           contains(env.COMMENT_BODY, '@PriestyBot review')
         run: |
-          gh pr comment ${{ github.event.issue.number }} --body "To trigger a new review (which will run linters and test the app), please go to the **Reviewers** panel on the right and request a review from me, **PriestyBot**. This ensures I have the correct permissions and context to run the tests properly!"
+          gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks!"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-  # JOB 2: The "heavy lifting" job. It ONLY runs when a review is formally requested.
+  # JOB 2: The full review job.
   full-review:
     name: Run Full Automated Review
     if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
@@ -52,7 +50,7 @@ jobs:
     steps:
       - name: Acknowledge Review Request
         run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body "Thank you for the review request! I'm starting the automated checks now. This includes running linters and attempting to launch the app. I'll be back shortly with a full review. 🧐"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the request! I'm warming up the engines to run the checks. I'll report back with what I find. 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
@@ -68,14 +66,13 @@ jobs:
 
       - name: Setup Reviewdog
         uses: reviewdog/action-setup@v1
-        with:
-          reviewdog_version: latest
 
-      - name: Run Linters with Reviewdog (Will now work correctly)
+      - name: Run Linters with Reviewdog
         id: linting
         run: |
           set +o pipefail
-          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-review -level=warning
+          # THE FIX: Use 'github-pr-check' reporter to post inline comments.
+          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-check -level=warning
           LINT_EXIT_CODE=${PIPESTATUS[0]}
           set -o pipefail
           if [ ${LINT_EXIT_CODE} -ne 0 ]; then echo "LINTER_ISSUES_FOUND=true" >> $GITHUB_ENV; else echo "LINTER_ISSUES_FOUND=false" >> $GITHUB_ENV; fi
@@ -90,20 +87,32 @@ jobs:
           APP_EXIT_CODE=$?
           set -e
           echo "APP_EXIT_CODE=${APP_EXIT_CODE}" >> $GITHUB_ENV
+          # Only create the failure file if the app actually failed
           if [ ${APP_EXIT_CODE} -ne 0 ]; then
-            { echo "I tried to run the app via the test harness, but it failed with an exception. This is likely an issue with the code itself (e.g., an import error or bug on startup). Here's the log:"; echo ""; echo '```'; cat app_output.txt; echo '```'; } > failure_comment.txt
+            {
+              echo "I tried to run the app, but it looks like it hit a snag during startup. This is usually caused by an import error or a bug in the initial code."
+              echo ""
+              echo "Here's the technical log I captured:"
+              echo '```'
+              cat app_output.txt
+              echo '```'
+            } > failure_comment.txt
             echo "FAILURE_COMMENT_FILE=failure_comment.txt" >> $GITHUB_ENV
           fi
 
       - name: Post Final Review
         if: always()
         run: |
+          # THE FIX: This logic now correctly checks the exit code from the previous step.
           if [ "${{ steps.app_test.outputs.APP_EXIT_CODE }}" == "0" ]; then
             LINT_MESSAGE=""
-            if [ "${{ steps.linting.outputs.LINTER_ISSUES_FOUND }}" == "true" ]; then LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments. "; fi
-            MESSAGE="Review complete! ${LINT_MESSAGE}The application test harness started and exited cleanly. Great work, I'm approving this. ✅"
+            if [ "${{ steps.linting.outputs.LINTER_ISSUES_FOUND }}" == "true" ]; then
+              LINT_MESSAGE="I've also dropped a few linter suggestions as inline comments on the changed files. They're just suggestions, but might be helpful! "
+            fi
+            MESSAGE="I've finished my review! ${LINT_MESSAGE}The most important thing is that the application test harness started up and shut down cleanly. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
           else
+            # Only use --body-file if the app failed.
             gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.FAILURE_COMMENT_FILE }}
           fi
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
