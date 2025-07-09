@@ -33,6 +33,7 @@ jobs:
           fi
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
       - name: Handle /review and /dismiss commands
         if: |
           startsWith(env.COMMENT_BODY, '/review') ||
@@ -71,23 +72,24 @@ jobs:
         id: linting
         run: |
           set +o pipefail
-          # THE FIX: Use 'github-pr-check' reporter to post inline comments.
-          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-check -level=warning
+          # THE FIX: Use 'github-pr-review' reporter to post a single, clean review comment.
+          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-review -level=warning
           LINT_EXIT_CODE=${PIPESTATUS[0]}
           set -o pipefail
-          if [ ${LINT_EXIT_CODE} -ne 0 ]; then echo "LINTER_ISSUES_FOUND=true" >> $GITHUB_ENV; else echo "LINTER_ISSUES_FOUND=false" >> $GITHUB_ENV; fi
+          # Use GITHUB_OUTPUT to pass variables to other steps
+          if [ ${LINT_EXIT_CODE} -ne 0 ]; then echo "linter_issues_found=true" >> $GITHUB_OUTPUT; else echo "linter_issues_found=false" >> $GITHUB_OUTPUT; fi
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
       - name: Run App Test via Test Runner
+        # THE FIX: This step needs an ID to reference its outputs later.
         id: app_test
         run: |
           set +e
           timeout 30s xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
           APP_EXIT_CODE=$?
           set -e
-          echo "APP_EXIT_CODE=${APP_EXIT_CODE}" >> $GITHUB_ENV
-          # Only create the failure file if the app actually failed
+          echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
           if [ ${APP_EXIT_CODE} -ne 0 ]; then
             {
               echo "I tried to run the app, but it looks like it hit a snag during startup. This is usually caused by an import error or a bug in the initial code."
@@ -97,22 +99,22 @@ jobs:
               cat app_output.txt
               echo '```'
             } > failure_comment.txt
-            echo "FAILURE_COMMENT_FILE=failure_comment.txt" >> $GITHUB_ENV
+            # Pass the filename as an output
+            echo "failure_comment_file=failure_comment.txt" >> $GITHUB_OUTPUT
           fi
 
       - name: Post Final Review
         if: always()
         run: |
-          # THE FIX: This logic now correctly checks the exit code from the previous step.
-          if [ "${{ steps.app_test.outputs.APP_EXIT_CODE }}" == "0" ]; then
+          # THE FIX: Reference step outputs using the steps context.
+          if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
             LINT_MESSAGE=""
-            if [ "${{ steps.linting.outputs.LINTER_ISSUES_FOUND }}" == "true" ]; then
-              LINT_MESSAGE="I've also dropped a few linter suggestions as inline comments on the changed files. They're just suggestions, but might be helpful! "
+            if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
+              LINT_MESSAGE="I also ran the linter and left a review with some style suggestions. "
             fi
             MESSAGE="I've finished my review! ${LINT_MESSAGE}The most important thing is that the application test harness started up and shut down cleanly. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
           else
-            # Only use --body-file if the app failed.
-            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.FAILURE_COMMENT_FILE }}
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
           fi
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
