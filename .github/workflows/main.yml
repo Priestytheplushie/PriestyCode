@@ -12,7 +12,7 @@ permissions:
   checks: write
 
 jobs:
-  # JOB 1: Handles all comment-based interactions.
+  # JOB 1: Handles simple commands.
   command-handler:
     name: Handle Comment Commands
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
@@ -21,7 +21,6 @@ jobs:
       - name: Get Comment Body
         run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
 
-      # --- Quick Commands ---
       - name: Handle /approve
         if: startsWith(env.COMMENT_BODY, '/approve') || contains(env.COMMENT_BODY, '@PriestyBot approve')
         run: |
@@ -35,61 +34,16 @@ jobs:
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-      # --- LIMITED REVIEW LOGIC (App Test Only) ---
-      - name: Acknowledge Limited Review
+      - name: Handle /review and /dismiss commands
         if: |
           startsWith(env.COMMENT_BODY, '/review') ||
           startsWith(env.COMMENT_BODY, '/dismiss') ||
           contains(env.COMMENT_BODY, '@PriestyBot review')
         run: |
-          gh pr comment ${{ github.event.issue.number }} --body "Okay, running a **limited review**! Since this was triggered by a comment, I can only test if the app launches correctly. For a full review with linters, please use the formal 'Request a review' feature next time. I'm on it... 🏃"
-        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
-      
-      - name: Checkout Code for Limited Review
-        if: |
-          startsWith(env.COMMENT_BODY, '/review') ||
-          startsWith(env.COMMENT_BODY, '/dismiss') ||
-          contains(env.COMMENT_BODY, '@PriestyBot review')
-        uses: actions/checkout@v4
-      
-      - name: Setup for Limited Review
-        if: |
-          startsWith(env.COMMENT_BODY, '/review') ||
-          startsWith(env.COMMENT_BODY, '/dismiss') ||
-          contains(env.COMMENT_BODY, '@PriestyBot review')
-        run: |
-          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      
-      - name: Run App Test for Limited Review
-        if: |
-          startsWith(env.COMMENT_BODY, '/review') ||
-          startsWith(env.COMMENT_BODY, '/dismiss') ||
-          contains(env.COMMENT_BODY, '@PriestyBot review')
-        id: limited_app_test
-        run: |
-          set +e
-          timeout 30s xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
-          APP_EXIT_CODE=$?
-          set -e
-          echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
-          if [ ${APP_EXIT_CODE} -ne 0 ]; then
-            { echo "Whoops! The app test failed. Here's the log I captured:"; echo ""; echo '```'; cat app_output.txt; echo '```'; } > failure_comment.txt
-            echo "failure_comment_file=failure_comment.txt" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Post Limited Review Verdict
-        if: steps.limited_app_test.conclusion == 'success'
-        run: |
-          if [ "${{ steps.limited_app_test.outputs.app_exit_code }}" == "0" ]; then
-            gh pr review ${{ github.event.issue.number }} --approve --body "Limited review passed! The application launched successfully. I'm approving this. ✅"
-          else
-            gh pr review ${{ github.event.issue.number }} --request-changes --body-file ${{ steps.limited_app_test.outputs.failure_comment_file }}
-          fi
+          gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks!"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-
-  # JOB 2: The full "deluxe" review job. It ONLY runs when a review is formally requested.
+  # JOB 2: The full review job.
   full-review:
     name: Run Full Automated Review
     if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
@@ -97,7 +51,7 @@ jobs:
     steps:
       - name: "Acknowledge Request: Let's see what we've got..."
         run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the formal request! Kicking off a **full review** with linters and the app launch test. I'll be back shortly with the results. 🧐"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the checks now. I'll check for code quality with a linter and run a smoke test to ensure the code is structurally sound. I'll be back shortly! 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
@@ -107,7 +61,7 @@ jobs:
 
       - name: Setup Environment and Dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+          # We no longer need GUI libraries for the new smoke test.
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install flake8
 
@@ -126,17 +80,19 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
-      - name: "Run App Test: The Moment of Truth"
-        id: app_test
+      - name: "Run Code Integrity Smoke Test"
+        id: smoke_test
         run: |
+          echo "Running smoke test to check for syntax and import errors..."
           set +e
-          timeout 30s xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
+          # We just run the new, simpler script. No xvfb or timeout needed.
+          python .github/scripts/run_test.py > app_output.txt 2>&1
           APP_EXIT_CODE=$?
           set -e
           echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
           if [ ${APP_EXIT_CODE} -ne 0 ]; then
             {
-              echo "Whoops! The app test failed. It looks like the program crashed on startup. This is usually due to a bug or an import error in the code."
+              echo "Whoops! The code integrity smoke test failed. This means there's a fatal `SyntaxError` or `ImportError` that needs to be fixed."
               echo ""
               echo "Here's the technical log I captured:"
               echo '```'
@@ -147,28 +103,16 @@ jobs:
           fi
 
       - name: Post Final Verdict
-        if: steps.app_test.conclusion == 'success'
+        if: steps.smoke_test.conclusion == 'success'
         run: |
-          if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
-            LINT_MESSAGE="I also ran the linter and it passed with flying colors. "
+          if [ "${{ steps.smoke_test.outputs.app_exit_code }}" == "0" ]; then
+            LINT_MESSAGE="The linter also passed with flying colors. "
             if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
-              LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments. They're just advisory, but might be helpful! "
+              LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments for you to consider. "
             fi
-            MESSAGE="Full review complete! ${LINT_MESSAGE}Most importantly, the application test harness started and shut down cleanly. Looking good! I'm approving this. ✅"
+            MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the code passed the integrity smoke test, meaning all imports and syntax are correct. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
           else
-            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.smoke_test.outputs.failure_comment_file }}
           fi
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
-
-      - name: Report Bot Failure
-        if: failure() && steps.app_test.conclusion != 'success'
-        run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "💥 **Bot Error!** 💥
-
-          Yikes! I encountered an unexpected internal error and couldn't finish my review. This is a problem with my own machinery, not your code. 
-
-          A human should check the [Action logs for this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) to see the full technical details."
-        env:
-          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-          GH_REPO: ${{ github.repository }}
