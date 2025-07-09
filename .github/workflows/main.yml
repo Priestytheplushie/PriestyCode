@@ -1,86 +1,109 @@
-name: Python CI/CD
+name: PriestyBot PR Manager
 
 on:
-  push:
-    branches: [ "main" ]
-    tags:
-      - 'v*.*.*'
+  issue_comment:
+    types: [created]
   pull_request:
-    branches: [ "main" ]
+    types: [review_requested]
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: write
 
 jobs:
-  linting:
-    name: Linting
+  # JOB 1: Handles simple, lightweight commands that don't need a full review.
+  command-handler:
+    name: Handle Comment Commands
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - name: Get Comment Body
+        run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
+      - name: Handle /approve
+        if: startsWith(env.COMMENT_BODY, '/approve') || contains(env.COMMENT_BODY, '@PriestyBot approve')
         run: |
-          python -m pip install --upgrade pip
-          pip install pylint
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run Pylint
-        # This will run pylint and show suggestions, but the step will never fail.
-        run: pylint src --exit-zero
-
-  run-test:
-    name: Run Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install Tkinter dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk
-      - name: Install app dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Run the app with a virtual display
-        run: |
-          xvfb-run python src/main.py &
-          PID=$!
-          sleep 10
-          if ps -p $PID > /dev/null; then
-            echo "App launched successfully."
-            kill $PID
-            exit 0
+          RAW_COMMENT="${{ env.COMMENT_BODY }}"
+          if [[ "$RAW_COMMENT" == /approve* ]]; then
+            BODY="${RAW_COMMENT#*/approve}"; BODY=$(echo "$BODY" | xargs)
+            if [ -z "$BODY" ]; then BODY="Approved as requested."; fi
           else
-            echo "App failed to launch or crashed."
-            exit 1
+            BODY="Consider it done! I've approved this pull request. 👍"
+          fi
+          gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      # THE GUIDANCE BOT: This step guides the user instead of trying to run a broken command.
+      - name: Handle /review and /dismiss commands
+        if: |
+          startsWith(env.COMMENT_BODY, '/review') ||
+          startsWith(env.COMMENT_BODY, '/dismiss') ||
+          contains(env.COMMENT_BODY, '@PriestyBot review')
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --body "To trigger a new review (which will run linters and test the app), please go to the **Reviewers** panel on the right and request a review from me, **PriestyBot**. This ensures I have the correct permissions and context to run the tests properly!"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+  # JOB 2: The "heavy lifting" job. It ONLY runs when a review is formally requested.
+  full-review:
+    name: Run Full Automated Review
+    if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acknowledge Review Request
+        run: >
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thank you for the review request! I'm starting the automated checks now. This includes running linters and attempting to launch the app. I'll be back shortly with a full review. 🧐"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Environment and Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install flake8
+
+      - name: Setup Reviewdog
+        uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+
+      - name: Run Linters with Reviewdog (Will now work correctly)
+        id: linting
+        run: |
+          set +o pipefail
+          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-review -level=warning
+          LINT_EXIT_CODE=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ ${LINT_EXIT_CODE} -ne 0 ]; then echo "LINTER_ISSUES_FOUND=true" >> $GITHUB_ENV; else echo "LINTER_ISSUES_FOUND=false" >> $GITHUB_ENV; fi
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          
+      - name: Run App Test via Test Runner
+        id: app_test
+        run: |
+          set +e
+          timeout 30s xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
+          APP_EXIT_CODE=$?
+          set -e
+          echo "APP_EXIT_CODE=${APP_EXIT_CODE}" >> $GITHUB_ENV
+          if [ ${APP_EXIT_CODE} -ne 0 ]; then
+            { echo "I tried to run the app via the test harness, but it failed with an exception. This is likely an issue with the code itself (e.g., an import error or bug on startup). Here's the log:"; echo ""; echo '```'; cat app_output.txt; echo '```'; } > failure_comment.txt
+            echo "FAILURE_COMMENT_FILE=failure_comment.txt" >> $GITHUB_ENV
           fi
 
-  deploy:
-    name: Deploy to Production
-    needs: [linting, run-test]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
-    runs-on: windows-latest
-    environment: Production
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install dependencies
+      - name: Post Final Review
+        if: always()
         run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Build the executable
-        run: pyinstaller --name PriestyCode --onefile --windowed src/main.py
-      - name: Create Release and Upload Asset
-        uses: softprops/action-gh-release@v2
-        with:
-          body: "This is an automated release of the latest version."
-          files: dist/PriestyCode.exe
+          if [ "${{ steps.app_test.outputs.APP_EXIT_CODE }}" == "0" ]; then
+            LINT_MESSAGE=""
+            if [ "${{ steps.linting.outputs.LINTER_ISSUES_FOUND }}" == "true" ]; then LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments. "; fi
+            MESSAGE="Review complete! ${LINT_MESSAGE}The application test harness started and exited cleanly. Great work, I'm approving this. ✅"
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
+          else
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.FAILURE_COMMENT_FILE }}
+          fi
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
