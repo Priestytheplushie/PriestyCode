@@ -1,0 +1,12 @@
+[flake8]
+# E501 is 'line too long'. W503 is 'line break before binary operator'.
+# Add any other error codes you want to ignore here, separated by commas.
+ignore = E501, W503
+
+# Optionally, you can just increase the max line length instead of ignoring it.
+# A max-length of 120 is very common in modern projects.
+# If you use this, you can remove E501 from the 'ignore' list above.
+max-line-length = 120
+
+# Exclude directories you don't want to lint
+exclude = .git,__pycache__,docs,venv
