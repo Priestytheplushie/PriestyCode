@@ -5,15 +5,20 @@ on:
     types: [review_requested]
 
 env:
+  # Using a PAT to allow the bot to approve the PR
   APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+  # Reviewdog needs a token with pull-request write permissions
   REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 
 permissions:
   contents: read
   pull-requests: write
+  # FIX: 'checks: write' permission is required for the 'github-pr-check' reporter.
+  checks: write
 
 jobs:
   review:
+    # Only run if the reviewer is the bot itself
     if: github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +29,8 @@ jobs:
           script: |
             const pr_number = context.issue.number;
             const bot_name = "PriestyBot";
+            const pr_author = context.payload.sender.login;
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -32,12 +39,14 @@ jobs:
             const hasAlreadyCommented = comments.some(
               comment => comment.user.login === bot_name && comment.body.includes("Thanks for asking me to review")
             );
+
             if (!hasAlreadyCommented) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pr_number,
-                body: "Hey @${{ github.event.sender.login }}! 👋 Thanks for asking me to review. I'll take a look at the code now and get back to you shortly. 🧐"
+                // FIX: Use backticks (`) for template literals and access the sender from the script's context object.
+                body: `Hey @${pr_author}! 👋 Thanks for asking me to review. I'll take a look at the code now and get back to you shortly. 🧐`
               });
             }
 
@@ -59,38 +68,47 @@ jobs:
 
       - name: 💧 Run Linter (flake8) on Changed Files
         id: lint
+        # FIX: Allows workflow to continue even if linter finds issues.
+        continue-on-error: true
         uses: reviewdog/action-flake8@v3
         with:
           filter_mode: "diff_context"
-          fail_on_error: false
-          reporter: github-pr-review 
+          # FIX: Fails the step if issues are found, so we can check its 'outcome'.
+          fail_on_error: true
+          # FIX: Use 'github-pr-check' to post inline comments on the code diff.
+          reporter: github-pr-check
           level: warning
 
       - name: 💅 Run Format Check (black) on Changed Files
         id: format_check
+        # FIX: Same changes as the linter step for consistency.
+        continue-on-error: true
         uses: reviewdog/action-black@v3
         with:
           filter_mode: "diff_context"
-          fail_on_error: false
-          reporter: github-pr-review
+          fail_on_error: true
+          reporter: github-pr-check
           level: warning
           black_args: "--check --diff src"
       
       - name: 🧪 Run Tkinter App Test
         id: app_test
+        # FIX: Restructured the script to correctly handle the 'timeout' exit code (124) as a success.
+        # The default 'set -e' shell option was causing the step to fail immediately on exit code 124.
         run: |
           echo "Starting the Tkinter app in a virtual display..."
-          # THIS LINE IS THE FIX: Run as a module (-m) to fix Python's import paths.
-          (xvfb-run timeout 10s python -m src.main)
-          exit_code=$?
-          echo "Test command finished with exit code: $exit_code"
-
-          if [ $exit_code -eq 0 ] || [ $exit_code -eq 124 ]; then
-            echo "App test result: PASSED"
-            exit 0
+          if xvfb-run timeout 10s python -m src.main; then
+            echo "App test result: PASSED (exited cleanly before timeout)"
           else
-            echo "App test result: FAILED"
-            exit 1
+            exit_code=$?
+            echo "Test command finished with exit code: $exit_code"
+            if [ $exit_code -eq 124 ]; then
+              echo "App test result: PASSED (ran for 10s without crashing)"
+              exit 0 # Explicitly exit 0 to mark the step as successful
+            else
+              echo "App test result: FAILED (crashed with an unexpected error)"
+              exit $exit_code # Exit with the original error code to fail the step
+            fi
           fi
 
       - name: 📝 Post Final Review Summary
@@ -99,22 +117,23 @@ jobs:
         with:
           github-token: ${{ env.APPROVER_TOKEN }}
           script: |
-            const lint_conclusion = '${{ steps.lint.conclusion }}';
-            const format_conclusion = '${{ steps.format_check.conclusion }}';
-            const test_conclusion = '${{ steps.app_test.conclusion }}';
+            // FIX: Check the step 'outcome' instead of 'conclusion' for a more reliable result.
+            const lint_outcome = '${{ steps.lint.outcome }}';
+            const format_outcome = '${{ steps.format_check.outcome }}';
+            const test_outcome = '${{ steps.app_test.outcome }}';
             const pr_author = context.payload.pull_request.user.login;
             
             let review_body = `Hi @${pr_author}, I've finished my review!\n\nHere's the summary:\n\n`;
             let event = 'APPROVE';
             
-            if ((lint_conclusion === 'success' || lint_conclusion === 'skipped') && (format_conclusion === 'success' || format_conclusion === 'skipped')) {
+            if (lint_outcome === 'success' && format_outcome === 'success') {
               review_body += '✅ **Code Quality & Style:** Passed. Great job!\n';
             } else {
               review_body += '❌ **Code Quality & Style:** I found some issues. Please check my in-line comments for details. You can try running `/format` to fix style issues automatically.\n';
               event = 'REQUEST_CHANGES';
             }
             
-            if (test_conclusion === 'success') {
+            if (test_outcome === 'success') {
               review_body += '✅ **Application Test:** Passed. The app launched successfully!\n';
             } else {
               review_body += '❌ **Application Test:** Failed. The app seems to crash on startup. Check the workflow logs for errors.\n';
