@@ -21,7 +21,7 @@ jobs:
       - name: Get Comment Body
         run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
 
-      # --- THE CORRECTED /help COMMAND ---
+      # --- THE CORRECTED HELP MESSAGE ---
       - name: Handle /help
         if: |
           startsWith(env.COMMENT_BODY, '/help') ||
@@ -163,9 +163,11 @@ jobs:
         if: steps.app_test.conclusion == 'success'
         run: |
           if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
-            LINT_MESSAGE="The linter also passed with flying colors. "
+            # THE FIX: Use a clear if/else block to choose the correct message.
             if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
-              LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments for you to consider. "
+              LINT_MESSAGE="By the way, I also ran the linter and left some suggestions as inline comments for you to consider. "
+            else
+              LINT_MESSAGE="The linter also passed with flying colors. No issues found! "
             fi
             MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the application passed the launch test, meaning it started up without crashing. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
