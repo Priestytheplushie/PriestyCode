@@ -14,10 +14,16 @@ from typing import cast, Union
 import re
 import shutil
 
-from code_editor import CodeEditor
-from console_ui import ConsoleUi
-from terminal import Terminal
-from file_explorer import FileExplorer
+try:
+    from code_editor import CodeEditor
+    from console_ui import ConsoleUi
+    from terminal import Terminal
+    from file_explorer import FileExplorer
+except Exception:
+    from src.code_editor import CodeEditor
+    from src.console_ui import ConsoleUi
+    from src.terminal import Terminal
+    from src.file_explorer import FileExplorer
 
 current_dir = os.path.dirname(__file__)
 initial_project_root_dir = os.path.abspath(os.path.join(current_dir, '..'))
