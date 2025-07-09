@@ -6,10 +6,12 @@ on:
 
 jobs:
   review:
+    # This job only runs when a comment with the exact body '/review' is made on a PR
     if: github.event.issue.pull_request && github.event.comment.body == '/review'
     runs-on: ubuntu-latest
     name: Run Pylint Review
 
+    # Grant permissions for the bot to write PR reviews and comments
     permissions:
       pull-requests: write
       contents: read
@@ -43,6 +45,8 @@ jobs:
         run: curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Run Pylint and save output
+        # Save the pylint report to a file. The '|| true' prevents this step
+        # from failing if pylint finds issues.
         run: pylint src > pylint-report.log || true
 
       - name: Post inline comments with Reviewdog
