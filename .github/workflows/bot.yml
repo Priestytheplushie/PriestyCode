@@ -16,20 +16,32 @@ jobs:
   bot-handler:
     runs-on: ubuntu-latest
     # IMPORTANT: Change 'approver-bot' to your bot's actual GitHub username.
+    # This corrected 'if' condition is more robust and reliable.
     if: >
       github.event_name == 'issue_comment' ||
-      (github.event_name == 'pull_request' && github.event.requested_reviewer.login == 'approver-bot')
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.requested_reviewers.*.login, 'approver-bot'))
 
     steps:
-      - name: 'Get PR Number'
+      - name: 'Get PR Metadata'
         id: get_pr
         run: |
           if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
             echo "pr_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "pr_sha=${{ fromJson(steps.get_pr_json.outputs.result).head.sha }}" >> $GITHUB_OUTPUT
           else
             echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "pr_sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
           fi
-
+        # This step is needed to get the SHA for comment-triggered reviews
+      - name: 'Get PR JSON'
+        if: github.event_name == 'issue_comment'
+        id: get_pr_json
+        run: |
+          gh pr view ${{ github.event.issue.number }} --json head > pr.json
+          echo "result=$(cat pr.json)" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
       - name: 'Handle Command: /approve'
         if: startsWith(github.event.comment.body, '/approve')
         run: |
@@ -56,7 +68,7 @@ jobs:
       - name: 'Handle Command: /review or Review Request'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         run: |
           gh pr comment ${{ steps.get_pr.outputs.pr_number }} -b "Alright, I'll take a look at this PR now. I'll check the code style and see if the app runs. Back in a moment! ☕"
         env:
@@ -65,15 +77,15 @@ jobs:
       - name: 'Automated Review: Checkout Code'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.event.issue.pull_request.url }}
+          ref: ${{ steps.get_pr.outputs.pr_sha }}
 
       - name: 'Automated Review: Setup Python and Dependencies'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         run: |
           sudo apt-get update && sudo apt-get install -y python3-tk xvfb
           python -m pip install --upgrade pip
@@ -82,14 +94,14 @@ jobs:
       - name: 'Automated Review: Run Linter (flake8)'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         run: |
           flake8 src/main.py > linting-results.txt || true
           
       - name: 'Automated Review: Attempt to run Tkinter app'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         run: |
           timeout 10s xvfb-run python src/main.py &> app-run-log.txt
           if [ $? -eq 124 ]; then
@@ -101,20 +113,15 @@ jobs:
       - name: 'Automated Review: Post Human-Like Results'
         if: >
           startsWith(github.event.comment.body, '/review') ||
-          (github.event_name == 'pull_request' && github.event.action == 'review_requested')
+          github.event.action == 'review_requested'
         run: |
-          # --- Build the review comment piece by piece ---
           FINAL_COMMENT="Okay, I've finished my review. Here are my thoughts:\n\n"
-
-          # 1. Add the linting/code style section
           if [ -s linting-results.txt ]; then
             LINTING_RESULTS=$(cat linting-results.txt)
             FINAL_COMMENT+="**Code Style Check:**\nI ran a linter over \`src/main.py\` and found a few things that could be improved for style and quality. Here's the output:\n\`\`\`\n${LINTING_RESULTS}\n\`\`\`\n\n"
           else
             FINAL_COMMENT+="**Code Style Check:**\nLooks great! I ran it through the linter and didn't find any issues. Nice work. ✅\n\n"
           fi
-
-          # 2. Add the application test section
           APP_RUN_STATUS=$(cat app-run-status.txt)
           if [ "$APP_RUN_STATUS" == "success" ]; then
             FINAL_COMMENT+="**Application Test:**\nNext, I tried running the Tkinter app. It launched without any immediate crashes, which is a good sign! 👍\n\n"
@@ -122,15 +129,11 @@ jobs:
             APP_RUN_LOG=$(cat app-run-log.txt)
             FINAL_COMMENT+="**Application Test:**\nI then tried to run the Tkinter app, but it seems to have run into a problem. Here's the log from the attempt, which might help you debug it:\n\`\`\`\n${APP_RUN_LOG}\n\`\`\`\n\n"
           fi
-
-          # 3. Add a summary
           if [ "$APP_RUN_STATUS" == "success" ] && ! [ -s linting-results.txt ]; then
             FINAL_COMMENT+="**Summary:**\nOverall, this looks good to me! No issues found in the automated check."
           else
             FINAL_COMMENT+="**Summary:**\nPlease take a look at the points above. Once those are addressed, it should be in good shape. Let me know if you have any questions!"
           fi
-          
-          # Use a delimiter to pass the multiline string to the body
           gh pr comment ${{ steps.get_pr.outputs.pr_number }} --body "$FINAL_COMMENT"
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
