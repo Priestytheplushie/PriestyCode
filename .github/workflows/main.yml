@@ -11,7 +11,7 @@ permissions:
   pull-requests: write
   contents: write
   checks: write
-  labels: write
+  labels: write # This is the correct place for permissions
 
 jobs:
   # JOB 1: Handles all comment-based interactions.
@@ -72,10 +72,10 @@ jobs:
           gh pr comment ${{ github.event.issue.number }} --body "
           ### PriestyBot Help
 
-          *   `/approve`: Approves the PR.
-          *   `@PriestyBot in-depth look`: Runs a strict, advisory code quality check. This is not required to merge.
-          *   `/format`: If a strict review fails, I will auto-format the code for you.
-          *   **Standard Review**: For the main app launch test, use the 'Request a review' feature in the GitHub sidebar and select me.
+          * `/approve`: Approves the PR.
+          * `@PriestyBot in-depth look`: Runs a strict, advisory code quality check. This is not required to merge.
+          * `/format`: If a strict review fails, I will auto-format the code for you.
+          * **Standard Review**: For the main app launch test, use the 'Request a review' feature in the GitHub sidebar and select me.
           "
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
