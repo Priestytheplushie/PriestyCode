@@ -21,9 +21,8 @@ jobs:
       - name: Get Comment Body
         run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
 
-      # --- NEW, MORE FLEXIBLE /help COMMAND ---
+      # --- THE CORRECTED /help COMMAND ---
       - name: Handle /help
-        # This now triggers on `/help` OR if the comment contains both '@PriestyBot' and 'help'.
         if: |
           startsWith(env.COMMENT_BODY, '/help') ||
           (contains(env.COMMENT_BODY, '@PriestyBot') && contains(env.COMMENT_BODY, 'help'))
@@ -35,6 +34,12 @@ jobs:
 
           *   **`/approve [message]`**
               > Approves the pull request with an optional message. You can also say things like \`@PriestyBot approve this\`.
+
+          *   **`/request-changes <message>`**
+              > Submits a review requesting changes, using your message as the reason. *This is a required field.*
+
+          *   **`/comment <message>`**
+              > Leaves a regular comment on the pull request without changing the review status. *This is a required field.*
           
           *   **Requesting a Review**
               > To run the full suite of checks (linters + app launch test), please use the formal **'Request a review'** feature in the GitHub sidebar and select me. Commenting \`/review\` or \`/dismiss\` will also remind you how to do this.
@@ -56,6 +61,23 @@ jobs:
             BODY="You got it! I've approved this pull request. 👍"
           fi
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      # --- These commands were missing from the help message, but their logic is here ---
+      - name: Handle /request-changes
+        if: startsWith(env.COMMENT_BODY, '/request-changes')
+        run: |
+          RAW_COMMENT="${{ env.COMMENT_BODY }}"; CHANGES="${RAW_COMMENT#*/request-changes}"; CHANGES=$(echo "$CHANGES" | xargs)
+          if [ -z "$CHANGES" ]; then echo "Error: The /request-changes command requires a reason."; exit 1; fi
+          gh pr review ${{ github.event.issue.number }} --request-changes --body "$CHANGES"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      - name: Handle /comment
+        if: startsWith(env.COMMENT_BODY, '/comment')
+        run: |
+          RAW_COMMENT="${{ env.COMMENT_BODY }}"; COMMENT_TEXT="${RAW_COMMENT#*/comment}"; COMMENT_TEXT=$(echo "$COMMENT_TEXT" | xargs)
+          if [ -z "$COMMENT_TEXT" ]; then echo "Error: The /comment command requires text."; exit 1; fi
+          gh pr comment ${{ github.event.issue.number }} --body "$COMMENT_TEXT"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Handle /review and /dismiss guidance
