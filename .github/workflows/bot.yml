@@ -1,0 +1,145 @@
+name: Bot Commands
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle-command:
+    # This job only runs if the comment is on a PR and starts with a known command
+    if: >
+      github.event.issue.pull_request &&
+      (
+        startsWith(trim(github.event.comment.body), '/review') ||
+        startsWith(trim(github.event.comment.body), '/approve') ||
+        startsWith(trim(github.event.comment.body), '/request-changes') ||
+        startsWith(trim(github.event.comment.body), '/comment') ||
+        startsWith(trim(github.event.comment.body), '/help')
+      )
+    runs-on: ubuntu-latest
+    
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      # --- /help COMMAND ---
+      - name: Handle /help command
+        if: startsWith(trim(github.event.comment.body), '/help')
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            🤖 **Available Bot Commands:**
+            - `/help`: Shows this help message.
+            - `/review`: Runs Pylint and posts suggestions as inline comments, then submits a formal PR review.
+            - `/approve`: Formally approves the Pull Request.
+            - `/request-changes`: Formally requests changes on the Pull Request.
+            - `/comment`: Posts a generic comment on the Pull Request.
+
+      # --- /approve COMMAND ---
+      - name: Handle /approve command
+        if: startsWith(trim(github.event.comment.body), '/approve')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commenter = context.payload.comment.user.login;
+            const reviewBody = `✅ Approved automatically by @PriestyBot based on a command from @${commenter}.`;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'APPROVE',
+              body: reviewBody,
+            });
+
+      # --- /request-changes COMMAND ---
+      - name: Handle /request-changes command
+        if: startsWith(trim(github.event.comment.body), '/request-changes')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commenter = context.payload.comment.user.login;
+            const reviewBody = `⚠️ Changes requested automatically by @PriestyBot based on a command from @${commenter}.`;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'REQUEST_CHANGES',
+              body: reviewBody,
+            });
+
+      # --- /comment COMMAND ---
+      - name: Handle /comment command
+        if: startsWith(trim(github.event.comment.body), '/comment')
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            💬 A comment was posted via the `/comment` command, triggered by @${{ github.event.comment.user.login }}.
+
+      # --- /review COMMAND ---
+      - name: Start /review command
+        if: startsWith(trim(github.event.comment.body), '/review')
+        id: review
+        run: echo "Starting the review process..."
+
+      - name: Acknowledge /review command
+        if: steps.review.conclusion == 'success'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            🤖 Understood! I'm starting the on-demand review.
+            I will post the results as comments and then submit a final review status.
+
+      - name: Check out PR code for review
+        if: steps.review.conclusion == 'success'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.issue.pull_request.head.sha }}
+
+      - name: Set up Python & dependencies for review
+        if: steps.review.conclusion == 'success'
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Install reviewdog
+        if: steps.review.conclusion == 'success'
+        run: curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Run Pylint and save output
+        if: steps.review.conclusion == 'success'
+        run: pylint src > pylint-report.log || true
+
+      - name: Post inline comments with Reviewdog
+        if: steps.review.conclusion == 'success'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cat pylint-report.log | reviewdog -f=pylint -name="Pylint Suggestions" -reporter=github-pr-review -level=info
+
+      - name: Submit Final Review Status
+        if: steps.review.conclusion == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('pylint-report.log', 'utf8');
+            let reviewEvent = 'APPROVE';
+            let reviewBody = '✅ Great work! I found no issues to report. This PR is approved.';
+            if (report.trim().length > 0) {
+              reviewEvent = 'REQUEST_CHANGES';
+              reviewBody = '⚠️ I found some areas for improvement. I have left suggestions as inline comments. Please review them.';
+            }
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: reviewEvent,
+              body: reviewBody,
+            });
