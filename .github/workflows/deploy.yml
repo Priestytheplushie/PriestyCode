@@ -1,0 +1,64 @@
+name: Create Release and Deploy
+
+on:
+  # This workflow runs only when you push a new tag that looks like a version number.
+  # Examples: v1.0, v1.2.3, v2.0-beta
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*'
+
+# This permission is essential for the workflow to create a release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release Executable
+    # Use the "Production" environment you created. You can add protection rules to this later.
+    environment: Production 
+    # To build a .exe, we MUST use a Windows runner.
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Specify a consistent Python version
+
+      - name: Install Dependencies
+        run: |
+          # Upgrade pip and install all packages from your requirements file
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build the .exe with PyInstaller
+        run: |
+          # --onefile: Creates a single executable file.
+          # --windowed: Prevents a console window from appearing when the GUI runs.
+          # --name: Sets the name of your final .exe file.
+          # The final argument is the entry point script for your application.
+          pyinstaller --onefile --windowed --name "${{ github.event.repository.name }}" src/main.py
+
+      - name: Package Release Assets
+        run: |
+          # It's good practice to zip the executable for distribution.
+          # We'll name the zip file using the repo name and the tag.
+          $zipName = "${{ github.event.repository.name }}-${{ github.ref_name }}.zip"
+          Compress-Archive -Path "dist/${{ github.event.repository.name }}.exe" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+        shell: powershell
+
+      - name: Create GitHub Release and Upload Asset
+        run: |
+          # This command uses the GitHub CLI to create a release.
+          # It uses the tag as the release name and automatically generates notes
+          # from the pull requests merged since the last release.
+          # Finally, it uploads the zip file we created.
+          gh release create "${{ github.ref_name }}" --generate-notes --title "${{ github.ref_name }}" "${{ env.ZIP_NAME }}"
+        env:
+          # The GITHUB_TOKEN is automatically provided by GitHub Actions.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

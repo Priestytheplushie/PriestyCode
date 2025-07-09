@@ -12,7 +12,7 @@ permissions:
   checks: write
 
 jobs:
-  # JOB 1: Handles simple commands and provides guidance.
+  # JOB 1: Handles simple, lightweight commands that don't need a full review.
   command-handler:
     name: Handle Comment Commands
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
@@ -21,8 +21,32 @@ jobs:
       - name: Get Comment Body
         run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
 
+      # --- NEW, MORE FLEXIBLE /help COMMAND ---
+      - name: Handle /help
+        # This now triggers on `/help` OR if the comment contains both '@PriestyBot' and 'help'.
+        if: |
+          startsWith(env.COMMENT_BODY, '/help') ||
+          (contains(env.COMMENT_BODY, '@PriestyBot') && contains(env.COMMENT_BODY, 'help'))
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --body "
+          ### Hello! I'm PriestyBot. 👋
+          
+          Here are the commands you can use by writing a new comment:
+
+          *   **`/approve [message]`**
+              > Approves the pull request with an optional message. You can also say things like \`@PriestyBot approve this\`.
+          
+          *   **Requesting a Review**
+              > To run the full suite of checks (linters + app launch test), please use the formal **'Request a review'** feature in the GitHub sidebar and select me. Commenting \`/review\` or \`/dismiss\` will also remind you how to do this.
+
+          *   **`/help`**
+              > Shows this help message. You can also just mention me and ask for help!
+          "
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
       - name: Handle /approve
-        if: startsWith(env.COMMENT_BODY, '/approve') || contains(env.COMMENT_BODY, '@PriestyBot approve')
+        # This `if` condition needs to be more specific to avoid firing on a help request.
+        if: (startsWith(env.COMMENT_BODY, '/approve') || contains(env.COMMENT_BODY, '@PriestyBot approve')) && !contains(env.COMMENT_BODY, 'help')
         run: |
           RAW_COMMENT="${{ env.COMMENT_BODY }}"
           if [[ "$RAW_COMMENT" == /approve* ]]; then
@@ -34,13 +58,11 @@ jobs:
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-      - name: Handle /review and /dismiss commands
-        if: |
-          startsWith(env.COMMENT_BODY, '/review') ||
-          startsWith(env.COMMENT_BODY, '/dismiss') ||
-          contains(env.COMMENT_BODY, '@PriestyBot review')
+      - name: Handle /review and /dismiss guidance
+        # This `if` condition needs to be more specific to avoid firing on a help request.
+        if: (startsWith(env.COMMENT_BODY, '/review') || startsWith(env.COMMENT_BODY, '/dismiss') || contains(env.COMMENT_BODY, '@PriestyBot review')) && !contains(env.COMMENT_BODY, 'help')
         run: |
-          gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks!"
+          gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks! (You can also type \`/help\` for more info)."
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
   # JOB 2: The full review job. It ONLY runs when a review is formally requested.
@@ -51,7 +73,7 @@ jobs:
     steps:
       - name: "Acknowledge Request: Let's see what we've got..."
         run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the checks now. I'll check for code quality with a linter and run a test to ensure the app can initialize. I'll be back shortly! 🧐"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the checks now. I'll check for code quality with a linter and run a test to ensure the app can launch. I'll be back shortly! 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
@@ -61,7 +83,6 @@ jobs:
 
       - name: Setup Environment and Dependencies
         run: |
-          # THE FIX: We must install both the Tkinter library AND the virtual display.
           sudo apt-get update && sudo apt-get install -y python3-tk xvfb
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install flake8
@@ -81,19 +102,23 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
-      - name: "Run App Initialization Test"
+      - name: "Run App Launch Test"
         id: app_test
         run: |
-          echo "Running app initialization test inside a virtual display..."
+          echo "Running app launch test for 10 seconds..."
           set +e
-          # THE FIX: We wrap our reliable test script with xvfb-run.
-          xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
+          timeout 10s xvfb-run python -m src.main > app_output.txt 2>&1
           APP_EXIT_CODE=$?
           set -e
-          echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
-          if [ ${APP_EXIT_CODE} -ne 0 ]; then
+          
+          if [ ${APP_EXIT_CODE} -eq 124 ]; then
+            echo "App ran for 10 seconds without crashing. Test PASSED."
+            echo "app_exit_code=0" >> $GITHUB_OUTPUT
+          else
+            echo "App crashed before timeout. Test FAILED with exit code ${APP_EXIT_CODE}."
+            echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
             {
-              echo "Whoops! The app initialization test failed. This means the program crashed on startup. This is usually due to a bug or an import error in the code."
+              echo "Whoops! The app launch test failed. The program crashed on startup."
               echo ""
               echo "Here's the technical log I captured:"
               echo '```'
@@ -111,7 +136,7 @@ jobs:
             if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
               LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments for you to consider. "
             fi
-            MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the application passed the initialization test, meaning all imports and GUI components are set up correctly. Looking good! I'm approving this. ✅"
+            MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the application passed the launch test, meaning it started up without crashing. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
           else
             gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
