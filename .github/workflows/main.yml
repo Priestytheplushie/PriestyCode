@@ -12,7 +12,7 @@ permissions:
   checks: write
 
 jobs:
-  # JOB 1: Handles simple commands.
+  # JOB 1: Handles simple commands and provides guidance.
   command-handler:
     name: Handle Comment Commands
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
@@ -43,7 +43,7 @@ jobs:
           gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks!"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-  # JOB 2: The full review job.
+  # JOB 2: The full review job. It ONLY runs when a review is formally requested.
   full-review:
     name: Run Full Automated Review
     if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
@@ -61,7 +61,8 @@ jobs:
 
       - name: Setup Environment and Dependencies
         run: |
-          # We no longer need GUI libraries for the new smoke test.
+          # THE FIX: We must install python3-tk because src/main.py imports it.
+          sudo apt-get update && sudo apt-get install -y python3-tk
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install flake8
 
@@ -85,7 +86,6 @@ jobs:
         run: |
           echo "Running smoke test to check for syntax and import errors..."
           set +e
-          # We just run the new, simpler script. No xvfb or timeout needed.
           python .github/scripts/run_test.py > app_output.txt 2>&1
           APP_EXIT_CODE=$?
           set -e
