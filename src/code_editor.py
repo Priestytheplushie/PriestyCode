@@ -351,27 +351,29 @@ class AutocompleteManager:
         self.window = tk.Toplevel(self.text_area)
         self.window.wm_overrideredirect(True)
         self.window.withdraw()
-        main_frame = tk.Frame(self.window, bg="#555555", borderwidth=1, relief="solid")
+        main_frame = tk.Frame(self.window, bg="#3C3C3C", borderwidth=1, relief="solid")
         main_frame.pack(fill="both", expand=True)
+        
         self.style = ttk.Style()
-        self.paned_window = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL, style='Autocomplete.TPanedwindow')
+        self.paned_window = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
         self.paned_window.pack(fill="both", expand=True)
-        list_frame = tk.Frame(self.paned_window, bg="#3C3C3C")
+
+        list_frame = tk.Frame(self.paned_window, bg="#252526")
         self.tree = ttk.Treeview(list_frame, show="tree", selectmode="browse")
-        self.tree.pack(fill="both", expand=True)
+        self.tree.pack(fill="both", expand=True, padx=(0,1), pady=1) # Add some padding
         self.paned_window.add(list_frame, weight=2)
         
-        preview_outer_frame = tk.Frame(self.paned_window, bg="#2B2B2B")
-        self.preview_text = tk.Text(preview_outer_frame, wrap="word", bg="#2B2B2B", fg="white",font=("Consolas", 9), state="disabled", borderwidth=0,highlightthickness=0, spacing1=2, spacing3=2)
-        self.preview_text.pack(fill="both", expand=True, padx=5, pady=5)
+        preview_outer_frame = tk.Frame(self.paned_window, bg="#1E1E1E")
+        self.preview_text = tk.Text(preview_outer_frame, wrap="word", bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 9), state="disabled", borderwidth=0, highlightthickness=0, spacing1=2, spacing3=2, padx=10, pady=5)
+        self.preview_text.pack(fill="both", expand=True)
         
         self.context_separator = ttk.Separator(preview_outer_frame, orient=tk.HORIZONTAL)
-        self.context_label = tk.Label(preview_outer_frame, text="", bg="#2B2B2B", fg="#AAAAAA", font=("Consolas", 8), justify=tk.LEFT)
+        self.context_label = tk.Label(preview_outer_frame, text="", bg="#1E1E1E", fg="#AAAAAA", font=("Consolas", 8), justify=tk.LEFT)
 
         self.preview_text.tag_config("type", foreground="#AAAAAA")
         self.preview_text.tag_config("label", foreground="white", font=("Consolas", 9, "bold"))
-        self.preview_text.tag_config("detail", foreground="#AAAAAA")
-        self.preview_text.tag_config("code_preview", foreground="#B4B4B4", background="#222222", font=("Consolas", 9), relief="sunken", borderwidth=1, lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
+        self.preview_text.tag_config("detail", foreground="#BBBBBB")
+        self.preview_text.tag_config("code_preview", foreground="#B4B4B4", background="#252526", font=("Consolas", 9), lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
         self.preview_text.tag_config("preview_match_highlight", font=("Consolas", 9, "bold", "underline"))
         self.paned_window.add(preview_outer_frame, weight=3)
         
@@ -379,14 +381,17 @@ class AutocompleteManager:
         self._configure_treeview()
 
     def _configure_treeview(self):
-        self.style.configure('Autocomplete.TPanedwindow', sashwidth=2, background="#3C3C3C")
+        self.style.configure('TPanedwindow', background="#3C3C3C", sashwidth=4, sashrelief=tk.FLAT)
         font_name = "Segoe UI Symbol" if os.name == 'nt' else "Arial"
-        self.style.configure("Custom.Treeview", background="#3C3C3C", foreground="white",
-                             fieldbackground="#3C3C3C", borderwidth=0, rowheight=22,
+        self.style.configure("Treeview", background="#252526", foreground="#CCCCCC",
+                             fieldbackground="#252526", borderwidth=0, rowheight=24,
                              font=(font_name, 10))
-        self.style.map('Custom.Treeview', background=[('selected', '#555555')])
-        self.style.layout("Custom.Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])
-        self.tree.config(style="Custom.Treeview")
+        self.style.map('Treeview',
+                       background=[('selected', '#094771')],
+                       foreground=[('selected', 'white')])
+        self.style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})]) # Remove borders
+        
+        self.tree.config(style="Treeview")
         self.tree.heading('#0', text='')
         self.tree.tag_configure('variable', foreground='#80D0FF')
         self.tree.tag_configure('attribute', foreground='#80D0FF') 
@@ -421,22 +426,22 @@ class AutocompleteManager:
         self.window.update_idletasks()
         
         bbox_info = self.preview_text.dlineinfo("end-1c")
-        required_height = bbox_info[1] + bbox_info[3] + 10 if bbox_info else 100
+        required_height = bbox_info[1] + bbox_info[3] + 15 if bbox_info else 100
         if self.context_label.winfo_ismapped():
             required_height += self.context_label.winfo_height() + self.context_separator.winfo_height()
 
-        list_height = min(len(completions), 10) * 22 + 6
+        list_height = min(len(completions), 10) * self.style.lookup("Treeview", "rowheight") + 10
         new_height = max(list_height, required_height)
         new_height = min(new_height, 400)
 
         if not self.window.winfo_viewable():
             x, y, _, h = bbox
             x += self.text_area.winfo_rootx(); y += self.text_area.winfo_rooty() + h
-            self.window.geometry(f"550x{new_height}+{x}+{y}")
+            self.window.geometry(f"600x{new_height}+{x}+{y}")
             self.window.deiconify(); self.window.lift()
         else:
             current_x, current_y = self.window.winfo_x(), self.window.winfo_y()
-            self.window.geometry(f"550x{new_height}+{current_x}+{current_y}")
+            self.window.geometry(f"600x{new_height}+{current_x}+{current_y}")
         
         if self.tree.get_children():
             self.tree.selection_set('0')
@@ -479,7 +484,7 @@ class AutocompleteManager:
                 self.preview_text.insert("end", f"{label}\n", "label")
 
             if detail:
-                self.preview_text.insert("end", "-----------------\n", "detail")
+                self.preview_text.insert("end", "\n", "detail") # Extra space
                 if '[code]' in detail:
                     parts = detail.split('[code]', 1)
                     description = parts[0].strip()
@@ -991,41 +996,51 @@ class CodeEditor(tk.Frame):
         """
         Inserts the selected completion item into the text area. It handles
         placeholder replacement for snippets and regular word replacement.
-
-        Args:
-            item: The completion dictionary object selected from the list.
+        This version fixes a bug where completing inside a snippet would
+        incorrectly terminate the session.
         """
         self.text_area.edit_separator()
 
-        # If a snippet is active and a placeholder is selected, that's our replacement target.
-        if self.active_snippet_session and self.text_area.tag_ranges("sel"):
-            replace_start_index_str = self.text_area.index("sel.first")
-            insert_index_before = self.text_area.index("sel.last")
-            # When completing inside a placeholder, we don't start a new snippet session.
+        # Helper to check if the completion item is itself a snippet
+        def is_snippet(completion_item):
+            raw_text = completion_item.get('insert', '')
+            return bool(re.search(r'\$\{\d+:.+?\}', raw_text))
+
+        # Case A: We are in an active snippet session and we are NOT inserting a new snippet.
+        # This means we are just filling text into a placeholder.
+        if self.active_snippet_session and not is_snippet(item):
+            replace_start_index_str = ""
+            insert_index_before = self.text_area.index(tk.INSERT)
+            
+            # If the placeholder is still fully selected, replace the selection.
+            if self.text_area.tag_ranges("sel"):
+                replace_start_index_str = self.text_area.index("sel.first")
+                insert_index_before = self.text_area.index("sel.last")
+            else: # Otherwise, replace the word before the cursor.
+                replace_start_index_str = self.text_area.index("insert-1c wordstart")
+            
             self._perform_insertion(item, replace_start_index_str, insert_index_before, start_new_snippet=False)
-            # Since we just filled a placeholder, confirm it.
             self._confirm_current_placeholder()
+        
+        # Case B: We are not in a snippet session, OR we are overriding an old snippet with a new one.
         else:
-            # Standard behavior: end any previous snippet session and start a new one if needed.
-            self._end_snippet_session()
+            self._end_snippet_session() # End any previous session.
             insert_index_before = self.text_area.index(tk.INSERT)
             current_line_before_cursor = self.text_area.get(f"{insert_index_before} linestart", insert_index_before)
             
-            # Determine the start of the word to be replaced.
-            replace_start_index_str = "insert-1c wordstart"
+            # Determine the start of the word to be replaced with corrected logic.
+            replace_start_index_str = self.text_area.index("insert-1c wordstart")
+            
             decorator_match = re.search(r'@\w*$', current_line_before_cursor)
+            dot_match = re.search(r'\b[\w_]+\.([\w_]*)$', current_line_before_cursor)
+
             if decorator_match:
                 replace_start_index_str = f"insert - {len(decorator_match.group(0))}c"
-            else:
-                try:
-                    # Handle replacing partial member access like `os.pa`
-                    dot_match = re.search(r'\b[\w_]+\.([\w_]*)$', current_line_before_cursor)
-                    if dot_match and dot_match.group(1):
-                        replace_start_index_str = f"{insert_index_before} - {len(dot_match.group(1))} chars"
-                    else: # Default word replacement
-                        replace_start_index_str = self.text_area.index("insert-1c wordstart")
-                except (tk.TclError, IndexError):
-                     replace_start_index_str = self.text_area.index("insert-1c wordstart")
+            elif dot_match:
+                # Replace the partial member name (group 2) after the dot.
+                partial_member = dot_match.group(2)
+                replace_start_index_str = f"insert - {len(partial_member)}c"
+            
             self._perform_insertion(item, replace_start_index_str, insert_index_before, start_new_snippet=True)
 
         self.last_action_was_auto_feature = True
