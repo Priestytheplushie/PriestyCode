@@ -51,7 +51,7 @@ jobs:
     steps:
       - name: "Acknowledge Request: Let's see what we've got..."
         run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the checks now. I'll check for code quality with a linter and run a smoke test to ensure the code is structurally sound. I'll be back shortly! 🧐"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the checks now. I'll check for code quality with a linter and run a test to ensure the app can initialize. I'll be back shortly! 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
@@ -61,8 +61,8 @@ jobs:
 
       - name: Setup Environment and Dependencies
         run: |
-          # THE FIX: We must install python3-tk because src/main.py imports it.
-          sudo apt-get update && sudo apt-get install -y python3-tk
+          # THE FIX: We must install both the Tkinter library AND the virtual display.
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install flake8
 
@@ -81,18 +81,19 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
-      - name: "Run Code Integrity Smoke Test"
-        id: smoke_test
+      - name: "Run App Initialization Test"
+        id: app_test
         run: |
-          echo "Running smoke test to check for syntax and import errors..."
+          echo "Running app initialization test inside a virtual display..."
           set +e
-          python .github/scripts/run_test.py > app_output.txt 2>&1
+          # THE FIX: We wrap our reliable test script with xvfb-run.
+          xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
           APP_EXIT_CODE=$?
           set -e
           echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
           if [ ${APP_EXIT_CODE} -ne 0 ]; then
             {
-              echo "Whoops! The code integrity smoke test failed. This means there's a fatal `SyntaxError` or `ImportError` that needs to be fixed."
+              echo "Whoops! The app initialization test failed. This means the program crashed on startup. This is usually due to a bug or an import error in the code."
               echo ""
               echo "Here's the technical log I captured:"
               echo '```'
@@ -103,16 +104,16 @@ jobs:
           fi
 
       - name: Post Final Verdict
-        if: steps.smoke_test.conclusion == 'success'
+        if: steps.app_test.conclusion == 'success'
         run: |
-          if [ "${{ steps.smoke_test.outputs.app_exit_code }}" == "0" ]; then
+          if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
             LINT_MESSAGE="The linter also passed with flying colors. "
             if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
               LINT_MESSAGE="I also ran the linter and left some suggestions as inline comments for you to consider. "
             fi
-            MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the code passed the integrity smoke test, meaning all imports and syntax are correct. Looking good! I'm approving this. ✅"
+            MESSAGE="I've finished my review! ${LINT_MESSAGE}The main thing is that the application passed the initialization test, meaning all imports and GUI components are set up correctly. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
           else
-            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.smoke_test.outputs.failure_comment_file }}
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
           fi
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
