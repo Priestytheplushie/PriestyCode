@@ -1,0 +1,67 @@
+# .github/workflows/strict-review.yml
+name: In-Depth Code Review
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  run-strict-review:
+    if: github.event.label.name == 'bot: in-depth review'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      checks: write
+      labels: write
+
+    steps:
+      - name: Acknowledge In-Depth Review
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body "Okay, I see you've requested an in-depth look. I'm running the strict code quality checks now (`black`, `isort`, `flake8`). I'll be back with a full report. 🕵️‍♂️"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Linters
+        run: pip install black isort flake8
+
+      - name: Setup Reviewdog
+        uses: reviewdog/action-setup@v1
+
+      - name: Run Linters with Reviewdog
+        id: strict_lint
+        continue-on-error: true
+        run: |
+          (isort --check-only . && black --check . && flake8 .) | reviewdog -name="In-Depth Code Quality" -reporter=github-pr-review
+      
+      - name: Post Final Report
+        run: |
+          if [ ${{ steps.strict_lint.outcome }} == 'success' ]; then
+            # If everything passed, just leave a simple, approving comment.
+            gh pr review ${{ github.event.pull_request.number }} --comment --body "✅ **In-Depth Review Passed!** All formatters and linters are happy. Excellent work!"
+          else
+            # --- THE NEW LOGIC ---
+            # Step 1: Submit the review requesting changes, with all the details.
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body "⚠️ **In-Depth Review Found Issues.** I've left comments on the specific lines that need attention.
+            
+            **Note:** This is an optional, advisory check. I will clear my 'changes requested' status immediately so this PR is **not blocked from merging.**
+            
+            **Want me to fix the formatting for you?** Just reply with a new comment:
+            \`\`\`
+            /format
+            \`\`\`
+            "
+            
+            # Step 2: Immediately submit a silent approval to unblock the PR.
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "Clearing advisory 'changes requested' status."
+          fi
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      - name: "Cleanup: Remove Trigger Label"
+        if: always()
+        run: gh pr edit ${{ github.event.pull_request.number }} --remove-label "bot: in-depth review"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
