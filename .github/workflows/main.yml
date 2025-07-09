@@ -12,7 +12,7 @@ permissions:
   checks: write
 
 jobs:
-  # JOB 1: Handles simple comments.
+  # JOB 1: Handles simple, lightweight commands that don't need a full review.
   command-handler:
     name: Handle Comment Commands
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
@@ -43,15 +43,15 @@ jobs:
           gh pr comment ${{ github.event.issue.number }} --body "To kick off a full automated review, please head over to the **Reviewers** panel on the right side of this page and formally request a review from me, **PriestyBot**. That gives me the green light to run all the checks!"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-  # JOB 2: The full review job.
+  # JOB 2: The full review job. It ONLY runs when a review is formally requested.
   full-review:
     name: Run Full Automated Review
     if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
-      - name: Acknowledge Review Request
+      - name: "Acknowledge Request: Let's see what we've got..."
         run: >
-          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the request! I'm warming up the engines to run the checks. I'll report back with what I find. 🧐"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm pulling down the code now and getting the test environment ready. I'll report back with what I find. 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
@@ -68,23 +68,22 @@ jobs:
       - name: Setup Reviewdog
         uses: reviewdog/action-setup@v1
 
-      - name: Run Linters with Reviewdog
+      - name: "Run Advisory Linters (will not block)"
         id: linting
+        continue-on-error: true
         run: |
           set +o pipefail
-          # THE FIX: Use 'github-pr-review' reporter to post a single, clean review comment.
-          flake8 . | reviewdog -f=flake8 -name="Flake8 Linter" -reporter=github-pr-review -level=warning
+          flake8 . | reviewdog -f=flake8 -name="Advisory Linter (flake8)" -reporter=github-pr-check -level=warning
           LINT_EXIT_CODE=${PIPESTATUS[0]}
           set -o pipefail
-          # Use GITHUB_OUTPUT to pass variables to other steps
           if [ ${LINT_EXIT_CODE} -ne 0 ]; then echo "linter_issues_found=true" >> $GITHUB_OUTPUT; else echo "linter_issues_found=false" >> $GITHUB_OUTPUT; fi
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
-      - name: Run App Test via Test Runner
-        # THE FIX: This step needs an ID to reference its outputs later.
+      - name: "Run App Test: The Moment of Truth"
         id: app_test
         run: |
+          echo "Alright, moment of truth. Attempting to launch the app..."
           set +e
           timeout 30s xvfb-run python .github/scripts/run_test.py > app_output.txt 2>&1
           APP_EXIT_CODE=$?
@@ -92,25 +91,24 @@ jobs:
           echo "app_exit_code=${APP_EXIT_CODE}" >> $GITHUB_OUTPUT
           if [ ${APP_EXIT_CODE} -ne 0 ]; then
             {
-              echo "I tried to run the app, but it looks like it hit a snag during startup. This is usually caused by an import error or a bug in the initial code."
+              echo "Whoops! The app test failed. It looks like the program crashed on startup. This is usually due to a bug or an import error in the code."
               echo ""
               echo "Here's the technical log I captured:"
               echo '```'
               cat app_output.txt
               echo '```'
             } > failure_comment.txt
-            # Pass the filename as an output
             echo "failure_comment_file=failure_comment.txt" >> $GITHUB_OUTPUT
           fi
 
-      - name: Post Final Review
-        if: always()
+      - name: Post Final Verdict
+        id: final_verdict
+        if: steps.app_test.conclusion == 'success'
         run: |
-          # THE FIX: Reference step outputs using the steps context.
           if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
-            LINT_MESSAGE=""
+            LINT_MESSAGE="By the way, I also ran the linter and it passed with flying colors. "
             if [ "${{ steps.linting.outputs.linter_issues_found }}" == "true" ]; then
-              LINT_MESSAGE="I also ran the linter and left a review with some style suggestions. "
+              LINT_MESSAGE="By the way, I also ran the linter and left some suggestions as inline comments on the changed files. They're just advisory, but might be helpful! "
             fi
             MESSAGE="I've finished my review! ${LINT_MESSAGE}The most important thing is that the application test harness started up and shut down cleanly. Looking good! I'm approving this. ✅"
             gh pr review ${{ github.event.pull_request.number }} --approve --body "$MESSAGE"
@@ -118,3 +116,15 @@ jobs:
             gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
           fi
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+-
+      - name: Report Bot Failure
+        if: failure() && steps.final_verdict.conclusion != 'success'
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body "💥 **Bot Error!** 💥
+
+          Yikes! I encountered an unexpected internal error and couldn't finish my review. This is a problem with my own machinery, not your code. 
+
+          A human should check the [Action logs for this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) to see the full technical details."
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          GH_REPO: ${{ github.repository }}
