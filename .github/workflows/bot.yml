@@ -1,5 +1,5 @@
 # FILE: .github/workflows/bot.yml
-# This version uses a robust, single setup step to avoid template parsing errors.
+# FINAL WORKING VERSION: This uses a robust 'if' condition that handles both triggers correctly.
 
 name: PR Bot Commands
 
@@ -16,34 +16,31 @@ permissions:
 jobs:
   bot-handler:
     runs-on: ubuntu-latest
+    # --- THIS IS THE FINAL, CORRECTED 'if' CONDITION ---
+    # It safely handles both comment and review_requested events without errors.
     if: >
-      github.event_name == 'issue_comment' ||
-      github.event.requested_reviewer.login == 'PriestyBot'
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+      (github.event_name == 'pull_request' && github.event.requested_reviewer.login == 'PriestyBot')
 
     steps:
-      # --- THIS IS THE NEW, ROBUST SETUP STEP ---
       - name: 'Set up PR Context'
         id: pr_context
         run: |
           if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
-            # For comments, we must fetch the PR JSON to get the head SHA
-            gh pr view ${{ github.event.issue.number }} --json number,headRefOid > pr.json
+            gh pr view ${{ github.event.issue.number }} --json number,headRefOid -R ${{ github.repository }} > pr.json
             echo "pr_number=$(jq .number pr.json)" >> $GITHUB_OUTPUT
             echo "pr_sha=$(jq -r .headRefOid pr.json)" >> $GITHUB_OUTPUT
           else
-            # For pull_request events, the data is in the event payload
             echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
             echo "pr_sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
-      # All steps below now use the reliable output from the setup step
-      
       - name: 'Handle Command: /approve'
         if: startsWith(github.event.comment.body, '/approve')
         run: |
-          gh pr review ${{ steps.pr_context.outputs.pr_number }} --approve -b "✅ Approved based on the command from @${{ github.event.comment.user.login }}."
+          gh pr review ${{ steps.pr_context.outputs.pr_number }} --approve -b "✅ Approved based on the command from @${{ github.event.comment.user.login }}." -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
@@ -51,7 +48,7 @@ jobs:
         if: startsWith(github.event.comment.body, '/request-changes')
         run: |
           COMMENT_BODY=$(echo "${{ github.event.comment.body }}" | sed -n 's|/request-changes ||p')
-          gh pr review ${{ steps.pr_context.outputs.pr_number }} --request-changes -b "🚨 Changes Requested by @${{ github.event.comment.user.login }}: $COMMENT_BODY"
+          gh pr review ${{ steps.pr_context.outputs.pr_number }} --request-changes -b "🚨 Changes Requested by @${{ github.event.comment.user.login }}: $COMMENT_BODY" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
@@ -59,18 +56,16 @@ jobs:
         if: startsWith(github.event.comment.body, '/comment')
         run: |
           COMMENT_BODY=$(echo "${{ github.event.comment.body }}" | sed -n 's|/comment ||p')
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "💬 @${{ github.event.comment.user.login }} asked me to leave a comment: $COMMENT_BODY"
+          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "💬 @${{ github.event.comment.user.login }} asked me to leave a comment: $COMMENT_BODY" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-
-      # --- This is the full review logic ---
       
       - name: 'Start Review (for /review command or review_request event)'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
         run: |
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "Alright, I'll take a look at this PR now. I'll check the code style and see if the app runs. Back in a moment! ☕"
+          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "Alright, I'll take a look at this PR now. I'll check the code style and see if the app runs. Back in a moment! ☕" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
           
@@ -134,6 +129,6 @@ jobs:
           else
             FINAL_COMMENT+="**Summary:**\nPlease take a look at the points above. Once those are addressed, it should be in good shape. Let me know if you have any questions!"
           fi
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} --body "$FINAL_COMMENT"
+          gh pr comment ${{ steps.pr_context.outputs.pr_number }} --body "$FINAL_COMMENT" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
