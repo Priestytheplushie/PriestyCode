@@ -32,20 +32,30 @@ jobs:
           
           Here are the commands you can use by writing a new comment:
 
-          *   **`/approve [message]`**
-              > Approves the pull request with an optional message. You can also say things like \`@PriestyBot approve this\`.
-
-          *   **`/request-changes <message>`**
-              > Submits a review requesting changes, using your message as the reason. *This is a required field.*
-
-          *   **`/comment <message>`**
-              > Leaves a regular comment on the pull request without changing the review status. *This is a required field.*
+          <details>
+          <summary><code>/approve [message]</code></summary>
+          Approves the pull request with an optional message. You can also say things like \`@PriestyBot approve this\`.
+          </details>
           
-          *   **Requesting a Review**
-              > To run the full suite of checks (linters + app launch test), please use the formal **'Request a review'** feature in the GitHub sidebar and select me. Commenting \`/review\` or \`/dismiss\` will also remind you how to do this.
+          <details>
+          <summary><code>/request-changes <message></code></summary>
+          Submits a review requesting changes, using your message as the reason. *This is a required field.*
+          </details>
+          
+          <details>
+          <summary><code>/comment <message></code></summary>
+          Leaves a regular comment on the pull request without changing the review status. *This is a required field.*
+          </details>
+          
+          <details>
+          <summary><code>/review</code> or <code>/dismiss</code></summary>
+          This tells me you'd like a new review. To run the full suite of checks (linters + app launch test), please use the formal **'Request a review'** feature in the GitHub sidebar and select me.
+          </details>
 
-          *   **`/help`**
-              > Shows this help message. You can also just mention me and ask for help!
+          <details>
+          <summary><code>/help</code></summary>
+          Shows this help message. You can also just mention me and ask for help!
+          </details>
           "
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
@@ -63,7 +73,6 @@ jobs:
           gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
-      # --- These commands were missing from the help message, but their logic is here ---
       - name: Handle /request-changes
         if: startsWith(env.COMMENT_BODY, '/request-changes')
         run: |
