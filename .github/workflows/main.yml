@@ -11,7 +11,6 @@ permissions:
   pull-requests: write
   contents: write
   checks: write
-  labels: write # This is the correct place for permissions
 
 jobs:
   # JOB 1: Handles all comment-based interactions.

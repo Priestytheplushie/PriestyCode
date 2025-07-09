@@ -13,12 +13,11 @@ jobs:
       pull-requests: write
       contents: read
       checks: write
-      labels: write
 
     steps:
       - name: Acknowledge In-Depth Review
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body "Okay, I see you've requested an in-depth look. I'm running the strict code quality checks now (`black`, `isort`, `flake8`). I'll be back with a full report. 🕵️‍♂️"
+          gh pr comment ${{ github.event.pull_request.number }} --body "Okay, I see you've requested an in-depth look. I'm running the strict code quality checks now (\`black\`, \`isort\`, \`flake8\`). I'll be back with a full report. 🕵️‍♂️"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
 
       - name: Checkout PR Code
