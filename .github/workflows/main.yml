@@ -1,0 +1,192 @@
+# .github/workflows/main.yml
+
+name: CI/CD Pipeline and Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - develop # Your develop branch for regular CI runs
+  pull_request:
+    branches:
+      - main
+      - develop # PRs targeting main or develop will run CI
+
+  # This specific trigger is for deploying to Production
+  # A 'release' event is typically created when you publish a new release tag on GitHub
+  release:
+    types: [published]
+
+jobs:
+  # --- 1. CORE CI JOBS ---
+  # These jobs run on every push and pull request to 'main' or 'develop'
+  # They must pass for subsequent jobs (like deployment) to proceed.
+
+  build_and_startup:
+    name: Build & Startup Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Specify your Python version, e.g., '3.10', '3.11', '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run startup test (your main.py check)
+        # Ensure this command actually tests if your IDE can start successfully
+        run: timeout 10s python main.py # Adjust this command as needed for actual startup test
+
+  lint:
+    name: Lint Code (Non-Strict)
+    runs-on: ubuntu-latest
+    # This job can run in parallel with build_and_startup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Match your main Python version
+
+      - name: Install linters
+        run: pip install flake8 ruff # Or any other linters you use
+
+      - name: Run linting
+        # Using '|| true' makes the step non-blocking, allowing the workflow to continue even if linting fails.
+        run: flake8 . || true && ruff . || true
+
+  codeql_analysis:
+    name: CodeQL Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    # This job can also run in parallel with build_and_startup and lint
+    # It doesn't need to be in 'needs' for deployment if it's not a strict blocker.
+    # If you want it to block deployment, add 'codeql_analysis' to the 'needs' of build_windows_exe/deploy_to_production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+          build-mode: 'none' # For Python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+
+  # --- 2. BUILD ARTIFACT JOB ---
+  # This job depends on the core CI check passing
+  build_windows_exe:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    needs: [build_and_startup] # Only runs if build_and_startup passes
+
+    # Only run this build when we are preparing for a release (push to main/develop, or a release event)
+    # This prevents building an EXE on every PR if not needed for the PR itself.
+    if: github.event_name == 'push' || github.event_name == 'release'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # Use a stable Python version, e.g., '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        # IMPORTANT: Replace 'your_main_script.py' with the actual entry point of your IDE
+        run: pyinstaller --onefile --windowed your_main_script.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PriestyCode-Windows-Exe
+          path: dist/your_main_script.exe # PyInstaller puts executables in 'dist' folder
+
+
+  # --- 3. DEPLOYMENT JOB ---
+  # This job depends on the build_windows_exe job completing successfully
+  deploy_to_production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest # You can change this to windows-latest if your upload script requires a Windows environment
+    # This is crucial: This job will only run IF build_windows_exe (which itself needs build_and_startup) succeeds.
+    needs: [build_windows_exe]
+    environment:
+      name: Production # This MUST match the name you created in GitHub Settings -> Environments
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }} # Link to the GitHub Release after deployment
+
+    # This job will ONLY trigger when a GitHub Release is published
+    if: github.event_name == 'release' && github.event.action == 'published'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Download the EXE artifact from the previous job
+      - name: Download Windows EXE artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PriestyCode-Windows-Exe
+          path: ./dist # Downloads to ./dist directory in this job
+
+      # 1. Create the initial 'pending' deployment status
+      - name: Create Deployment Record
+        id: deployment_record # Give this step an ID to reference its outputs
+        uses: actions/create-deployment@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: Production
+          description: Deploying release to production
+          ref: ${{ github.ref }} # The branch/tag being deployed
+
+      # 2. Your actual production deployment logic goes here.
+      # For GitHub Releases, this involves uploading the compiled EXE as an asset.
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }} # This URL is provided by the 'release' event
+          asset_path: ./dist/your_main_script.exe # Path to your compiled EXE artifact
+          asset_name: PriestyCode-${{ github.event.release.tag_name }}.exe # Name for the asset in the release
+          asset_content_type: application/vnd.microsoft.portable-executable # MIME type for EXE
+
+      # 3. Update the deployment status based on the success or failure of the deployment logic
+      - name: Update Deployment Status (Success)
+        if: success() # Only run if previous steps were successful
+        uses: actions/deployment-status@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment_record.outputs.deployment_id }}
+          state: success
+          environment: Production
+          environment_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }} # Link to the GitHub Release
+
+      - name: Update Deployment Status (Failure)
+        if: failure() # Only run if previous steps failed
+        uses: actions/deployment-status@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment_record.outputs.deployment_id }}
+          state: failure
+          environment: Production
