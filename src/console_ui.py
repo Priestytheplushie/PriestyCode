@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 import os
 
+
 class ConsoleUi(ttk.Frame):
     def __init__(self, parent, jump_callback):
         super().__init__(parent)
@@ -14,7 +15,9 @@ class ConsoleUi(ttk.Frame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(self, columns=("Description", "File", "Location"), show="headings")
+        self.tree = ttk.Treeview(
+            self, columns=("Description", "File", "Location"), show="headings"
+        )
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         self.tree.heading("Description", text="Description")
@@ -29,7 +32,7 @@ class ConsoleUi(ttk.Frame):
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Motion>", self._on_hover)
         self.tree.bind("<Leave>", self._on_leave)
@@ -41,25 +44,34 @@ class ConsoleUi(ttk.Frame):
             self._show_tooltip(event, details)
         else:
             self._hide_tooltip()
-            
+
     def _on_leave(self, event):
         self._hide_tooltip()
 
     def _show_tooltip(self, event, text):
         if self.tooltip_window:
             self.tooltip_window.destroy()
-        
+
         x = self.winfo_pointerx() + 20
         y = self.winfo_pointery() + 10
 
         self.tooltip_window = tk.Toplevel(self)
         self.tooltip_window.wm_overrideredirect(True)
         self.tooltip_window.wm_geometry(f"+{x}+{y}")
-        
-        label = tk.Label(self.tooltip_window, text=text, justify='left',
-                         background="#3C3C3C", foreground="white", relief='solid',
-                         borderwidth=1, wraplength=500, font=("Consolas", 9),
-                         padx=4, pady=4)
+
+        label = tk.Label(
+            self.tooltip_window,
+            text=text,
+            justify="left",
+            background="#3C3C3C",
+            foreground="white",
+            relief="solid",
+            borderwidth=1,
+            wraplength=500,
+            font=("Consolas", 9),
+            padx=4,
+            pady=4,
+        )
         label.pack(ipadx=1)
 
     def _hide_tooltip(self):
@@ -81,8 +93,7 @@ class ConsoleUi(ttk.Frame):
         if proactive_only:
             self.clear(proactive_only=True)
         elif runtime_only:
-             self.clear(runtime_only=True)
-
+            self.clear(runtime_only=True)
 
         for error in errors_list:
             file_path = error.get("file_path", "N/A")
@@ -90,26 +101,42 @@ class ConsoleUi(ttk.Frame):
             line = error.get("line", 1)
             col = error.get("col", 1)
             location_str = f"{line}:{col}"
-            
-            item_id = self.tree.insert("", "end", values=(error["title"], file_name, location_str))
-            
+
+            item_id = self.tree.insert(
+                "", "end", values=(error["title"], file_name, location_str)
+            )
+
             error_type = "proactive" if proactive_only else "runtime"
-            self.error_map[item_id] = { "type": error_type, **error }
+            self.error_map[item_id] = {"type": error_type, **error}
 
     def display_error(self, title, details):
         """Legacy method to display a single, non-structured error."""
-        error_item = {"title": title, "details": details, "file_path": "N/A", "line": 1, "col": 1}
-        self.clear() 
+        error_item = {
+            "title": title,
+            "details": details,
+            "file_path": "N/A",
+            "line": 1,
+            "col": 1,
+        }
+        self.clear()
         self.display_errors([error_item])
 
     def clear(self, proactive_only=False, runtime_only=False):
         """Clears errors. Can selectively clear proactive or runtime errors."""
         items_to_delete = []
         if proactive_only:
-            items_to_delete = [item_id for item_id, details in self.error_map.items() if details.get("type") == "proactive"]
+            items_to_delete = [
+                item_id
+                for item_id, details in self.error_map.items()
+                if details.get("type") == "proactive"
+            ]
         elif runtime_only:
-            items_to_delete = [item_id for item_id, details in self.error_map.items() if details.get("type") == "runtime"]
-        else: # Clear all
+            items_to_delete = [
+                item_id
+                for item_id, details in self.error_map.items()
+                if details.get("type") == "runtime"
+            ]
+        else:  # Clear all
             items_to_delete = list(self.error_map.keys())
 
         for item_id in items_to_delete:
