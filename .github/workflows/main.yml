@@ -1,0 +1,125 @@
+# .github/workflows/bot.yml
+name: PriestyBot PR Manager
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [review_requested]
+
+permissions:
+  pull-requests: write
+  contents: write
+  checks: write
+  labels: write # This is the correct place for permissions
+
+jobs:
+  # JOB 1: Handles all comment-based interactions.
+  command-handler:
+    name: Handle Comment Commands
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Comment Body
+        run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
+
+      # --- This step now triggers the strict review by applying a label ---
+      - name: Handle In-Depth Review Request
+        if: |
+          startsWith(env.COMMENT_BODY, '/review-strict') ||
+          (contains(env.COMMENT_BODY, '@PriestyBot') && (contains(env.COMMENT_BODY, 'in-depth') || contains(env.COMMENT_BODY, 'in depth') || contains(env.COMMENT_BODY, 'deep dive')))
+        run: |
+          gh pr edit ${{ github.event.issue.number }} --add-label "bot: in-depth review"
+          gh pr comment ${{ github.event.issue.number }} --body "On it! I've scheduled an in-depth review. A separate check will appear shortly to handle it."
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      # --- This job handles the auto-formatting command ---
+      - name: Handle /format
+        if: startsWith(env.COMMENT_BODY, '/format')
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.APPROVER_TOKEN }}
+          ref: ${{ github.event.issue.pull_request.head.ref }}
+      - name: Setup Formatters
+        if: startsWith(env.COMMENT_BODY, '/format')
+        run: pip install black isort
+      - name: Run Formatters to Fix Code
+        if: startsWith(env.COMMENT_BODY, '/format')
+        run: |
+          isort .
+          black .
+      - name: Commit and Push Changes
+        if: startsWith(env.COMMENT_BODY, '/format')
+        run: |
+          git config --global user.name 'PriestyBot'
+          git config --global user.email 'priestybot@users.noreply.github.com'
+          git add .
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "style: auto-format code with black and isort"
+            git push
+            gh pr comment ${{ github.event.issue.number }} --body "Done! I've formatted the code and pushed the changes. ✨"
+          else
+            gh pr comment ${{ github.event.issue.number }} --body "Looks like the code was already perfectly formatted! Nothing for me to do."
+          fi
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+      
+      # ... [Your existing /help and /approve handlers] ...
+      - name: Handle /help
+        if: |
+          startsWith(env.COMMENT_BODY, '/help') ||
+          (contains(env.COMMENT_BODY, '@PriestyBot') && contains(env.COMMENT_BODY, 'help'))
+        run: |
+          gh pr comment ${{ github.event.issue.number }} --body "
+          ### PriestyBot Help
+
+          * `/approve`: Approves the PR.
+          * `@PriestyBot in-depth look`: Runs a strict, advisory code quality check. This is not required to merge.
+          * `/format`: If a strict review fails, I will auto-format the code for you.
+          * **Standard Review**: For the main app launch test, use the 'Request a review' feature in the GitHub sidebar and select me.
+          "
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+      - name: Handle /approve
+        if: (startsWith(env.COMMENT_BODY, '/approve') || contains(env.COMMENT_BODY, '@PriestyBot approve')) && !contains(env.COMMENT_BODY, 'help')
+        run: |
+          RAW_COMMENT="${{ env.COMMENT_BODY }}"
+          if [[ "$RAW_COMMENT" == /approve* ]]; then BODY="${RAW_COMMENT#*/approve}"; else BODY="You got it! I've approved this pull request. 👍"; fi
+          gh pr review ${{ github.event.issue.number }} --approve --body "$BODY"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+
+
+  # JOB 2: The standard "full review" job remains for formal review requests.
+  full-review:
+    name: Run Standard Review (Launch Test)
+    if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
+    runs-on: ubuntu-latest
+    steps:
+      # ... [The full-review job from the previous response remains here, unchanged] ...
+      - name: "Acknowledge Request"
+        run: >
+          gh pr comment ${{ github.event.pull_request.number }} --body "Thanks for the ping! I'm running the standard checks now: the app launch test. I'll be back shortly! 🧐"
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+      - name: Checkout PR Code
+        uses: actions/checkout@v4
+      - name: Setup Environment
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+          pip install -r requirements.txt flake8
+      - name: "Run App Launch Test"
+        id: app_test
+        run: |
+          set +e
+          timeout 10s xvfb-run python -m src.main > app_output.txt 2>&1
+          APP_EXIT_CODE=$?
+          set -e
+          if [ $APP_EXIT_CODE -eq 124 ]; then echo "app_exit_code=0" >> $GITHUB_OUTPUT; else echo "app_exit_code=$APP_EXIT_CODE" >> $GITHUB_OUTPUT; fi
+          if [ $APP_EXIT_CODE -ne 124 ]; then { echo "Whoops! App launch test failed."; cat app_output.txt; } > failure_comment.txt; echo "failure_comment_file=failure_comment.txt" >> $GITHUB_OUTPUT; fi
+      - name: Post Final Verdict
+        if: steps.app_test.conclusion == 'success'
+        run: |
+          if [ "${{ steps.app_test.outputs.app_exit_code }}" == "0" ]; then
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "Standard review passed! The application launched without crashing. Looking good! ✅"
+          else
+            gh pr review ${{ github.event.pull_request.number }} --request-changes --body-file ${{ steps.app_test.outputs.failure_comment_file }}
+          fi
+        env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
