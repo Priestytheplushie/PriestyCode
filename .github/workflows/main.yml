@@ -20,7 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Get Comment Body
-        run: echo "COMMENT_BODY=${{ github.event.comment.body }}" >> $GITHUB_ENV
+        run: |
+          echo "COMMENT_BODY<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.comment.body }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
       - name: Handle In-Depth Review Request
         if: |
           startsWith(env.COMMENT_BODY, '/review-strict') ||
@@ -29,6 +33,8 @@ jobs:
           gh pr edit ${{ github.event.issue.number }} --add-label "bot: in-depth review"
           gh pr comment ${{ github.event.issue.number }} --body "Alright, kicking off the in-depth review for you. I'll start a new check to run the linters and report back there. One moment! 🕵️‍♂️"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
+      
+      # ... (The rest of the file is the same as the previous version) ...
       - name: Handle /format
         if: startsWith(env.COMMENT_BODY, '/format')
         uses: actions/checkout@v4
@@ -116,6 +122,7 @@ jobs:
   # JOB 2: The standard "full review" job
   full-review:
     name: Run Standard Review (Launch Test)
+    # ... This job is unchanged and correct ...
     if: github.event_name == 'pull_request' && github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
@@ -123,18 +130,14 @@ jobs:
         run: >
           gh pr comment ${{ github.event.pull_request.number }} --body "Got the review request! I'm running the standard check now. This includes a quick lint with \`flake8\` and a test to make sure the app launches. I'll report back when I'm done! 🧐"
         env: { GH_TOKEN: "${{ secrets.APPROVER_TOKEN }}", GH_REPO: "${{ github.repository }}" }
-      
       - name: Checkout PR Code
         uses: actions/checkout@v4
-
       - name: Setup Environment
         run: |
           sudo apt-get update && sudo apt-get install -y python3-tk xvfb
           pip install -r requirements.txt flake8
-          
       - name: Setup Reviewdog
         uses: reviewdog/action-setup@v1
-
       - name: Run Flake8 and Check for Issues
         id: run_flake8
         continue-on-error: true
@@ -147,7 +150,6 @@ jobs:
           fi
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: "Run App Launch Test"
         id: app_test
         run: |
@@ -168,7 +170,6 @@ jobs:
             echo "$FAILURE_BODY" > failure_comment.txt
             echo "failure_comment_file=failure_comment.txt" >> $GITHUB_OUTPUT
           fi
-          
       - name: Post Final Verdict
         if: always()
         run: |
