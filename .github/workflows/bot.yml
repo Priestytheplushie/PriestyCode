@@ -1,4 +1,4 @@
-# .github/workflows/bot.yml
+# FILE: .github/workflows/bot.yml
 
 name: PR Bot Commands
 
@@ -15,11 +15,9 @@ permissions:
 jobs:
   bot-handler:
     runs-on: ubuntu-latest
-    # IMPORTANT: Change 'approver-bot' to your bot's actual GitHub username.
-    # This corrected 'if' condition is more robust and reliable.
     if: >
       github.event_name == 'issue_comment' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
+      github.event.requested_reviewer.login == 'PriestyBot'
 
     steps:
       - name: 'Get PR Metadata'
@@ -32,8 +30,7 @@ jobs:
             echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
             echo "pr_sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
           fi
-        # This step is needed to get the SHA for comment-triggered reviews
-      - name: 'Get PR JSON'
+      - name: 'Get PR JSON for Comment Trigger'
         if: github.event_name == 'issue_comment'
         id: get_pr_json
         run: |
@@ -41,7 +38,7 @@ jobs:
           echo "result=$(cat pr.json)" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+
       - name: 'Handle Command: /approve'
         if: startsWith(github.event.comment.body, '/approve')
         run: |
@@ -65,7 +62,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 
-      - name: 'Handle Command: /review or Review Request'
+      # --- This is the full review logic, triggered by /review or a direct request ---
+      
+      - name: 'Start Review (for /review command or review_request event)'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
@@ -82,7 +81,7 @@ jobs:
         with:
           ref: ${{ steps.get_pr.outputs.pr_sha }}
 
-      - name: 'Automated Review: Setup Python and Dependencies'
+      - name: 'Automated Review: Setup and Install'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
@@ -91,14 +90,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install flake8
           
-      - name: 'Automated Review: Run Linter (flake8)'
+      - name: 'Automated Review: Run Linter'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
         run: |
           flake8 src/main.py > linting-results.txt || true
           
-      - name: 'Automated Review: Attempt to run Tkinter app'
+      - name: 'Automated Review: Run App Test'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
@@ -110,11 +109,12 @@ jobs:
             echo "failure" > app-run-status.txt
           fi
 
-      - name: 'Automated Review: Post Human-Like Results'
+      - name: 'Automated Review: Post Results'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
         run: |
+          # (Script to build and post the final comment remains the same)
           FINAL_COMMENT="Okay, I've finished my review. Here are my thoughts:\n\n"
           if [ -s linting-results.txt ]; then
             LINTING_RESULTS=$(cat linting-results.txt)
