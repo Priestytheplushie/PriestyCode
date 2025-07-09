@@ -32,14 +32,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x' # Specify your Python version, e.g., '3.10', '3.11', '3.12'
+          python-version: '3.13.5' # Specify your Python version, e.g., '3.10', '3.11', '3.12'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run startup test (your main.py check)
-        # Ensure this command actually tests if your IDE can start successfully
-        run: timeout 10s python main.py # Adjust this command as needed for actual startup test
+        # CORRECTED PATH: main.py is in the 'src' directory
+        run: timeout 10s python src/main.py # <-- Path updated here
 
   lint:
     name: Lint Code (Non-Strict)
@@ -52,7 +52,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x' # Match your main Python version
+          python-version: '3.13.5' # Match your main Python version
 
       - name: Install linters
         run: pip install flake8 ruff # Or any other linters you use
@@ -105,7 +105,7 @@ jobs:
       - name: Set up Python 3.x
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x' # Use a stable Python version, e.g., '3.11'
+          python-version: '3.13.5' # Use a stable Python version, e.g., '3.11'
           cache: 'pip'
 
       - name: Install dependencies and PyInstaller
@@ -175,18 +175,3 @@ jobs:
       - name: Update Deployment Status (Success)
         if: success() # Only run if previous steps were successful
         uses: actions/deployment-status@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          deployment_id: ${{ steps.deployment_record.outputs.deployment_id }}
-          state: success
-          environment: Production
-          environment_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }} # Link to the GitHub Release
-
-      - name: Update Deployment Status (Failure)
-        if: failure() # Only run if previous steps failed
-        uses: actions/deployment-status@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          deployment_id: ${{ steps.deployment_record.outputs.deployment_id }}
-          state: failure
-          environment: Production
