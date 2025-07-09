@@ -1,5 +1,5 @@
 # FILE: .github/workflows/bot.yml
-# FINAL WORKING VERSION: This uses a robust 'if' condition that handles both triggers correctly.
+# FINAL REBUILD: This version uses the simpler, more robust command pattern you suggested.
 
 name: PR Bot Commands
 
@@ -16,8 +16,6 @@ permissions:
 jobs:
   bot-handler:
     runs-on: ubuntu-latest
-    # --- THIS IS THE FINAL, CORRECTED 'if' CONDITION ---
-    # It safely handles both comment and review_requested events without errors.
     if: >
       (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
       (github.event_name == 'pull_request' && github.event.requested_reviewer.login == 'PriestyBot')
@@ -37,38 +35,59 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
+      # --- COMMANDS REBUILT USING YOUR SUGGESTED, SIMPLER PATTERN ---
+
       - name: 'Handle Command: /approve'
         if: startsWith(github.event.comment.body, '/approve')
-        run: |
-          gh pr review ${{ steps.pr_context.outputs.pr_number }} --approve -b "✅ Approved based on the command from @${{ github.event.comment.user.login }}." -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          MESSAGE: "✅ Approved based on the command from @${{ github.event.comment.user.login }}."
+        run: |
+          gh pr review $PR_NUMBER --approve --body "$MESSAGE" -R $REPO
           
       - name: 'Handle Command: /request-changes'
         if: startsWith(github.event.comment.body, '/request-changes')
-        run: |
-          COMMENT_BODY=$(echo "${{ github.event.comment.body }}" | sed -n 's|/request-changes ||p')
-          gh pr review ${{ steps.pr_context.outputs.pr_number }} --request-changes -b "🚨 Changes Requested by @${{ github.event.comment.user.login }}: $COMMENT_BODY" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          COMMENT_BODY: "${{ github.event.comment.body }}"
+          USER_LOGIN: ${{ github.event.comment.user.login }}
+        run: |
+          # Use 'cut' to safely get all text after the command
+          CHANGES_TEXT=$(echo "$COMMENT_BODY" | cut -c 18-)
+          MESSAGE="🚨 Changes Requested by @$USER_LOGIN: $CHANGES_TEXT"
+          gh pr review $PR_NUMBER --request-changes --body "$MESSAGE" -R $REPO
           
       - name: 'Handle Command: /comment'
         if: startsWith(github.event.comment.body, '/comment')
-        run: |
-          COMMENT_BODY=$(echo "${{ github.event.comment.body }}" | sed -n 's|/comment ||p')
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "💬 @${{ github.event.comment.user.login }} asked me to leave a comment: $COMMENT_BODY" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          COMMENT_BODY: "${{ github.event.comment.body }}"
+          USER_LOGIN: ${{ github.event.comment.user.login }}
+        run: |
+          # Use 'cut' to safely get all text after the command
+          COMMENT_TEXT=$(echo "$COMMENT_BODY" | cut -c 9-)
+          MESSAGE="💬 @$USER_LOGIN asked me to leave a comment: $COMMENT_TEXT"
+          gh pr comment $PR_NUMBER --body "$MESSAGE" -R $REPO
       
       - name: 'Start Review (for /review command or review_request event)'
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
-        run: |
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} -b "Alright, I'll take a look at this PR now. I'll check the code style and see if the app runs. Back in a moment! ☕" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment $PR_NUMBER -b "Alright, I'll take a look at this PR now. I'll check the code style and see if the app runs. Back in a moment! ☕" -R $REPO
           
+      # --- AUTOMATED REVIEW STEPS (Remain the same, as they are necessary for the review) ---
+
       - name: 'Automated Review: Checkout Code'
         if: >
           startsWith(github.event.comment.body, '/review') ||
@@ -78,6 +97,7 @@ jobs:
           ref: ${{ steps.pr_context.outputs.pr_sha }}
 
       - name: 'Automated Review: Setup and Install'
+        # ... (This and subsequent review steps are unchanged)
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
@@ -109,6 +129,10 @@ jobs:
         if: >
           startsWith(github.event.comment.body, '/review') ||
           github.event.action == 'review_requested'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          REPO: ${{ github.repository }}
         run: |
           FINAL_COMMENT="Okay, I've finished my review. Here are my thoughts:\n\n"
           if [ -s linting-results.txt ]; then
@@ -129,6 +153,4 @@ jobs:
           else
             FINAL_COMMENT+="**Summary:**\nPlease take a look at the points above. Once those are addressed, it should be in good shape. Let me know if you have any questions!"
           fi
-          gh pr comment ${{ steps.pr_context.outputs.pr_number }} --body "$FINAL_COMMENT" -R ${{ github.repository }}
-        env:
-          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          gh pr comment $PR_NUMBER --body "$FINAL_COMMENT" -R $REPO
