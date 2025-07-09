@@ -1,122 +1,103 @@
-name: PriestyBot Auto-Review
+name: PriestyBot Commands
 
 on:
-  pull_request:
-    types: [review_requested]
-
-env:
-  APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-  # We can remove the reviewdog token from here as we'll pass it directly.
+  issue_comment:
+    types: [created]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
-  review:
-    if: github.event.requested_reviewer.login == 'PriestyBot'
+  command-handler:
+    # Only run for comments on PRs and only if the commenter is the PR author
+    if: github.event.issue.pull_request && github.event.comment.user.login == github.event.issue.user.login
     runs-on: ubuntu-latest
     steps:
-      - name: 💬 Acknowledging the review request...
-        # ... this step is correct ...
+      # Step 1: Generate a temporary token for the bot's identity
+      - name: Generate Bot Token
+        id: get_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.PRIESTYBOT_APP_ID }}
+          private_key: ${{ secrets.PRIESTYBOT_PRIVATE_KEY }}
+
+      # --- Handler for /approve, /comment, /request-changes, /help ---
+      # This step handles all simple commands that just post a message.
+      - name: Handle Simple Commands
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          github-token: ${{ steps.get_token.outputs.token }}
           script: |
-            # Your script here
+            const comment_body = context.payload.comment.body;
+            const issue_number = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-      - name: Check out repository
+            // --- /approve ---
+            if (comment_body.startsWith('/approve') || (comment_body.includes('@PriestyBot') && comment_body.includes('approve'))) {
+              const message = comment_body.replace(/^\/approve\s*|@PriestyBot\s*approve\s*/i, '').trim();
+              const review_body = message || "Approved as requested. Looks good to me! ✅";
+              await github.rest.pulls.createReview({ owner, repo, pull_number: issue_number, event: 'APPROVE', body: review_body });
+              return; // Exit script after handling
+            }
+
+            // --- /comment ---
+            if (comment_body.startsWith('/comment')) {
+              const message = comment_body.replace('/comment', '').trim();
+              if (message) {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body: `A quick note from @${context.payload.sender.login}:\n\n> ${message}` });
+              } else {
+                core.setFailed("Command failed: /comment requires a message.");
+              }
+              return;
+            }
+
+            // --- /request-changes ---
+            if (comment_body.startsWith('/request-changes')) {
+              const message = comment_body.replace('/request-changes', '').trim();
+              if (message) {
+                await github.rest.pulls.createReview({ owner, repo, pull_number: issue_number, event: 'REQUEST_CHANGES', body: message });
+              } else {
+                core.setFailed("Command failed: /request-changes requires a message.");
+              }
+              return;
+            }
+
+            // --- /help ---
+            if (comment_body.startsWith('/help') || (comment_body.includes('@PriestyBot') && comment_body.includes('help'))) {
+              const help_message = "Hello! I'm PriestyBot, your friendly neighborhood code reviewer. Here's what I can do for you... (full help text)"; // Abridged for clarity
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: help_message });
+              return;
+            }
+
+      # --- Handler for /format ---
+      - name: Handle /format
+        if: startsWith(github.event.comment.body, '/format') || (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format'))
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          # Check out the PR's branch directly
+          ref: ${{ github.event.issue.pull_request.url }}
+          # Authenticate with the bot's token which has push permission
+          token: ${{ steps.get_token.outputs.token }}
 
-      - name: Set up Python
+      - name: Setup Python for Format
+        if: steps.checkout.outcome == 'success'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install and run black
+        if: steps.checkout.outcome == 'success'
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install black
+          black src
 
-      # --- LINTER CONFIGURATION WITH CORRECT TOKEN ---
-      - name: 💧 Run Linter (flake8) on Changed Files
-        id: lint
-        uses: reviewdog/action-flake8@v3
-        continue-on-error: true
+      - name: Commit and Push Changes
+        if: steps.checkout.outcome == 'success'
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          github_token: ${{ env.APPROVER_TOKEN }} # <-- THIS IS THE FIX
-          filter_mode: "diff_context"
-          reporter: github-pr-review
-          fail_on_error: true
-
-      - name: 💅 Run Format Check (black) on Changed Files
-        id: format_check
-        uses: reviewdog/action-black@v3
-        continue-on-error: true
-        with:
-          github_token: ${{ env.APPROVER_TOKEN }} # <-- THIS IS THE FIX
-          filter_mode: "diff_context"
-          reporter: github-pr-review
-          fail_on_error: true
-          black_args: "--check --diff src"
-      
-      # --- CORRECTED APPLICATION TEST ---
-      - name: 🧪 Run Tkinter App Test
-        id: app_test
-        # ... this step is correct ...
-        run: |
-          # Your script here
-          
-      # --- ACCURATE FINAL SUMMARY ---
-      - name: 📝 Post Final Review Summary
-        if: ${{ always() }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.APPROVER_TOKEN }}
-          script: |
-            # THIS SCRIPT WILL NOW WORK CORRECTLY
-            # It can find the review posted by 'PriestyBot' and update it.
-            const lint_conclusion = '${{ steps.lint.conclusion }}';
-            const format_conclusion = '${{ steps.format_check.conclusion }}';
-            const test_conclusion = '${{ steps.app_test.conclusion }}';
-            const pr_author = context.payload.pull_request.user.login;
-            
-            let review_body = `Hi @${pr_author}, I've finished my review!\n\nHere's the summary:\n\n`;
-            let event = 'APPROVE';
-            
-            if (lint_conclusion === 'failure' || format_conclusion === 'failure') {
-              review_body += '❌ **Code Quality & Style:** I found some issues. Please check my in-line comments for details.\n';
-              event = 'REQUEST_CHANGES';
-            } else {
-              review_body += '✅ **Code Quality & Style:** Passed. Great job!\n';
-            }
-            
-            if (test_conclusion === 'success') {
-              review_body += '✅ **Application Test:** Passed. The app launched successfully!\n';
-            } else {
-              review_body += '❌ **Application Test:** Failed. The app seems to crash on startup. Check the workflow logs for errors.\n';
-              event = 'REQUEST_CHANGES';
-            }
-            
-            const { data: reviews } = await github.rest.pulls.listReviews({
-              owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number,
-            });
-
-            // Find the review posted by our bot
-            const bot_review = reviews.find(r => r.user.login === 'PriestyBot' && r.state !== 'COMMENTED');
-
-            if (bot_review) {
-              await github.rest.pulls.updateReview({
-                owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, review_id: bot_review.id, body: review_body
-              });
-            } else {
-              if (event === 'APPROVE') {
-                review_body += `\nEverything looks good to me. I'm approving this PR. Keep up the great work! 👍`;
-              }
-              await github.rest.pulls.createReview({
-                owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, event: event, body: review_body
-              });
-            }
+          commit_message: "chore(bot): Format code with black"
+          # This uses the official bot format for the author
+          commit_user_name: "PriestyBot [bot]"
+          commit_user_email: "${{ secrets.PRIESTYBOT_APP_ID }}+PriestyBot[bot]@users.noreply.github.com"

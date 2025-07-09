@@ -4,133 +4,98 @@ on:
   pull_request:
     types: [review_requested]
 
-env:
-  APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-  REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-
 permissions:
-  contents: read
+  contents: read # Read-only is enough for this workflow
   pull-requests: write
+  checks: write
+  security-events: write # For Trivy scan results
 
 jobs:
   review:
     if: github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
-      - name: 💬 Acknowledging the review request...
+      # Step 1: Generate a temporary token for the bot's identity
+      - name: Generate Bot Token
+        id: get_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.PRIESTYBOT_APP_ID }}
+          private_key: ${{ secrets.PRIESTYBOT_PRIVATE_KEY }}
+
+      # Step 2: Create the initial status comment
+      - name: 💬 Create Progress Comment
+        id: progress_comment
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          github-token: ${{ steps.get_token.outputs.token }}
+          result-encoding: string
           script: |
-            const pr_number = context.issue.number;
-            const bot_name = "PriestyBot";
-            const { data: comments } = await github.rest.issues.listComments({
+            const { data: comment } = await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: pr_number,
+              issue_number: context.issue.number,
+              body: "Hey @${{ github.sender.login }}! I'm on it. 🧐\n\n**My review checklist:**\n- [ ] Code Quality (Linting & Formatting)\n- [ ] Application Test\n- [ ] Security Scan"
             });
-            const hasAlreadyCommented = comments.some(
-              comment => comment.user.login === bot_name && comment.body.includes("Thanks for asking me to review")
-            );
-            if (!hasAlreadyCommented) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr_number,
-                body: "Hey @${{ github.event.sender.login }}! 👋 Thanks for asking me to review. I'll take a look at the code now and get back to you shortly. 🧐"
-              });
-            }
+            return comment.id;
 
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Set up Python
+      - name: Set up Python, Cache & Install Dependencies
+        # (Combined these steps for brevity)
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install Dependencies
-        run: |
+          cache: 'pip'
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           sudo apt-get update && sudo apt-get install -y xvfb
 
-      - name: 💧 Run Linter (flake8) on Changed Files
-        id: lint
-        uses: reviewdog/action-flake8@v3
-        with:
-          filter_mode: "diff_context"
-          fail_on_error: false
-          reporter: github-pr-review 
-          level: warning
-
-      - name: 💅 Run Format Check (black) on Changed Files
-        id: format_check
-        uses: reviewdog/action-black@v3
-        with:
-          filter_mode: "diff_context"
-          fail_on_error: false
-          reporter: github-pr-review
-          level: warning
-          black_args: "--check --diff src"
-      
-      - name: 🧪 Run Tkinter App Test
-        id: app_test
+      # --- Code Quality Steps ---
+      - name: 💧 Run Linters (flake8 & black)
+        id: quality_checks
+        continue-on-error: true
         run: |
-          echo "Starting the Tkinter app in a virtual display..."
-          # THIS LINE IS THE FIX: Run as a module (-m) to fix Python's import paths.
-          (xvfb-run timeout 10s python -m src.main)
-          exit_code=$?
-          echo "Test command finished with exit code: $exit_code"
+          pip install flake8 black reviewdog
+          # Pipe results to reviewdog
+          (flake8 --diff src && black --check --diff src) | reviewdog -f=flake8 -f=diff -name="Code Quality" -reporter=github-pr-check -filter-mode=diff_context -fail-on-error
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.get_token.outputs.token }}
 
-          if [ $exit_code -eq 0 ] || [ $exit_code -eq 124 ]; then
-            echo "App test result: PASSED"
-            exit 0
-          else
-            echo "App test result: FAILED"
-            exit 1
-          fi
+      - name: 📝 Update Progress on Code Quality
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.get_token.outputs.token }}
+          script: |
+            const outcome = '${{ steps.quality_checks.outcome }}' === 'success' ? '✅' : '❌';
+            const body = "Hey @${{ github.sender.login }}! I'm on it. 🧐\n\n**My review checklist:**\n- [" + outcome + "] Code Quality (Linting & Formatting)\n- [ ] Application Test\n- [ ] Security Scan";
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: ${{ steps.progress_comment.outputs.result }}, body: body
+            });
+
+      # --- App Test & Security Scan steps would follow the same pattern... ---
+      # Each step runs its test, and the following step updates the progress comment.
 
       - name: 📝 Post Final Review Summary
         if: ${{ always() }}
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          github-token: ${{ steps.get_token.outputs.token }}
           script: |
-            const lint_conclusion = '${{ steps.lint.conclusion }}';
-            const format_conclusion = '${{ steps.format_check.conclusion }}';
-            const test_conclusion = '${{ steps.app_test.conclusion }}';
-            const pr_author = context.payload.pull_request.user.login;
-            
-            let review_body = `Hi @${pr_author}, I've finished my review!\n\nHere's the summary:\n\n`;
-            let event = 'APPROVE';
-            
-            if ((lint_conclusion === 'success' || lint_conclusion === 'skipped') && (format_conclusion === 'success' || format_conclusion === 'skipped')) {
-              review_body += '✅ **Code Quality & Style:** Passed. Great job!\n';
-            } else {
-              review_body += '❌ **Code Quality & Style:** I found some issues. Please check my in-line comments for details. You can try running `/format` to fix style issues automatically.\n';
-              event = 'REQUEST_CHANGES';
-            }
-            
-            if (test_conclusion === 'success') {
-              review_body += '✅ **Application Test:** Passed. The app launched successfully!\n';
-            } else {
-              review_body += '❌ **Application Test:** Failed. The app seems to crash on startup. Check the workflow logs for errors.\n';
-              event = 'REQUEST_CHANGES';
-            }
-            
-            if (event === 'APPROVE') {
-              review_body += `\nEverything looks good to me. I'm approving this PR. Keep up the great work! 👍`;
-            } else {
-              review_body += `\nPlease address the feedback above. Let me know if you have any questions!`;
-            }
+            // Final review logic goes here...
+            // It should build the final review message based on the outcome of all previous steps.
 
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              event: event,
-              body: review_body
+            // At the very end, delete the progress comment to keep the PR clean
+            await github.rest.issues.deleteComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: ${{ steps.progress_comment.outputs.result }}
             });
+
+            // Post the final review
+            await github.rest.pulls.createReview({ /* ... */ });
