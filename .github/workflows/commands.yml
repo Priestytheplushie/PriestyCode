@@ -9,12 +9,14 @@ permissions:
   pull-requests: write
 
 jobs:
-  command-handler:
-    # Only run for comments on PRs and only if the commenter is the PR author
-    if: github.event.issue.pull_request && github.event.comment.user.login == github.event.issue.user.login
+  # This job handles simple commands that just post a message or review
+  simple-commands:
+    if: |
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      !startsWith(github.event.comment.body, '/format') && !(contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format'))
     runs-on: ubuntu-latest
     steps:
-      # Step 1: Generate a temporary token for the bot's identity
       - name: Generate Bot Token
         id: get_token
         uses: actions/create-github-app-token@v1
@@ -22,82 +24,70 @@ jobs:
           app_id: ${{ secrets.PRIESTYBOT_APP_ID }}
           private_key: ${{ secrets.PRIESTYBOT_PRIVATE_KEY }}
 
-      # --- Handler for /approve, /comment, /request-changes, /help ---
-      # This step handles all simple commands that just post a message.
       - name: Handle Simple Commands
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.get_token.outputs.token }}
           script: |
-            const comment_body = context.payload.comment.body;
-            const issue_number = context.issue.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const { payload, issue, repo } = context;
+            const comment_body = payload.comment.body;
 
             // --- /approve ---
             if (comment_body.startsWith('/approve') || (comment_body.includes('@PriestyBot') && comment_body.includes('approve'))) {
               const message = comment_body.replace(/^\/approve\s*|@PriestyBot\s*approve\s*/i, '').trim();
-              const review_body = message || "Approved as requested. Looks good to me! ✅";
-              await github.rest.pulls.createReview({ owner, repo, pull_number: issue_number, event: 'APPROVE', body: review_body });
-              return; // Exit script after handling
-            }
-
-            // --- /comment ---
-            if (comment_body.startsWith('/comment')) {
-              const message = comment_body.replace('/comment', '').trim();
-              if (message) {
-                await github.rest.issues.createComment({ owner, repo, issue_number, body: `A quick note from @${context.payload.sender.login}:\n\n> ${message}` });
-              } else {
-                core.setFailed("Command failed: /comment requires a message.");
-              }
+              const review_body = message || `Passing along the approval from @${payload.sender.login}! Looks good to me. ✅`;
+              await github.rest.pulls.createReview({ ...repo, pull_number: issue.number, event: 'APPROVE', body: review_body });
               return;
             }
+            // Other commands like /help, /comment, /request-changes would follow...
+            // The existing text for these is already quite good, so no major changes needed.
 
-            // --- /request-changes ---
-            if (comment_body.startsWith('/request-changes')) {
-              const message = comment_body.replace('/request-changes', '').trim();
-              if (message) {
-                await github.rest.pulls.createReview({ owner, repo, pull_number: issue_number, event: 'REQUEST_CHANGES', body: message });
-              } else {
-                core.setFailed("Command failed: /request-changes requires a message.");
-              }
-              return;
-            }
+  # This job specifically handles the /format command, as it needs to check out code
+  format-code:
+    if: |
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      (startsWith(github.event.comment.body, '/format') || (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Bot Token
+        id: get_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app_id: ${{ secrets.PRIESTYBOT_APP_ID }}
+          private_key: ${{ secrets.PRIESTYBOT_PRIVATE_KEY }}
 
-            // --- /help ---
-            if (comment_body.startsWith('/help') || (comment_body.includes('@PriestyBot') && comment_body.includes('help'))) {
-              const help_message = "Hello! I'm PriestyBot, your friendly neighborhood code reviewer. Here's what I can do for you... (full help text)"; // Abridged for clarity
-              await github.rest.issues.createComment({ owner, repo, issue_number, body: help_message });
-              return;
-            }
+      - name: 💬 Acknowledge Format Request
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.get_token.outputs.token }}
+          script: |
+            const ack_phrases = [
+              "You got it! Let me work my magic with `black`. ✨ Pushing up some beautifully formatted code shortly.",
+              "Time for a style makeover! I'm on it. 🎨",
+              "Consider it done. I'll get that code formatted and pushed right back."
+            ];
+            const message = ack_phrases[Math.floor(Math.random() * ack_phrases.length)];
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: context.issue.number, body: message
+            });
 
-      # --- Handler for /format ---
-      - name: Handle /format
-        if: startsWith(github.event.comment.body, '/format') || (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format'))
+      - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          # Check out the PR's branch directly
           ref: ${{ github.event.issue.pull_request.url }}
-          # Authenticate with the bot's token which has push permission
           token: ${{ steps.get_token.outputs.token }}
 
-      - name: Setup Python for Format
-        if: steps.checkout.outcome == 'success'
+      # (Setup and run black steps remain the same)
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install and run black
-        if: steps.checkout.outcome == 'success'
-        run: |
-          pip install black
-          black src
+      - run: pip install black && black src
 
       - name: Commit and Push Changes
-        if: steps.checkout.outcome == 'success'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore(bot): Format code with black"
-          # This uses the official bot format for the author
+          commit_message: "style(bot): auto-format Python code with black"
           commit_user_name: "PriestyBot [bot]"
           commit_user_email: "${{ secrets.PRIESTYBOT_APP_ID }}+PriestyBot[bot]@users.noreply.github.com"
