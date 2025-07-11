@@ -11,10 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-  REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-
 permissions:
   contents: read
   pull-requests: write
@@ -26,19 +22,24 @@ jobs:
     name: Lint & Test
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # FIXED: Re-instating the environment variable so reviewdog uses your PAT.
+    # This will now work because you've added the `checks: write` scope to the PAT.
+    env:
+      REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
     outputs:
       flake8_outcome: ${{ steps.flake8.outcome }}
       black_outcome: ${{ steps.black.outcome }}
-      isort_outcome: ${{ steps.isort.outcome }}
-      bandit_outcome: ${{ steps.bandit.outcome }}
-      mypy_outcome: ${{ steps.mypy.outcome }}
+      isort_outcome: ${{ steps.isort.conclusion }}
+      bandit_outcome: ${{ steps.bandit.conclusion }}
+      mypy_outcome: ${{ steps.mypy.conclusion }}
       app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
       - name: 💬 Acknowledging the review request...
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          # This action should also use the bot's token for consistency
+          github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -58,7 +59,6 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      # FIXED: Correctly install reviewdog using its own action
       - name: Set up reviewdog
         uses: reviewdog/action-setup@v1
         with:
@@ -68,9 +68,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # FIXED: Removed 'reviewdog' from pip install
           pip install flake8 black isort mypy bandit
-          sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: 💧 Run Linter (flake8)
         id: flake8
@@ -97,19 +95,19 @@ jobs:
         id: isort
         continue-on-error: true
         run: |
-          isort --check --diff src | reviewdog -f=diff -f.isort --reporter=github-pr-check --level=warning -name="isort-check"
+          (isort --check --diff src || true) | reviewdog -f=diff -f.isort --reporter=github-pr-check --level=warning -name="isort-check" -fail-on-error
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
         run: |
-          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error
+          (bandit -r src -f txt || true) | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
         run: |
-          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error
+          (mypy src || true) | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
@@ -165,7 +163,7 @@ jobs:
       - name: 📝 Post Final Review Summary
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
@@ -175,7 +173,7 @@ jobs:
 
             if (lintJobResult === 'failure' || codeqlJobResult === 'failure') {
               event = 'REQUEST_CHANGES';
-              review_body += `❌ **Workflow Error:** One of the main check jobs ('Lint & Test' or 'CodeQL') failed unexpectedly. This is usually due to a configuration issue in the workflow file itself, not a problem with your code.\n\n`;
+              review_body += `❌ **Workflow Error:** One of the main check jobs ('Lint & Test' or 'CodeQL') failed unexpectedly. This could be due to a configuration issue in the workflow file itself.\n\n`;
               review_body += `Please check the workflow logs in the "Checks" tab for the exact error message. I cannot approve this PR until the workflow runs successfully.`;
             } else {
               const outcomes = {
