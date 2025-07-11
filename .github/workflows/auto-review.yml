@@ -61,29 +61,39 @@ jobs:
           echo "isort_status=PASSED" >> $GITHUB_OUTPUT
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
-          set -o pipefail
           
-          # This robust logic prevents the step from crashing if a linter fails.
-          echo "--- Running flake8 and black for inline comments ---"
-          if ! flake8_output=$(flake8 src 2>&1); then
+          # --- Running flake8 and black for inline comments ---
+          # Always capture output to file, then check file content for failure
+          echo "--- Running flake8 for inline comments ---"
+          # Run flake8 and capture its output to flake8_report.txt
+          # Using `|| true` to prevent script from exiting if flake8 fails,
+          # allowing us to check the file content.
+          flake8 src 2>&1 | tee flake8_raw_output.txt
+          if [ -s flake8_raw_output.txt ]; then # Check if file exists and is not empty
             LINTER_FAILED_ANY=true
             echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
-            echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
-            echo "$flake8_output" > flake8_report.txt # Capture flake8 output to a file if it failed
+            # Send the output to reviewdog for inline comments
+            cat flake8_raw_output.txt | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
           fi
-          if ! black_output=$(black --check --diff src 2>&1); then
+
+          echo "--- Running black for inline comments ---"
+          # Run black and capture its output to black_report.txt
+          black --check --diff src 2>&1 | tee black_raw_output.txt
+          if [ -s black_raw_output.txt ]; then # Check if file exists and is not empty
             LINTER_FAILED_ANY=true
             echo "black_status=FAILED" >> $GITHUB_OUTPUT
-            echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
-            echo "$black_output" > black_report.txt # Capture black output to a file if it failed
+            # Send the output to reviewdog for inline comments
+            cat black_raw_output.txt | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
           fi
 
           echo "--- Running isort and mypy for summary reports ---"
+          # isort output for summary report
           if ! isort_output=$(isort --check src 2>&1); then
                 LINTER_FAILED_ANY=true
                 echo "isort_status=FAILED" >> $GITHUB_OUTPUT
                 echo "$isort_output" > isort_report.txt
           fi
+          # mypy output for summary report
           if ! mypy_output=$(mypy src 2>&1); then
                 LINTER_FAILED_ANY=true
                 echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
@@ -135,8 +145,12 @@ jobs:
             let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             function getReport(name) {
-              if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
-              return 'No output captured.';
+              // Ensure we check for the existence before reading
+              if (fs.existsSync(`${name}_report.txt`)) {
+                  const content = fs.readFileSync(`${name}_report.txt`, 'utf8').trim();
+                  return content !== '' ? content : 'No output captured or no issues found.';
+              }
+              return 'Report file not generated (no issues found by this linter).';
             }
 
             if (app_status === 'FAILED') {
@@ -145,15 +159,14 @@ jobs:
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
               
-              // Corrected Logic: Check if flake8 or black actually generated a report with content
-              // This relies on the shell script only creating the report file if there's output.
-              const flake8_reported_issues = fs.existsSync('flake8_report.txt') && fs.readFileSync('flake8_report.txt', 'utf8').trim() !== '';
-              const black_reported_issues = fs.existsSync('black_report.txt') && fs.readFileSync('black_report.txt', 'utf8').trim() !== '';
-
+              // NEW LOGIC FOR INLINE COMMENTS MESSAGE
+              // We check the actual status outputs from the linting step,
+              // and the presence/content of the raw output files for clarity.
+              const flake8_has_issues = flake8_status === 'FAILED';
+              const black_has_issues = black_status === 'FAILED';
               const summary_failed = (isort_status === 'FAILED' || mypy_status === 'FAILED');
 
-              // Only add this message if flake8 or black genuinely reported issues
-              if (flake8_reported_issues || black_reported_issues) { 
+              if (flake8_has_issues || black_has_issues) { 
                 body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n";
               }
               
