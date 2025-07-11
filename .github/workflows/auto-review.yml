@@ -57,35 +57,30 @@ jobs:
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
           
-          # This robust logic prevents the step from crashing if a linter fails.
-          # It captures the exit code DIRECTLY without using any complex shell features.
+          # --- Group 1: Inline Comment Linters ---
           echo "--- [1/4] Running flake8 for inline comments ---"
-          flake8_output=$(flake8 src 2>&1)
-          exit_code=$?
-          echo "-> flake8 finished with exit code: $exit_code"
-          if [ $exit_code -ne 0 ]; then
-            echo "-> flake8 found issues. Reporting them."
+          # This robust logic prevents the step from crashing if the linter fails.
+          flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
+          # PIPESTATUS[0] is the real exit code of the linter, not reviewdog.
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "-> flake8 found issues."
             LINTER_FAILED_ANY=true
             echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
-            echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
           fi
 
           echo "--- [2/4] Running black for inline comments ---"
-          black_output=$(black --check --diff src 2>&1)
-          exit_code=$?
-          echo "-> black finished with exit code: $exit_code"
-          if [ $exit_code -ne 0 ]; then
-            echo "-> black found formatting issues. Reporting them."
+          black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "-> black found formatting issues."
             LINTER_FAILED_ANY=true
             echo "black_status=FAILED" >> $GITHUB_OUTPUT
-            echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
           fi
           
+          # --- Group 2: Summary Report Linters ---
           echo "--- [3/4] Running isort for summary report ---"
+          # This does not pipe to reviewdog, so we check `?` for the exit code.
           isort_output=$(isort --check src 2>&1)
-          exit_code=$?
-          echo "-> isort finished with exit code: $exit_code"
-          if [ $exit_code -ne 0 ]; then
+          if [ $? -ne 0 ]; then
               echo "-> isort found import sorting issues. Saving report."
               LINTER_FAILED_ANY=true
               echo "isort_status=FAILED" >> $GITHUB_OUTPUT
@@ -94,9 +89,7 @@ jobs:
 
           echo "--- [4/4] Running mypy for summary report ---"
           mypy_output=$(mypy src 2>&1)
-          exit_code=$?
-          echo "-> mypy finished with exit code: $exit_code"
-          if [ $exit_code -ne 0 ]; then
+          if [ $? -ne 0 ]; then
               echo "-> mypy found type checking issues. Saving report."
               LINTER_FAILED_ANY=true
               echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
@@ -133,10 +126,10 @@ jobs:
             const pr_author = context.payload.pull_request.user.login;
             const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
             const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
-            const flake8_status = "${{ steps.linting.outputs.flake8_status || 'FAILED' }}";
-            const black_status = "${{ steps.linting.outputs.black_status || 'FAILED' }}";
-            const isort_status = "${{ steps.linting.outputs.isort_status || 'FAILED' }}";
-            const mypy_status = "${{ steps.linting.outputs.mypy_status || 'FAILED' }}";
+            const flake8_status = "${{ steps.linting.outputs.flake8_status }}";
+            const black_status = "${{ steps.linting.outputs.black_status }}";
+            const isort_status = "${{ steps.linting.outputs.isort_status }}";
+            const mypy_status = "${{ steps.linting.outputs.mypy_status }}";
             
             const app_check = app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌';
             const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
