@@ -1,9 +1,6 @@
 name: PriestyBot Auto-Review & CodeQL
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     types: [review_requested, synchronize]
 
@@ -25,32 +22,32 @@ jobs:
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
     runs-on: ubuntu-latest
     outputs:
-      flake8_outcome: ${{ steps.flake8.conclusion }}
-      black_outcome: ${{ steps.black.conclusion }}
-      isort_outcome: ${{ steps.isort.conclusion }}
-      bandit_outcome: ${{ steps.bandit.conclusion }}
-      mypy_outcome: ${{ steps.mypy.conclusion }}
-      app_test_outcome: ${{ steps.app_test.conclusion }}
+      flake8_report: ${{ steps.flake8.outputs.report }}
+      black_report: ${{ steps.black.outputs.report }}
+      isort_report: ${{ steps.isort.outputs.report }}
+      bandit_report: ${{ steps.bandit.outputs.report }}
+      mypy_report: ${{ steps.mypy.outputs.report }}
+      app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
-      - name: Add 'priestybot-review' Label
+      - name: Add 'priestybot-review' Label & Comment
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            const issue_number = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
+              owner, repo, issue_number,
               labels: ['priestybot-review']
             });
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
+              owner, repo, issue_number,
               body: `Hey @${context.payload.pull_request.user.login}! 👋 Thanks for the review request. I'll get started right away.\n\nP.S. I've added the \`priestybot-review\` label. I'll keep re-reviewing any new changes you push. If you want me to stop, just remove the label!`
             });
-      - name: 💬 Acknowledging new changes
+      
+      - name: 💬 Acknowledging New Changes
         if: github.event.action == 'synchronize'
         uses: actions/github-script@v7
         with:
@@ -67,371 +64,61 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
+      
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install flake8 black isort mypy bandit
 
-      - name: Create linter-reports directory
-        run: mkdir -p linter-reports
-
       - name: 💧 Run Linter (flake8)
         id: flake8
         continue-on-error: true
-        run: |
-          flake8 src > flake8_raw_output.txt || true 
-          cat << 'EOF' > convert_flake8_to_rdjson.py
-          import json
-          import sys
-          import re
-          import os
-
-          def convert_flake8_to_rdjson(flake8_report_path, rdjson_output_path):
-              diagnostics = []
-              flake8_pattern = re.compile(r"^(.*?):(\d+):(\d+): (\S+) (.*)$")
-
-              try:
-                  if not os.path.exists(flake8_report_path) or os.stat(flake8_report_path).st_size == 0:
-                      print(f"Flake8 report file {flake8_report_path} is empty or missing. Creating empty rdjson.")
-                      with open(rdjson_output_path, 'w') as f:
-                          json.dump({"source": {"name": "flake8"}, "diagnostics": []}, f, indent=2)
-                      return
-
-                  with open(flake8_report_path, 'r') as f:
-                      for line in f:
-                          match = flake8_pattern.match(line.strip())
-                          if match:
-                              file_path = match.group(1)
-                              line_num = int(match.group(2))
-                              col_num = int(match.group(3))
-                              code = match.group(4)
-                              message = match.group(5)
-
-                              diagnostics.append({
-                                  "message": f"[{code}] {message}",
-                                  "location": {
-                                      "path": file_path,
-                                      "range": {
-                                          "start": {"line": line_num, "column": col_num},
-                                          "end": {"line": line_num, "column": col_num}
-                                      }
-                                  },
-                                  "level": "warning", 
-                                  "code": {"value": code}
-                              })
-                          else:
-                              print(f"Skipping unparsable flake8 line: {line.strip()}")
-
-              except Exception as e:
-                  print(f"Error processing Flake8 report: {e}. Creating empty rdjson.")
-                  with open(rdjson_output_path, 'w') as f:
-                      json.dump({"source": {"name": "flake8"}, "diagnostics": []}, f, indent=2)
-                  return
-
-              rdjson_report = {
-                  "source": {"name": "flake8"},
-                  "diagnostics": diagnostics
-              }
-
-              with open(rdjson_output_path, 'w') as f:
-                  json.dump(rdjson_report, f, indent=2)
-
-          if __name__ == "__main__":
-              convert_flake8_to_rdjson(sys.argv[1], sys.argv[2])
-          EOF
-          python convert_flake8_to_rdjson.py flake8_raw_output.txt linter-reports/flake8.rdjson
+        run: echo "report=$(flake8 src --format='%(path)s:%(row)d:%(col)d: [%(code)s] %(text)s' | base64 -w 0)" >> $GITHUB_OUTPUT
 
       - name: 💅 Run Format Check (black)
         id: black
         continue-on-error: true
-        run: |
-          black --check src > black_raw_output.txt 2>&1 || true
-          cat << 'EOF' > convert_black_to_rdjson.py
-          import json
-          import sys
-          import re
-          import os
-
-          def convert_black_to_rdjson(black_report_path, rdjson_output_path):
-              diagnostics = []
-              file_pattern = re.compile(r"^would reformat (.*)$")
-
-              try:
-                  if not os.path.exists(black_report_path) or os.stat(black_report_path).st_size == 0:
-                      print(f"Black report file {black_report_path} is empty or missing. Creating empty rdjson.")
-                      with open(rdjson_output_path, 'w') as f:
-                          json.dump({"source": {"name": "black"}, "diagnostics": []}, f, indent=2)
-                      return
-
-                  with open(black_report_path, 'r') as f:
-                      for line in f:
-                          match = file_pattern.match(line.strip())
-                          if match:
-                              file_path = match.group(1).strip()
-                              diagnostics.append({
-                                  "message": "File needs reformatting by Black.",
-                                  "location": {
-                                      "path": file_path,
-                                      "range": {"start": {"line": 1}} 
-                                  },
-                                  "level": "info",
-                                  "code": {"value": "BLACK_REFORMAT"}
-                              })
-                          elif "would be reformatted" in line:
-                              diagnostics.append({
-                                  "message": line.strip(),
-                                  "level": "info",
-                                  "code": {"value": "BLACK_SUMMARY"}
-                              })
-
-              except Exception as e:
-                  print(f"Error processing Black report: {e}. Creating empty rdjson.")
-                  with open(rdjson_output_path, 'w') as f:
-                      json.dump({"source": {"name": "black"}, "diagnostics": []}, f, indent=2)
-                  return
-
-              rdjson_report = {
-                  "source": {"name": "black"},
-                  "diagnostics": diagnostics
-              }
-
-              with open(rdjson_output_path, 'w') as f:
-                  json.dump(rdjson_report, f, indent=2)
-
-          if __name__ == "__main__":
-              convert_black_to_rdjson(sys.argv[1], sys.argv[2])
-          EOF
-          python convert_black_to_rdjson.py black_raw_output.txt linter-reports/black.rdjson
+        run: echo "report=$(black --check --diff src 2>&1 | base64 -w 0)" >> $GITHUB_OUTPUT
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
-        run: |
-          isort --check src > isort_raw_output.txt || true
-          cat << 'EOF' > convert_isort_to_rdjson.py
-          import json
-          import sys
-          import re
-          import os
+        run: echo "report=$(isort --check-only --diff src 2>&1 | base64 -w 0)" >> $GITHUB_OUTPUT
 
-          def convert_isort_to_rdjson(isort_report_path, rdjson_output_path):
-              diagnostics = []
-              file_pattern = re.compile(r"ERROR: (.*?) Imports are incorrectly sorted or formatted.$")
-
-              try:
-                  if not os.path.exists(isort_report_path) or os.stat(isort_report_path).st_size == 0:
-                      print(f"Isort report file {isort_report_path} is empty or missing. Creating empty rdjson.")
-                      with open(rdjson_output_path, 'w') as f:
-                          json.dump({"source": {"name": "isort"}, "diagnostics": []}, f, indent=2)
-                      return
-
-                  with open(isort_report_path, 'r') as f:
-                      for line in f:
-                          match = file_pattern.match(line.strip())
-                          if match:
-                              file_path = match.group(1).strip()
-                              diagnostics.append({
-                                  "message": "Imports are incorrectly sorted or formatted.",
-                                  "location": {
-                                      "path": file_path,
-                                      "range": {"start": {"line": 1}} 
-                                  },
-                                  "level": "info", 
-                                  "code": {"value": "ISORT_ERROR"}
-                              })
-                          else:
-                              if line.strip() and line.strip().startswith("ERROR:"):
-                                  diagnostics.append({
-                                      "message": line.strip(),
-                                      "level": "error",
-                                      "code": {"value": "ISORT_GENERAL_ERROR"}
-                                  })
-
-              except Exception as e:
-                  print(f"Error processing Isort report: {e}. Creating empty rdjson.")
-                  with open(rdjson_output_path, 'w') as f:
-                      json.dump({"source": {"name": "isort"}, "diagnostics": []}, f, indent=2)
-                  return
-
-              rdjson_report = {
-                  "source": {"name": "isort"},
-                  "diagnostics": diagnostics
-              }
-
-              with open(rdjson_output_path, 'w') as f:
-                  json.dump(rdjson_report, f, indent=2)
-
-          if __name__ == "__main__":
-              convert_isort_to_rdjson(sys.argv[1], sys.argv[2])
-          EOF
-          python convert_isort_to_rdjson.py isort_raw_output.txt linter-reports/isort.rdjson
-      
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
-        run: |
-          bandit -r src -f json > bandit_raw_output.json || true
-
-          cat << 'EOF' > convert_bandit_to_rdjson.py
-          import json
-          import sys
-          import os
-
-          def convert_bandit_to_rdjson(bandit_report_path, rdjson_output_path):
-              diagnostics = []
-              try:
-                  if not os.path.exists(bandit_report_path) or os.stat(bandit_report_path).st_size == 0:
-                      print(f"Bandit report file {bandit_report_path} is empty or missing. Creating empty rdjson.")
-                      with open(rdjson_output_path, 'w') as f:
-                          json.dump({"source": {"name": "bandit"}, "diagnostics": []}, f, indent=2)
-                      return
-
-                  with open(bandit_report_path, 'r') as f:
-                      bandit_data = json.load(f)
-              except (FileNotFoundError, json.JSONDecodeError) as e:
-                  print(f"Error loading/parsing Bandit report: {e}. Creating empty rdjson.")
-                  with open(rdjson_output_path, 'w') as f:
-                      json.dump({"source": {"name": "bandit"}, "diagnostics": []}, f, indent=2)
-                  return
-
-              for result in bandit_data.get('results', []):
-                  diagnostics.append({
-                      "message": f"[{result['test_id']}] {result['issue_text']} (Confidence: {result['issue_confidence']}, Severity: {result['issue_severity']})",
-                      "location": {
-                          "path": result['filename'],
-                          "range": {
-                              "start": {"line": result['line_number']},
-                              "end": {"line": result['end_line_number'] if 'end_line_number' in result else result['line_number']}
-                          }
-                      },
-                      "level": "error" if result['issue_severity'] == 'HIGH' else ("warning" if result['issue_severity'] == 'MEDIUM' else "info"),
-                      "code": {"value": result['test_name']}
-                  })
-              
-              rdjson_report = {
-                  "source": {"name": "bandit"},
-                  "diagnostics": diagnostics
-              }
-
-              with open(rdjson_output_path, 'w') as f:
-                  json.dump(rdjson_report, f, indent=2)
-
-          if __name__ == "__main__":
-              convert_bandit_to_rdjson(sys.argv[1], sys.argv[2])
-          EOF
-          python convert_bandit_to_rdjson.py bandit_raw_output.json linter-reports/bandit.rdjson
-
+        run: echo "report=$(bandit -r src -f custom --msg-template '{path}:{line}: [{test_id}] {msg}' | base64 -w 0)" >> $GITHUB_OUTPUT
+      
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
-        run: |
-          mypy src > mypy_raw_output.txt || true
-
-          cat << 'EOF' > convert_mypy_to_rdjson.py
-          import json
-          import sys
-          import re
-          import os
-
-          def convert_mypy_to_rdjson(mypy_report_path, rdjson_output_path):
-              diagnostics = []
-              mypy_pattern = re.compile(r"^(.*?):(\d+)(?::(\d+))?: (.*?): (.*)$")
-
-              try:
-                  if not os.path.exists(mypy_report_path) or os.stat(mypy_report_path).st_size == 0:
-                      print(f"Mypy report file {mypy_report_path} is empty or missing. Creating empty rdjson.")
-                      with open(rdjson_output_path, 'w') as f:
-                          json.dump({"source": {"name": "mypy"}, "diagnostics": []}, f, indent=2)
-                      return
-
-                  with open(mypy_report_path, 'r') as f:
-                      for line in f:
-                          match = mypy_pattern.match(line.strip())
-                          if match:
-                              file_path = match.group(1)
-                              line_num = int(match.group(2))
-                              col_num = int(match.group(3)) if match.group(3) else 0
-                              level_str = match.group(4).lower()
-                              message = match.group(5)
-
-                              level = "info" 
-                              if "error" in level_str:
-                                  level = "error"
-                              elif "warning" in level_str:
-                                  level = "warning"
-                              elif "note" in level_str:
-                                  level = "info"
-
-                              diagnostics.append({
-                                  "message": message,
-                                  "location": {
-                                      "path": file_path,
-                                      "range": {
-                                          "start": {"line": line_num, "column": col_num},
-                                          "end": {"line": line_num, "column": col_num}
-                                      }
-                                  },
-                                  "level": level,
-                                  "code": {"value": level_str}
-                              })
-                          else:
-                              print(f"Skipping unparsable mypy line: {line.strip()}")
-
-              except Exception as e:
-                  print(f"Error processing Mypy report: {e}. Creating empty rdjson.")
-                  with open(rdjson_output_path, 'w') as f:
-                      json.dump({"source": {"name": "mypy"}, "diagnostics": []}, f, indent=2)
-                  return
-
-              rdjson_report = {
-                  "source": {"name": "mypy"},
-                  "diagnostics": diagnostics
-              }
-
-              with open(rdjson_output_path, 'w') as f:
-                  json.dump(rdjson_report, f, indent=2)
-
-          if __name__ == "__main__":
-              convert_mypy_to_rdjson(sys.argv[1], sys.argv[2])
-          EOF
-          python convert_mypy_to_rdjson.py mypy_raw_output.txt linter-reports/mypy.rdjson
+        run: echo "report=$(mypy src | base64 -w 0)" >> $GITHUB_OUTPUT
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
         continue-on-error: true
         run: |
-          echo "Starting the Tkinter app in a virtual display..."
-          # Use timeout and xvfb-run to handle the Tkinter app
-          # Exit code 124 means timeout, which we consider a success for non-crashing apps
           if xvfb-run timeout 10s python -m src.main; then
-            echo "App test result: PASSED (exited cleanly before timeout)"
+            echo "App test PASSED: Exited cleanly before timeout."
             exit 0
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
-              echo "App test result: PASSED (ran for 10s and timed out, which implies no crash)."
+              echo "App test PASSED: Ran for 10s and was terminated as expected."
               exit 0
             else
-              echo "App test result: FAILED (app crashed with exit code $exit_code)."
-              exit $exit_code
+              echo "App test FAILED: App crashed with exit code $exit_code."
+              exit 1
             fi
           fi
-      
-      - name: Upload Linter Reports
-        if: success() || failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: linter-reports
-          path: linter-reports/*.rdjson
-          retention-days: 1
 
   codeql:
     name: CodeQL Analysis
@@ -443,8 +130,6 @@ jobs:
     permissions:
       security-events: write
       actions: read
-    outputs:
-      analyze_outcome: ${{ steps.analyze.outcome }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -458,7 +143,6 @@ jobs:
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
       - name: Perform CodeQL Analysis
-        id: analyze
         uses: github/codeql-action/analyze@v3
 
   final-review:
@@ -467,195 +151,124 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
     steps:
-      - name: Download Linter Reports
-        uses: actions/download-artifact@v4
-        with:
-          name: linter-reports
-          path: linter-reports
-
       - name: 📝 Post Final Review Summary
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            const fs = require('fs');
-            const path = require('path');
-            
-            const inlineComments = []; 
-            const summaryDiagnostics = {}; 
+            const { owner, repo } = context.repo;
+            const pull_number = context.issue.number;
 
-            const reportDir = './linter-reports';
-            try {
-              const files = fs.readdirSync(reportDir);
-              for (const file of files) {
-                if (file.endsWith('.rdjson')) {
-                  const content = fs.readFileSync(path.join(reportDir, file), 'utf8');
-                  if (!content.trim()) { 
-                      console.log(`File ${file} is empty or contains only whitespace, skipping.`);
-                      continue;
-                  }
-                  let report;
-                  try {
-                      report = JSON.parse(content);
-                  } catch (e) {
-                      console.error(`Failed to parse JSON from ${file}: ${e.message}`);
-                      continue;
-                  }
-                  
-                  const sourceName = report.source?.name || path.basename(file, '.rdjson'); 
-                  summaryDiagnostics[sourceName] = summaryDiagnostics[sourceName] || []; 
+            // Helper to decode Base64 reports
+            const atob = (b64) => Buffer.from(b64, 'base64').toString('utf-8');
 
-                  if (!report.diagnostics || report.diagnostics.length === 0) {
-                      console.log(`No diagnostics found in ${file}.`);
-                      continue;
-                  }
-
-                  for (const diag of report.diagnostics) {
-                    const location = diag.location || diag.primaryLocation; 
-                    const filePath = location?.path;
-                    const startLine = location?.range?.start?.line; 
-                    
-                    // Prioritize inline comments if path and a valid line number exist
-                    if (filePath && typeof startLine === 'number' && startLine > 0) { 
-                      inlineComments.push({
-                          path: filePath,
-                          line: startLine, // This 'line' maps to the 'position' in the diff hunk
-                          body: `**[${sourceName}]**: ${diag.message}`
-                      });
-                    } else if (filePath) { 
-                      // If no valid line, but has a path, add to summary with file context
-                      summaryDiagnostics[sourceName].push(`File \`${filePath}\`: ${diag.message}`); 
-                    } else {
-                        // If no path, add to summary as last resort
-                        summaryDiagnostics[sourceName].push(`[${sourceName}] (General Issue): ${diag.message}`);
-                        console.log(`Diagnostic from ${sourceName} only added to summary due to missing path: ${JSON.stringify(diag)}`);
-                    }
-                  }
-                }
-              }
-            } catch (error) {
-              console.log("Could not process linter reports, likely none were generated or directory issues:", error.message);
-            }
-
-            const pr_author = context.payload.pull_request.user.login;
-            let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
-            let event = 'APPROVE';
-            let is_perfect_run = true; 
-
-            const outcomes = {
-              flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, title: `🎨 Linting Issues (\`flake8\`)` },
-              black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, title: `🎨 Formatting & Style (\`black\`)` },
-              isort: { conclusion: `${{ needs.lint-and-test.outputs.isort_outcome }}`, title: `🎨 Import Order (\`isort\`)` },
-              bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, title: `🚨 Security Analysis (\`bandit\`)` }, 
-              mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, title: `🚨 Type Checking (\`mypy\`)` }, 
-              app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, title: `🚨 Application Test` }, 
-              codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, title: `🚨 Advanced Security (\`CodeQL\`)` } 
-            };
-
-            const appTestPassed = outcomes.app_test.conclusion === 'success';
-            const hasAnyLinterIssues = inlineComments.length > 0 || Object.values(summaryDiagnostics).some(arr => arr.length > 0);
-            const codeQLFailed = outcomes.codeql.conclusion === 'failure';
-            const anyLinterStepFailed = ['flake8', 'black', 'isort', 'bandit', 'mypy'].some(linter => outcomes[linter].conclusion === 'failure');
-
-            // --- Core Logic: Determine APPROVE vs. REQUEST_CHANGES ---
-
-            if (!appTestPassed) {
-                event = 'REQUEST_CHANGES';
-                review_body += `**🚨 Critical Issue: The Tkinter application failed to run for 10 seconds!**\n`;
-                review_body += `Please ensure the \`src/main.py\` application starts correctly and remains stable for at least 10 seconds without crashing. This is a primary requirement for merging.\n\n`;
-                
-                if (hasAnyLinterIssues || codeQLFailed || anyLinterStepFailed) {
-                    review_body += `---\n\nAdditionally, I found other issues (these become blocking since the app test failed):\n\n`;
-                    if (anyLinterStepFailed) {
-                        review_body += `* **Failed Linter/Check Steps:** Some linter steps failed. Please check the workflow logs for details. This is blocking.\n`;
-                    }
-                    if (codeQLFailed) {
-                        review_body += `* **CodeQL Analysis:** Failed. Go to the 'Security' tab for details. This is blocking.\n`;
-                    }
-                    if (inlineComments.length > 0) {
-                         review_body += `* **Inline Comments:** See comments directly on the code for specific issues. These are now blocking.\n`;
-                    }
-                }
-                
-                let aggregatedDetails = '';
-                for (const linterName in summaryDiagnostics) {
-                    if (summaryDiagnostics[linterName].length > 0) {
-                        aggregatedDetails += `\n### ${outcomes[linterName]?.title || linterName} (Aggregated):\n`;
-                        for (const msg of summaryDiagnostics[linterName]) {
-                            aggregatedDetails += `- ${msg}\n`;
-                        }
-                    }
-                }
-                if (aggregatedDetails) {
-                    review_body += `\n---\n\n## 📋 Detailed Linter Findings (Aggregated):\n`;
-                    review_body += aggregatedDetails;
-                    review_body += `\n---\n`;
-                }
-
-                review_body += `\nPlease address these issues, especially the application test failure. Let me know if you have questions!`;
-                is_perfect_run = false; 
-
-            } else { // App Test PASSED 🎉
-                review_body += `The Tkinter application passed its 10-second run test successfully! 🎉 This PR is good to merge.\n\n`;
-                
-                if (hasAnyLinterIssues || codeQLFailed || anyLinterStepFailed) {
-                    event = 'APPROVE'; 
-                    review_body += `However, I've found some **advisory suggestions** to improve the code quality. These are not blockers for merging but are highly recommended:\n\n---\n\n`;
-                    
-                    if (anyLinterStepFailed) {
-                        review_body += `* **Some Linter Steps Failed:** While not blocking, these indicate potential issues. Please investigate the workflow logs for more details.\n`;
-                    }
-                    if (codeQLFailed) {
-                        review_body += `* **CodeQL Analysis:** Failed. Go to the 'Security' tab for detailed advice.\n`;
-                    }
-                    if (inlineComments.length > 0) {
-                        review_body += `* **Inline Comments:** Please check the code for inline comments outlining specific suggestions.\n`;
-                    } else {
-                        review_body += `* **Aggregated Linter Findings:** No specific code comments were generated, but review the 'Detailed Linter Findings' section below for aggregated advice.\n`;
-                    }
-                    
-                    let aggregatedDetails = '';
-                    for (const linterName in summaryDiagnostics) {
-                        if (summaryDiagnostics[linterName].length > 0) {
-                            aggregatedDetails += `\n### ${outcomes[linterName]?.title || linterName} (Aggregated):\n`;
-                            for (const msg of summaryDiagnostics[linterName]) {
-                                aggregatedDetails += `- ${msg}\n`;
-                            }
-                        }
-                    }
-
-                    if (aggregatedDetails) {
-                        review_body += `\n---\n\n## 📋 Detailed Linter Findings (Aggregated):\n`;
-                        review_body += aggregatedDetails;
-                        review_body += `\n---\n`;
-                    }
-
-                    review_body += `\nFeel free to merge this PR. Addressing these suggestions would be beneficial for code quality!`;
-                    is_perfect_run = false; 
-                } else {
-                    review_body += `Everything looks perfectly clean! All checks passed, including the application test. Keep up the fantastic work! 👍`;
-                    is_perfect_run = true;
-                }
-            }
-
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              event: event,
-              body: review_body,
-              comments: inlineComments // Only pass valid inline comments here
+            // Fetch the diff to identify changed lines
+            const { data: diff } = await github.rest.pulls.get({
+              owner, repo, pull_number,
+              mediaType: { format: "diff" }
             });
             
-            if (is_perfect_run) {
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.issue.number,
-                  name: 'priestybot-review'
-                });
-              } catch (error) {
-                console.log("Could not remove 'priestybot-review' label, it might not exist or already be removed.");
+            const changedLines = {};
+            let currentFile = "";
+            for (const line of diff.split('\n')) {
+              if (line.startsWith('+++ b/')) {
+                currentFile = line.substring(6);
+                changedLines[currentFile] = new Set();
+              }
+              if (line.startsWith('@@')) {
+                const match = line.match(/\+([0-9]+)/);
+                if (match) {
+                  let startLine = parseInt(match[1]);
+                  let currentLineInHunk = startLine;
+                  const hunkLines = line.substring(line.indexOf('@@') + 2).split('\n');
+                  // This is a simplified diff parser. A more robust solution might be needed for complex diffs.
+                  // For now, we'll add all lines in the 'add' part of the hunk.
+                  const hunkInfo = line.split("@@")[1];
+                  const lines = diff.substring(diff.indexOf(hunkInfo) + hunkInfo.length).split('\n');
+                  let lineNumInFile = startLine;
+                  for (const diffLine of lines) {
+                    if (diffLine.startsWith('+') && !diffLine.startsWith('+++')) {
+                      changedLines[currentFile].add(lineNumInFile);
+                      lineNumInFile++;
+                    } else if (!diffLine.startsWith('-')) {
+                      lineNumInFile++;
+                    }
+                  }
+                }
               }
             }
+            
+            const inlineComments = [];
+            const summaryIssues = {};
+
+            function addIssue(linter, message) {
+              const match = message.match(/^([^:]+):(\d+):/);
+              if (match && changedLines[match[1]]?.has(parseInt(match[2]))) {
+                inlineComments.push({
+                  path: match[1],
+                  line: parseInt(match[2]),
+                  body: `**[${linter}]**: ${message.substring(message.indexOf(']') + 2)}`
+                });
+              } else {
+                summaryIssues[linter] = summaryIssues[linter] || [];
+                summaryIssues[linter].push(message);
+              }
+            }
+
+            // Process reports
+            const reports = {
+              flake8: atob("${{ needs.lint-and-test.outputs.flake8_report }}"),
+              bandit: atob("${{ needs.lint-and-test.outputs.bandit_report }}"),
+              mypy: atob("${{ needs.lint-and-test.outputs.mypy_report }}"),
+              isort: atob("${{ needs.lint-and-test.outputs.isort_report }}"),
+              black: atob("${{ needs.lint-and-test.outputs.black_report }}")
+            };
+
+            reports.flake8.split('\n').filter(l => l).forEach(l => addIssue('flake8', l));
+            reports.bandit.split('\n').filter(l => l).forEach(l => addIssue('bandit', l));
+            reports.mypy.split('\n').filter(l => l).forEach(l => addIssue('mypy', l));
+            
+            // Handle linters with non-standard output (like black and isort)
+            if (reports.isort.includes("ERROR")) {
+              summaryIssues['isort'] = reports.isort.split('\n').filter(l => l);
+            }
+            if (reports.black.includes("would be reformatted")) {
+               summaryIssues['black'] = reports.black.split('\n').filter(l => l);
+            }
+
+            // Determine review status
+            const appTestPassed = "${{ needs.lint-and-test.outputs.app_test_outcome }}" === 'success';
+            let event = appTestPassed ? 'APPROVE' : 'REQUEST_CHANGES';
+            let review_body = `Hi @${context.payload.pull_request.user.login}, I've finished my review!\n\n`;
+
+            if (!appTestPassed) {
+              review_body += `**🚨 Critical Issue: The application test failed!**\nThis is a blocking issue. Please check the workflow logs to debug why the app isn't running correctly.\n\n---\n\n`;
+            } else {
+              review_body += `**✅ The application test passed!** This PR is approved and can be merged.\n\n---\n\n`;
+            }
+            
+            const hasSummaryIssues = Object.keys(summaryIssues).length > 0;
+            const hasInlineComments = inlineComments.length > 0;
+
+            if (hasSummaryIssues || hasInlineComments) {
+              review_body += `I have some suggestions to improve code quality. They are **advisory** if the app test passed, but **required** if it failed.\n\n`;
+              if (hasInlineComments) {
+                review_body += `* I've left some comments directly on the changed lines of your code.\n`;
+              }
+              if (hasSummaryIssues) {
+                review_body += `* Below is a summary of other findings:\n\n`;
+                for (const linter in summaryIssues) {
+                  review_body += `### ${linter} Findings\n\`\`\`\n${summaryIssues[linter].join('\n')}\n\`\`\`\n`;
+                }
+              }
+            } else {
+              review_body += `Everything looks perfectly clean! No issues found. Great job! 👍`;
+            }
+            
+            // Submit the review
+            await github.rest.pulls.createReview({
+              owner, repo, pull_number,
+              event,
+              body: review_body,
+              comments: inlineComments
+            });
