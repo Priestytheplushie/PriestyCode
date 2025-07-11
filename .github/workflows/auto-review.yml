@@ -2,51 +2,16 @@ name: PriestyBot PR Review
 
 on:
   pull_request:
-    types: [review_requested]
+    types: [ review_requested ]
 
 permissions:
   contents: read
   pull-requests: write
   checks: write
-  security-events: write
 
 jobs:
-  security-scan:
-    if: github.event.requested_reviewer.login == 'PriestyBot'
-    runs-on: ubuntu-latest
-    steps:
-      - name: 🕵️‍♀️ Acknowledging Security Scan Start
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "I've also started the deep security scan with CodeQL! 🕵️‍♀️ This will run in the background. I'll post another update here as soon as it's done!" });
-
-      - name: ⬇️ Checking out the code
-        uses: actions/checkout@v4
-
-      - name: 🛡️ Initializing CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: 'python'
-
-      - name: 🔬 Performing CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-
-      - name: ✅ Announce Security Scan Completion
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const conclusion = "${{ job.status }}";
-            const body = (conclusion === 'success')
-              ? "Security scan complete! ✅ I didn't find any new vulnerabilities. Great job keeping our code safe!"
-              : "Security scan complete! ⚠️ I found some potential issues. Please check the 'Security' tab on the PR for the full details.";
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: body });
-
   code-review:
-    if: github.event.requested_reviewer.login == 'PriestyBot'
+    if: github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
       - name: 🤖 PriestyBot, Reporting for Duty!
@@ -54,72 +19,68 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 Thanks for having me. I'm starting the review process right now and will be back with updates soon! 🚀" });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done." });
 
-      - name: ⬇️ Checking out the code...
+      - name: 🚚 Getting the code...
         uses: actions/checkout@v4
 
-      - name: 🐍 Setting up Python 3.13
+      - name: 🐍 Setting up Python...
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: 📦 Caching and Installing Dependencies
+      - name: ⚡ Caching dependencies for speed...
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-      
-      - name: 💻 Installing Python Linters
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install mypy flake8 black isort
 
-      - name: 🐶 Setting up reviewdog
+      - name: 🛠️ Installing tools and linters...
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt && pip install mypy flake8 black isort
+
+      - name: 🐶 Summoning the reviewdog...
         uses: reviewdog/action-setup@v1
         with:
           reviewdog_version: latest
           
-      - name: 🎨 Reviewing Code Style (Linters)
+      - name: 🎨 Reviewing Code Style (and posting inline comments)...
         id: linting
-        continue-on-error: true # Keep workflow running
+        continue-on-error: true # Ensures workflow continues to the summary step
         env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This ensures PriestyBot posts the inline comments
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
+          LINTER_FAILED_ANY=false
           set -o pipefail
-          LINTING_FAILED=false
-          
-          echo "--- Running Linters ---"
-          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
-          if ! mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
-          if ! black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
-          if ! isort --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
-          
-          if [ "$LINTING_FAILED" = true ]; then
-            echo "LINTER_OVERALL_STATUS=FAILED" >> "$GITHUB_ENV"
+
+          # This logic posts comments directly AS IT FINDS THEM and reliably reports the overall status.
+          # The -reporter=github-pr-review is ESSENTIAL for inline comments.
+          if ! (flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
+          if ! (mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
+          if ! (black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
+          if ! (isort --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
+
+          if [ "$LINTER_FAILED_ANY" = true ]; then
+            echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
           else
-            echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
+            echo "overall_status=PASSED" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 🖥️ Installing Display Server for App Test
+      - name: 🖥️ Preparing the testing environment...
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
-      - name: 🧪 Time for the App Test!
+      - name: 🧪 Running the critical App Test...
         id: app_test
-        continue-on-error: true
         run: |
-          echo "Running the Tkinter App Test now! Fingers crossed! 🤞"
-          # App Test script remains the same...
           if xvfb-run timeout 10s python src/main.py; then
-            echo "App test PASSED: Exited cleanly before timeout."; echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV";
+            echo "status=PASSED" >> "$GITHUB_OUTPUT";
           else
             exit_code=$?; if [ $exit_code -eq 124 ]; then
-              echo "App test PASSED: Ran for 10s and was terminated as expected."; echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV";
+              echo "status=PASSED" >> "$GITHUB_OUTPUT";
             else
-              echo "App test FAILED: App crashed with exit code $exit_code."; echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV";
+              echo "status=FAILED" >> "$GITHUB_OUTPUT";
             fi
           fi
 
@@ -129,34 +90,32 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            // This script remains the same, but will now receive the CORRECT LINTER_OVERALL_STATUS
-            const app_status = "${{ env.APP_TEST_STATUS }}";
-            const app_reason = "${{ env.APP_TEST_REASON }}";
-            const linter_status = "${{ env.LINTER_OVERALL_STATUS }}";
-            const black_status = "${{ env.BLACK_STATUS }}"; // This is less relevant now, but harmless
-            const isort_status = "${{ env.ISORT_STATUS }}"; // This is less relevant now, but harmless
+            const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
+            const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
+            const pr_author = context.payload.pull_request.user.login;
             
-            const app_emoji = app_status === 'PASSED' ? '👍' : '👎';
-            const linter_emoji = linter_status === 'PASSED' ? '👍' : '👎';
+            const app_check = app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌';
+            const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot's Review Summary\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** ${app_emoji}\n  - _Reason: ${app_reason}_\n- **Linter Health:** ${linter_emoji}\n- **CodeQL Security Scan:** 🕵️‍♀️ Running in parallel. I'll post a separate comment when it's done.\n\n---\n\n`;
+            // Start the message by addressing the user!
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             if (app_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "🚨 **Okay team, let's huddle up!** 🚨\n\nThe most critical check, the **app test, has failed**. This is our top priority! Let's focus our amazing brainpower on fixing this. I have full faith we can solve it.\n\nI also left some notes on code style, but we can totally ignore those until the app test is green. ✅";
+              body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "⭐ **Fantastic news! The app test passed beautifully!** The application is solid! ⭐\n\nOn the code style front, I did find a few areas for improvement and left some advisory comments. Since these are just suggestions, this PR is very close!\n\nHere are your options:\n- **To automatically fix formatting**, just comment `/format` on this PR.\n- **To bypass my suggestions and approve**, just comment `/approve`.\n\nLet me know how you'd like to proceed! I'm requesting changes for now, but you have the power to override me."
-            } else { // Everything passed
+              body += `💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.\n\nRequesting changes due to linter issues. Please check the details in any inline comments I've left. Remember, you can use \`/approve\` to bypass them if needed.`
+            } else {
               review_event = 'APPROVE';
-              body += "🎉 **WE DID IT! EVERYTHING IS PERFECT!** 🎉\n\nThis is amazing! The code is clean, the app test passed with flying colors... this is a thing of beauty. I'm so proud of this work! I'm smashing that **Approve** button. Let's get this merged! 🥳";
+              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
             }
             
-            github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              body: body,
+            await github.rest.pulls.createReview({ 
+              owner: context.repo.owner, 
+              repo: context.repo.repo, 
+              pull_number: context.issue.number, 
+              body: body, 
               event: review_event,
             });
