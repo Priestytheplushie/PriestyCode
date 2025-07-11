@@ -63,19 +63,13 @@ jobs:
               body: `Just noticed you pushed new changes! Taking another look... 🧐`
             });
 
+      # THIS IS THE DEFINITIVE FIX.
+      # It fetches the full history and checks out the PR's branch correctly.
       - name: Check out repository
         uses: actions/checkout@v4
-        # We don't need any special parameters here anymore.
-
-      # THIS IS THE CRITICAL FIX
-      - name: Set up git context for reviewdog
-        run: |
-          echo "Fetching base branch ${{ github.event.pull_request.base.ref }}"
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          echo "Checking out PR HEAD commit ${{ github.event.pull_request.head.sha }}"
-          git checkout -f ${{ github.event.pull_request.head.sha }}
-          echo "Git log:"
-          git log -n 5 --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset'
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
