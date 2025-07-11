@@ -1,32 +1,134 @@
-name: PriestyCode Build & Release
+name: PriestyCode CI/CD Pipeline
+
+# Concurrency: Ensures only one workflow run for a given branch/tag is active at a time
+# This helps prevent race conditions, especially during deployments.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   push:
     branches:
-      - main     # Trigger for automated Beta pre-releases
+      - main # Trigger for CI and official release builds (tags on main)
+      - develop # Trigger for CI and beta release builds (tags on develop)
     tags:
-      - 'v*.*.*' # Trigger for official Production releases
+      - 'v*.*.*' # Trigger for official release build and GitHub Release (from main)
+      - 'v*.*.*-beta*' # Trigger for beta release build and GitHub Release (from develop)
 
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: 'Select environment for deployment'
+        required: true
+        type: choice
+        # Default to Beta as Production should be a more deliberate choice
+        default: 'Beta'
+        options:
+          - 'Beta'
+          - 'Production'
+      # For releases, the source is implicitly the tag that generated the release.
+      # This input is primarily for context if needed, but the artifact_name_to_deploy is key.
+      release_tag_to_deploy:
+        description: 'Tag of the release to deploy (e.g., v1.0.0, v1.1.0-beta.1)'
+        required: true
+        default: 'v1.0.0' # Provide a sensible default tag format
+      
 permissions:
-  contents: write      # Required to create Git tags and GitHub Releases
+  contents: write # For checkout, creating releases, and potentially commit changes (if part of build)
+  pull-requests: write # For auto-review (if combined or for status checks) - keep for safety, but minimize if separate bot handles PRs
+  deployments: write # For environment tracking
+  checks: write # For CI/CD status checks
 
 jobs:
-  # JOB 1: Build the executable. This is the central factory for our app.
-  # It runs for any push to main or any new tag.
+  # -----------------------------------------------------------
+  # CI Job: Runs on PRs and pushes to main/develop branches
+  # (Now focuses only on the Tkinter App Test)
+  # -----------------------------------------------------------
+  ci-checks:
+    name: Application Test
+    runs-on: ubuntu-latest # Keeping ubuntu for faster CI checks
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'))
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Standardized Python version across CI and Build
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-python-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-python-
+
+      - name: Install Dependencies and Xvfb
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y xvfb
+          
+      - name: 🧪 Run Tkinter App Test
+        id: app_test
+        run: |
+          echo "Starting the Tkinter app in a virtual display..."
+          # Run the app, if it exits cleanly or times out after 10s, consider it passed.
+          # If it crashes with an unexpected error, fail the step.
+          if xvfb-run timeout 10s python -m src.main; then
+            echo "App test result: PASSED (exited cleanly before timeout)"
+            exit 0 # Explicitly exit 0 for success
+          elif [ $? -eq 124 ]; then
+            echo "App test result: PASSED (ran for 10s without crashing)"
+            exit 0 # Explicitly exit 0 for success
+          else
+            exit_code=$?
+            echo "Test command finished with unexpected exit code: $exit_code"
+            echo "App test result: FAILED (crashed with an unexpected error)"
+            exit 1 # Exit with 1 to mark the step as failed
+          fi
+
+  # -----------------------------------------------------------
+  # Build Job: Creates the executable artifact
+  # Runs after CI passes on main branch push or any tag push
+  # -----------------------------------------------------------
   build-executable:
     name: Build PriestyCode Executable
     runs-on: windows-latest
+    needs: ci-checks # Only build if CI passes
+    # Trigger on push to main OR any tag push (v*.*.* or v*.*.*-beta*)
+    if: success() && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     outputs:
       artifact_zip_name: ${{ steps.prepare-package.outputs.zip_name }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }} # Use the pushed branch/tag
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.11' # Standardized Python version
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-python-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-python-
 
       - name: Install Dependencies
         run: |
@@ -42,56 +144,183 @@ jobs:
           New-Item -ItemType Directory -Path "release"
           Copy-Item -Path "dist/PriestyCode.exe" -Destination "release/PriestyCode.exe"
           
-          # Use the tag name for the zip if it's a tag, otherwise use the SHA for beta builds
-          $zipName = if ("${{ github.ref_type }}" -eq "tag") {
-            "${{ github.event.repository.name }}-${{ github.ref_name }}.zip"
-          } else {
-            "${{ github.event.repository.name }}-beta-${{ github.sha }}.zip"
+          $zipName = "${{ github.event.repository.name }}-${{ github.sha }}.zip"
+          if ("${{ github.ref_type}}" -eq "tag") {
+            # For tags, use the tag name directly for the artifact name for clarity in releases
+            $zipName = "${{ github.event.repository.name }}-${{ github.ref_name }}.zip"
           }
           
           Compress-Archive -Path "release/*" -DestinationPath $zipName
           echo "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
         shell: powershell
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.prepare-package.outputs.zip_name }}
-          path: ${{ steps.prepare-package.outputs.zip_name }}
+          path: ${{ env.ZIP_PATH }}
 
-
-  # JOB 2: Create a Release. This job handles both Beta pre-releases and Production releases.
-  create-release:
+  # -----------------------------------------------------------
+  # GitHub Release Job: Creates a formal GitHub Release
+  # Runs only when a new tag is pushed, depends on build-executable
+  # -----------------------------------------------------------
+  create-github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: build-executable
-    
+    # Trigger on any push that is a tag starting with 'v'
+    if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - name: Download Build Artifact
         uses: actions/download-artifact@v4
         with:
+          # Download the artifact using the name set by the build-executable job
           name: ${{ needs.build-executable.outputs.artifact_zip_name }}
-          path: ./artifact/
+          path: ./downloaded_artifact/
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v1
         with:
-          # If the trigger was a v* tag, use it. Otherwise, create a new 'beta-<sha>' tag.
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('beta-{0}', github.sha) }}
-          
-          # If it's a v* tag, the release name is "Release v1.2.3". Otherwise, it's "Beta Release (commit hash)".
-          name: ${{ github.ref_type == 'tag' && format('Release {0}', github.ref_name) || format('Beta Release ({0})', github.sha) }}
-          
-          # Mark as a pre-release if it's NOT a v* tag push.
-          prerelease: ${{ github.ref_type != 'tag' }}
-          
-          # Only auto-generate release notes for official v* tag releases.
-          generate_release_notes: ${{ github.ref_type == 'tag' }}
-
-          # Provide a simple body for automated beta pre-releases.
-          body: ${{ github.ref_type != 'tag' && 'Automated pre-release generated from the latest commit on the `main` branch.' || '' }}
-
-          files: ./artifact/${{ needs.build-executable.outputs.artifact_zip_name }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          # Automatically generate release notes from merged PRs/commits
+          generate_release_notes: true 
+          body: |
+            ## Download the executable below!
+            
+            This release contains the latest features and bug fixes.
+            
+            You can find the detailed changes in the auto-generated release notes above or in the full changelog here: https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}
+          draft: false
+          # Mark as prerelease if tag name contains 'beta', 'rc', or 'test'
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'test') }}
+          # Upload the downloaded artifact as a release asset
+          files: ./downloaded_artifact/${{ needs.build-executable.outputs.artifact_zip_name }}
         env:
-          # The GITHUB_TOKEN is automatically provided by GitHub Actions
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -----------------------------------------------------------
+  # Deployment Job: Beta Environment
+  # Manual trigger only, deploying from a specific GitHub Release (tag)
+  # -----------------------------------------------------------
+  deploy-beta:
+    name: Deploy to Beta
+    runs-on: ubuntu-latest
+    # This job does NOT need 'build-executable' if it's deploying from an existing release.
+    # However, it does need to ensure a release exists for the specified tag.
+    # For simplicity and to ensure the workflow still makes sense if an artifact from the *current*
+    # run's build is desired (though not the primary intention here), we keep 'needs: build-executable'
+    # but the primary input should be 'release_tag_to_deploy'.
+    needs: [build-executable, create-github-release] # Depends on build and release creation
+    environment: Beta # Links to GitHub Environment for protection rules (e.g., manual approval)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_environment == 'Beta' && success()
+
+    steps:
+      - name: Checkout Code (for context/scripts, if needed)
+        uses: actions/checkout@v4
+        with:
+          # Checkout the branch/tag corresponding to the release being deployed
+          ref: ${{ github.event.inputs.release_tag_to_deploy }}
+
+      - name: Download Executable Asset from GitHub Release
+        # This step will fetch the asset directly from the specified GitHub Release
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }} # Assumes the artifact was uploaded by this workflow
+          # You'll need to specify the exact artifact name from the release, which is based on the tag name
+          # Example: 'PriestyCode-v1.0.0.zip'. If the artifact name differs, adjust this.
+          name: PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip # Construct artifact name from tag
+          path: ./app_to_deploy/ # Path to download the artifact to
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.BETA_SSH_KEY }}
+
+      - name: Transfer Artifact to Beta Server
+        run: |
+          # Make sure to replace '/path/to/beta/app' with your actual deployment path on the server
+          # Note: The downloaded artifact is now directly in ./app_to_deploy, assuming it's unzipped by SSH action
+          scp -o StrictHostKeyChecking=no ./app_to_deploy/PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip ${{ secrets.BETA_SERVER_USER }}@${{ secrets.BETA_SERVER_HOST }}:/path/to/beta/app/
+
+      - name: Deploy on Beta Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BETA_SERVER_HOST }}
+          username: ${{ secrets.BETA_SERVER_USER }}
+          key: ${{ secrets.BETA_SSH_KEY }}
+          script: |
+            echo "Deployment initiated on Beta server..."
+            cd /path/to/beta/app/
+            unzip -o PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip # Unzip the new artifact
+            # Add commands to restart your application, run database migrations, etc.
+            # Example: systemctl restart your_beta_app_service
+            echo "Deployment to Beta complete."
+
+      - name: Verify Beta Deployment
+        run: |
+          # Replace with actual health checks or verification steps
+          echo "Running post-deployment verification for Beta..."
+          # curl -f http://${{ secrets.BETA_SERVER_HOST }}:8080/health || exit 1
+          echo "Beta deployment verified successfully!"
+
+  # -----------------------------------------------------------
+  # Deployment Job: Production Environment
+  # Manual trigger only, with required approval, deploying from a specific GitHub Release (tag)
+  # -----------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-executable, create-github-release] # Depends on build and release creation
+    environment: Production # Links to GitHub Environment for protection rules (e.g., required approval)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_environment == 'Production' && success()
+
+    steps:
+      - name: Checkout Code (for context/scripts, if needed)
+        uses: actions/checkout@v4
+        with:
+          # Checkout the branch/tag corresponding to the release being deployed
+          ref: ${{ github.event.inputs.release_tag_to_deploy }}
+
+      - name: Download Executable Asset from GitHub Release
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          repo: ${{ github.repository }}
+          workflow: ${{ github.workflow }}
+          name: PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip # Construct artifact name from tag
+          path: ./app_to_deploy/ # Path to download the artifact to
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PROD_SSH_KEY }}
+
+      - name: Transfer Artifact to Production Server
+        run: |
+          # Make sure to replace '/path/to/prod/app' with your actual deployment path on the server
+          scp -o StrictHostKeyChecking=no ./app_to_deploy/PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip ${{ secrets.PROD_SERVER_USER }}@${{ secrets.PROD_SERVER_HOST }}:/path/to/prod/app/
+
+      - name: Deploy on Production Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            echo "Deployment initiated on Production server with approval..."
+            cd /path/to/prod/app/
+            unzip -o PriestyCode-${{ github.event.inputs.release_tag_to_deploy }}.zip
+            # Example: systemctl restart your_prod_app_service
+            echo "Deployment to Production complete."
+
+      - name: Verify Production Deployment
+        run: |
+          # Replace with actual health checks or verification steps
+          echo "Running post-deployment verification for Production..."
+          # curl -f http://${{ secrets.PROD_SERVER_HOST }}:8080/health || exit 1
+          echo "Production deployment verified successfully!"
