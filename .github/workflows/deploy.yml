@@ -1,19 +1,23 @@
-name: Create Release and Deploy
+name: PriestyCode Build & Release
 
 on:
   push:
+    branches:
+      - main     # Trigger for automated Beta pre-releases
     tags:
-      - 'v*.*.*'
-      - 'v*.*'
+      - 'v*.*.*' # Trigger for official Production releases
 
 permissions:
-  contents: write
+  contents: write      # Required to create Git tags and GitHub Releases
 
 jobs:
-  build-and-release:
-    name: Build and Release Executable
-    environment: Production 
+  # JOB 1: Build the executable. This is the central factory for our app.
+  # It runs for any push to main or any new tag.
+  build-executable:
+    name: Build PriestyCode Executable
     runs-on: windows-latest
+    outputs:
+      artifact_zip_name: ${{ steps.prepare-package.outputs.zip_name }}
 
     steps:
       - name: Checkout Code
@@ -29,31 +33,65 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build the .exe using the .spec file
-        run: |
-          # We no longer need all the flags, we just point to our spec file.
-          pyinstaller main.spec
+      - name: Build the .exe using main.spec
+        run: pyinstaller main.spec
 
       - name: Prepare Release Package
+        id: prepare-package
         run: |
-          # Create a 'release' folder to hold everything for the zip.
           New-Item -ItemType Directory -Path "release"
-          
-          # Copy the final executable into the release folder.
           Copy-Item -Path "dist/PriestyCode.exe" -Destination "release/PriestyCode.exe"
           
-          # Optional: Copy other files like README or LICENSE into the release folder.
-          # if (Test-Path "README.md") { Copy-Item -Path "README.md" -Destination "release/README.md" }
-          # if (Test-Path "LICENSE") { Copy-Item -Path "LICENSE" -Destination "release/LICENSE" }
+          # Use the tag name for the zip if it's a tag, otherwise use the SHA for beta builds
+          $zipName = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.event.repository.name }}-${{ github.ref_name }}.zip"
+          } else {
+            "${{ github.event.repository.name }}-beta-${{ github.sha }}.zip"
+          }
           
-          # Create the final zip file from the contents of the 'release' folder.
-          $zipName = "${{ github.event.repository.name }}-${{ github.ref_name }}.zip"
           Compress-Archive -Path "release/*" -DestinationPath $zipName
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          echo "zip_name=$zipName" >> $env:GITHUB_OUTPUT
         shell: powershell
 
-      - name: Create GitHub Release and Upload Asset
-        run: |
-          gh release create "${{ github.ref_name }}" --generate-notes --title "${{ github.ref_name }}" "${{ env.ZIP_NAME }}"
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare-package.outputs.zip_name }}
+          path: ${{ steps.prepare-package.outputs.zip_name }}
+
+
+  # JOB 2: Create a Release. This job handles both Beta pre-releases and Production releases.
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-executable
+    
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-executable.outputs.artifact_zip_name }}
+          path: ./artifact/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          # If the trigger was a v* tag, use it. Otherwise, create a new 'beta-<sha>' tag.
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('beta-{0}', github.sha) }}
+          
+          # If it's a v* tag, the release name is "Release v1.2.3". Otherwise, it's "Beta Release (commit hash)".
+          name: ${{ github.ref_type == 'tag' && format('Release {0}', github.ref_name) || format('Beta Release ({0})', github.sha) }}
+          
+          # Mark as a pre-release if it's NOT a v* tag push.
+          prerelease: ${{ github.ref_type != 'tag' }}
+          
+          # Only auto-generate release notes for official v* tag releases.
+          generate_release_notes: ${{ github.ref_type == 'tag' }}
+
+          # Provide a simple body for automated beta pre-releases.
+          body: ${{ github.ref_type != 'tag' && 'Automated pre-release generated from the latest commit on the `main` branch.' || '' }}
+
+          files: ./artifact/${{ needs.build-executable.outputs.artifact_zip_name }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The GITHUB_TOKEN is automatically provided by GitHub Actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

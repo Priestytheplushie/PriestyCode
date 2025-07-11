@@ -5,157 +5,59 @@ on:
     types: [created]
 
 env:
+  # Using a PAT with repo scope to allow merging and pushing code
   APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+  # Standardized user info for bot commits
+  BOT_EMAIL: "priestybot@users.noreply.github.com"
+  BOT_NAME: "PriestyBot"
 
 permissions:
+  # Required to push formatted code
   contents: write
+  # Required to merge, approve, and comment on PRs
   pull-requests: write
+  # Required to add emoji reactions to comments for better UX
+  reactions: write
 
 jobs:
-  command-handler:
-    if: github.event.issue.pull_request && github.event.comment.user.login == github.event.issue.user.login
+  # JOB 1: Handles the /format command
+  format-code:
+    name: "Run /format Command"
+    # Only run if it's a PR comment containing /format from the PR author
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/format') && github.event.comment.user.login == github.event.issue.user.login
     runs-on: ubuntu-latest
     steps:
-      # --- Handler for /approve ---
-      - name: Handle /approve
-        if: |
-          startsWith(github.event.comment.body, '/approve') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'approve'))
+      - name: 💬 Acknowledge format request
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.APPROVER_TOKEN }}
           script: |
-            const comment_body = context.payload.comment.body;
-            let message = '';
-            if (comment_body.startsWith('/approve')) {
-              message = comment_body.replace(/^\/approve\s*/, '').trim();
-            } else {
-              message = comment_body.replace(/@PriestyBot/i, '').replace(/approve/i, '').trim();
-            }
-            const review_body = message || "Approved as requested. Looks good to me! ✅";
-            await github.rest.pulls.createReview({
+            await github.rest.reactions.createForIssueComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number,
-              event: 'APPROVE',
-              body: review_body
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
             });
-
-      # --- Handler for /comment ---
-      - name: Handle /comment
-        if: startsWith(github.event.comment.body, '/comment')
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.APPROVER_TOKEN }}
-          script: |
-            const message = context.payload.comment.body.replace('/comment', '').trim();
-            if (message) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: `A quick note from @${context.payload.sender.login}:\n\n> ${message}`
-              });
-            } else {
-              // CORRECTED: Using string concatenation to build the message safely
-              const errorMessage = "It looks like you wanted to leave a comment, but you forgot to write one! 😅\n\n" +
-                "Please try again. For example:\n" +
-                "> /comment I'll review this in an hour.";
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: errorMessage
-              });
-              core.setFailed("Command failed: /comment requires a message.");
-            }
-
-      # --- Handler for /request-changes ---
-      - name: Handle /request-changes
-        if: startsWith(github.event.comment.body, '/request-changes')
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.APPROVER_TOKEN }}
-          script: |
-            const message = context.payload.comment.body.replace('/request-changes', '').trim();
-            if (!message) {
-              // CORRECTED: Using string concatenation to build the message safely
-              const errorMessage = "Whoops! It looks like you tried to use `/request-changes` without giving me a reason. I need to know *what* needs to be changed! 🤔\n\n" +
-                "Please try again and tell me what to write in the review. For example:\n" +
-                "> /request-changes Please add documentation for the new functions.";
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: errorMessage
-              });
-              core.setFailed("Command failed: /request-changes requires a message.");
-              return;
-            }
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              event: 'REQUEST_CHANGES',
-              body: message
-            });
-
-      # --- Handler for /help ---
-      - name: Handle /help
-        if: |
-          startsWith(github.event.comment.body, '/help') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'help'))
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.APPROVER_TOKEN }}
-          script: |
-            // CORRECTED: Using string concatenation for safety here as well
-            const help_message = "Hello! I'm PriestyBot, your friendly neighborhood code reviewer. Here's what I can do for you:\n\n" +
-              "### Automatic Review\n" +
-              "When you request a review from me, I'll automatically:\n" +
-              "1.  **Run Linters**: I check your code for quality and style issues using `flake8` and `black`.\n" +
-              "2.  **Test The App**: I'll try to run your Tkinter app (`src/main.py`) to make sure it doesn't crash.\n" +
-              "3.  **Approve or Request Changes**: Based on the results, I'll either approve the PR or leave feedback.\n\n" +
-              "### Manual Commands (for PR authors only)\n" +
-              "You can also give me direct orders in a comment:\n\n" +
-              "-   `@PriestyBot help` or `/help`\n" +
-              "    > Shows this help message.\n\n" +
-              "-   `@PriestyBot approve [message]` or `/approve [message]`\n" +
-              "    > Forcefully approves the PR. You can add an optional message.\n" +
-              "    > *Example: `@PriestyBot please approve this, it is urgent`*\n\n" +
-              "-   `@PriestyBot format` or `/format`\n" +
-              "    > I'll format your code using `black` and commit the changes directly to this PR.\n\n" +
-              "-   `/comment <message>`\n" +
-              "    > I'll post your message as a general comment on the PR.\n\n" +
-              "-   `/request-changes <message>`\n" +
-              "    > Requests changes on the PR with your provided reason.";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: help_message
+              body: "On it! I'll format the code with `black` and `isort` and push the changes back to this branch. 🎨"
             });
 
-      # --- Steps for the /format command ---
-      - name: 💬 Acknowledging format request
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format'))
+      - name: Parse custom commit message
+        id: parse_message
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.APPROVER_TOKEN }}
+          result-encoding: string
           script: |
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "On it! I'll format the code with `black` and push the changes back to this branch. 🎨"
-            });
+            const message = context.payload.comment.body.replace('/format', '').trim();
+            if (message) {
+              return message;
+            }
+            return "chore(bot): Format code with black and isort";
 
       - name: Get PR branch name
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.comment.body, 'format'))
         id: get_branch
         uses: actions/github-script@v7
         with:
@@ -169,36 +71,164 @@ jobs:
             return pr.data.head.ref;
 
       - name: Checkout PR branch
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.body, 'format'))
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.get_branch.outputs.result }}
+          token: ${{ env.APPROVER_TOKEN }}
 
       - name: Set up Python
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.body, 'format'))
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: Install and run black
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.body, 'format'))
+      - name: Install and run formatters
         run: |
-          pip install black
+          pip install black isort
           black src
+          isort src
 
       - name: Commit and push changes
-        if: |
-          startsWith(github.event.comment.body, '/format') ||
-          (contains(github.event.comment.body, '@PriestyBot') && contains(github.event.body, 'format'))
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore(bot): Format code with black"
-          commit_user_name: PriestyBot
-          commit_user_email: priestybot@users.noreply.github.com
-          commit_author: PriestyBot <priestybot@users.noreply.github.com>
+          commit_message: ${{ steps.parse_message.outputs.result }}
+          commit_user_name: ${{ env.BOT_NAME }}
+          commit_user_email: ${{ env.BOT_EMAIL }}
+          commit_author: ${{ env.BOT_NAME }} <${{ env.BOT_EMAIL }}>
+
+  # JOB 2: Handles the /merge command
+  merge-pr:
+    name: "Run /merge Command"
+    # Only run if it's a PR comment containing /merge from a repo Member or Owner
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/merge') && (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Merge Script
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.APPROVER_TOKEN }}
+          script: |
+            const reason = context.payload.comment.body.replace('/merge', '').trim();
+            const pr_number = context.issue.number;
+
+            // Step 1: Get PR data to check its state
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr_number,
+            });
+
+            // Step 2: Safety Check for Mergeability
+            // The mergeable_state can take time to compute. We'll poll it briefly.
+            let current_pr = pr;
+            for (let i = 0; i < 5; i++) {
+              if (current_pr.mergeable_state !== 'unknown') break;
+              await new Promise(r => setTimeout(r, 2000)); // wait 2s
+              const { data: updated_pr } = await github.rest.pulls.get({ owner: context.repo.owner, repo: context.repo.repo, pull_number: pr_number });
+              current_pr = updated_pr;
+            }
+
+            if (current_pr.mergeable_state === 'dirty') {
+              const body = `I can't merge this, @${context.actor}. This branch has merge conflicts with the base branch. Please resolve them first.`;
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr_number, body });
+              return;
+            }
+
+            if (current_pr.mergeable_state === 'blocked') {
+              const body = `I can't merge this, @${context.actor}. Required status checks have not passed or a branch protection rule is blocking the merge.`;
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr_number, body });
+              return;
+            }
+
+            // Step 3: Perform the Merge
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr_number,
+                commit_title: `Merge PR #${pr_number}: ${pr.title} (squashed)`,
+                commit_message: `Squashed by @${context.actor} via PriestyBot.\n\nReason: ${reason || 'No reason provided.'}`,
+                merge_method: 'squash',
+              });
+              await github.rest.reactions.createForIssueComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: context.payload.comment.id, content: 'rocket' });
+            } catch (error) {
+              const body = `An error occurred while trying to merge: ${error.message}`;
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr_number, body });
+            }
+
+  # JOB 3: Handles all other commands (/help, /approve, etc.)
+  other-commands:
+    name: "Handle Other Commands"
+    # Run if it's a PR comment but NOT /format or /merge
+    if: github.event.issue.pull_request && !contains(github.event.comment.body, '/format') && !contains(github.event.comment.body, '/merge')
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Process Command: /help, /approve, /comment, /request-changes"
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.APPROVER_TOKEN }}
+          script: |
+            const comment_body = context.payload.comment.body;
+            const issue_number = context.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const pr_author = context.payload.issue.user.login;
+            const is_pr_author = commenter === pr_author;
+
+            // --- /help (available to anyone) ---
+            if (comment_body.startsWith('/help') || (comment_body.includes('@PriestyBot') && comment_body.includes('help'))) {
+              const help_message = "Hello! I'm PriestyBot, your friendly neighborhood code reviewer. Here's what I can do:\n\n" +
+                "### Automatic Review\n" +
+                "When you request a review from me on a PR, I'll automatically check your code for quality, style, types, and security issues.\n\n" +
+                "### Manual Commands\n" +
+                "- `@PriestyBot help` or `/help`\n" +
+                "  > Shows this help message.\n\n" +
+                "- `/format [commit message]` (PR author only)\n" +
+                "  > I'll format your code using `black` & `isort` and push the changes. You can provide an optional commit message.\n\n" +
+                "- `/merge [reason]` (Repo members/owners only)\n" +
+                "  > I'll merge the PR for you. You can provide an optional reason.\n\n" +
+                "- `/approve [message]` (PR author only)\n" +
+                "  > Approves the PR. You can add an optional message.\n\n" +
+                "- `/comment <message>` (PR author only)\n" +
+                "  > I'll post your message as a general comment on the PR.\n\n" +
+                "- `/request-changes <message>` (PR author only)\n" +
+                "  > Requests changes on the PR with your provided reason.";
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body: help_message });
+              return;
+            }
+
+            // --- Commands restricted to the PR Author ---
+            if (!is_pr_author) {
+              console.log(`Commenter '${commenter}' is not the PR author '${pr_author}'. Ignoring author-only commands.`);
+              return;
+            }
+
+            if (comment_body.startsWith('/approve') || (comment_body.includes('@PriestyBot') && comment_body.includes('approve'))) {
+              let message = '';
+              if (comment_body.startsWith('/approve')) {
+                message = comment_body.replace('/approve', '').trim();
+              } else {
+                message = comment_body.replace(/@PriestyBot/i, '').replace(/approve/i, '').trim();
+              }
+              const review_body = message || "Approved as requested by author. Looks good to me! ✅";
+              await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: issue_number, event: 'APPROVE', body: review_body });
+
+            } else if (comment_body.startsWith('/request-changes')) {
+              const message = comment_body.replace('/request-changes', '').trim();
+              if (!message) {
+                const error_message = "Whoops! `/request-changes` requires a reason. Please try again, for example:\n> /request-changes Please add documentation.";
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body: error_message });
+                core.setFailed("Command failed: /request-changes requires a message.");
+              } else {
+                await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: issue_number, event: 'REQUEST_CHANGES', body: message });
+              }
+
+            } else if (comment_body.startsWith('/comment')) {
+              const message = comment_body.replace('/comment', '').trim();
+              if (!message) {
+                const error_message = "It looks like you wanted to leave a comment, but you forgot to write one! 😅 Please try again.";
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body: error_message });
+                core.setFailed("Command failed: /comment requires a message.");
+              } else {
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number, body: `A quick note from @${commenter}:\n\n> ${message}` });
+              }
+            }

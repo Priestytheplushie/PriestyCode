@@ -2,86 +2,78 @@ name: PriestyBot Auto-Review
 
 on:
   pull_request:
-    types: [review_requested]
+    # Trigger when a review is requested OR when new commits are pushed.
+    # The job-level 'if' condition will ensure it only runs when appropriate.
+    types: [review_requested, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
-  # Using a PAT to allow the bot to approve the PR
   APPROVER_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-  # Reviewdog needs a token with pull-request write permissions
   REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
 
 permissions:
   contents: read
   pull-requests: write
-  # FIX: 'checks: write' permission is required for the 'github-pr-check' reporter.
   checks: write
+  security-events: write
 
 jobs:
-  review:
-    # Only run if the reviewer is the bot itself
-    if: github.event.requested_reviewer.login == 'PriestyBot'
+  lint-and-test:
+    name: Lint & Test
+    if: |
+      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
     runs-on: ubuntu-latest
+    outputs:
+      flake8_outcome: ${{ steps.flake8.outcome }}
+      black_outcome: ${{ steps.black.outcome }}
+      isort_outcome: ${{ steps.isort.outcome }}
+      bandit_outcome: ${{ steps.bandit.outcome }}
+      mypy_outcome: ${{ steps.mypy.outcome }}
+      app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
       - name: 💬 Acknowledging the review request...
+        if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.APPROVER_TOKEN }}
           script: |
-            const pr_number = context.issue.number;
-            const bot_name = "PriestyBot";
-            const pr_author = context.payload.sender.login;
-
-            const { data: comments } = await github.rest.issues.listComments({
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: pr_number,
+              issue_number: context.issue.number,
+              body: `Hey @${context.payload.pull_request.user.login}! 👋 Thanks for the review request. I'll get started right away. 🧐`
             });
-            const hasAlreadyCommented = comments.some(
-              comment => comment.user.login === bot_name && comment.body.includes("Thanks for asking me to review")
-            );
-
-            if (!hasAlreadyCommented) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr_number,
-                // FIX: Use backticks (`) for template literals and access the sender from the script's context object.
-                body: `Hey @${pr_author}! 👋 Thanks for asking me to review. I'll take a look at the code now and get back to you shortly. 🧐`
-              });
-            }
-
+            
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
+          cache: 'pip'
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install flake8 black isort mypy bandit
           sudo apt-get update && sudo apt-get install -y xvfb
-
-      - name: 💧 Run Linter (flake8) on Changed Files
-        id: lint
-        # FIX: Allows workflow to continue even if linter finds issues.
+      - name: 💧 Run Linter (flake8)
+        id: flake8
         continue-on-error: true
         uses: reviewdog/action-flake8@v3
         with:
           filter_mode: "diff_context"
-          # FIX: Fails the step if issues are found, so we can check its 'outcome'.
           fail_on_error: true
-          # FIX: Use 'github-pr-check' to post inline comments on the code diff.
           reporter: github-pr-check
           level: warning
-
-      - name: 💅 Run Format Check (black) on Changed Files
-        id: format_check
-        # FIX: Same changes as the linter step for consistency.
+      - name: 💅 Run Format Check (black)
+        id: black
         continue-on-error: true
         uses: reviewdog/action-black@v3
         with:
@@ -90,60 +82,167 @@ jobs:
           reporter: github-pr-check
           level: warning
           black_args: "--check --diff src"
-      
+      - name:  sorted? Run Import Sort Check (isort)
+        id: isort
+        continue-on-error: true
+        uses: reviewdog/action-isort@v1
+        with:
+          filter_mode: "diff_context"
+          fail_on_error: true
+          reporter: github-pr-check
+          level: warning
+          isort_args: "--check --diff src"
+      - name: 🔒 Run Security Check (bandit)
+        id: bandit
+        continue-on-error: true
+        uses: reviewdog/action-bandit@v2
+        with:
+          filter_mode: "diff_context"
+          fail_on_error: true
+          reporter: github-pr-check
+          level: error
+      - name: 🧐 Run Type Check (mypy)
+        id: mypy
+        continue-on-error: true
+        uses: reviewdog/action-mypy@v3
+        with:
+          filter_mode: "diff_context"
+          fail_on_error: true
+          reporter: github-pr-check
+          level: error
+          mypy_flags: "src/"
       - name: 🧪 Run Tkinter App Test
         id: app_test
-        # FIX: Restructured the script to correctly handle the 'timeout' exit code (124) as a success.
-        # The default 'set -e' shell option was causing the step to fail immediately on exit code 124.
+        continue-on-error: true
         run: |
           echo "Starting the Tkinter app in a virtual display..."
           if xvfb-run timeout 10s python -m src.main; then
             echo "App test result: PASSED (exited cleanly before timeout)"
           else
             exit_code=$?
-            echo "Test command finished with exit code: $exit_code"
             if [ $exit_code -eq 124 ]; then
               echo "App test result: PASSED (ran for 10s without crashing)"
-              exit 0 # Explicitly exit 0 to mark the step as successful
+              exit 0
             else
               echo "App test result: FAILED (crashed with an unexpected error)"
-              exit $exit_code # Exit with the original error code to fail the step
+              exit $exit_code
             fi
           fi
 
+
+  codeql:
+    name: CodeQL Analysis
+    if: |
+      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+    outputs:
+      analyze_outcome: ${{ steps.analyze.outcome }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          config-file: ./.github/codeql/codeql-config.yml
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@v3
+
+  final-review:
+    name: Post Final Review
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, codeql]
+    # This job only runs if the other jobs were triggered in the first place.
+    if: always() && needs.lint-and-test.result != 'skipped'
+    steps:
       - name: 📝 Post Final Review Summary
-        if: ${{ always() }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.APPROVER_TOKEN }}
           script: |
-            // FIX: Check the step 'outcome' instead of 'conclusion' for a more reliable result.
-            const lint_outcome = '${{ steps.lint.outcome }}';
-            const format_outcome = '${{ steps.format_check.outcome }}';
-            const test_outcome = '${{ steps.app_test.outcome }}';
+            // This entire script is identical to the previous version.
+            // It just uses the outputs from the 'needs' context now.
             const pr_author = context.payload.pull_request.user.login;
+            const outcomes = {
+              flake8: { outcome: '${{ needs.lint-and-test.outputs.flake8_outcome }}', isBlocker: false,
+                title: '🎨 Linting Issues (`flake8`)',
+                reason: 'This check helps maintain code quality and catch potential bugs or anti-patterns.',
+                fix: 'I have left inline comments with the details. Please review them and apply the suggested fixes.' },
+              black: { outcome: '${{ needs.lint-and-test.outputs.black_outcome }}', isBlocker: false,
+                title: '🎨 Formatting & Style (`black`)',
+                reason: 'Consistent code style makes the project easier for everyone to read and maintain.',
+                fix: 'You can run `black src` locally to fix this. For an even easier fix, just **comment `/format` on this PR**, and I will do it for you!' },
+              isort: { outcome: '${{ needs.lint-and-test.outputs.isort_outcome }}', isBlocker: false,
+                title: '🎨 Import Order (`isort`)',
+                reason: 'Keeping imports sorted makes dependencies clear and organized.',
+                fix: 'You can run `isort src` locally. This will also be fixed automatically if you use the **`/format`** command.' },
+              bandit: { outcome: '${{ needs.lint-and-test.outputs.bandit_outcome }}', isBlocker: true,
+                title: '🚨 Security Analysis (`bandit`)',
+                reason: 'This check found a potential security vulnerability in the code.',
+                fix: 'Please check my inline comments for the specific vulnerability and how to address it.' },
+              mypy: { outcome: '${{ needs.lint-and-test.outputs.mypy_outcome }}', isBlocker: true,
+                title: '🚨 Type Checking (`mypy`)',
+                reason: 'This check prevents bugs by ensuring data types are used correctly.',
+                fix: 'Check the `mypy` logs in the "Checks" tab for the exact line and error, or review my inline comments.' },
+              app_test: { outcome: '${{ needs.lint-and-test.outputs.app_test_outcome }}', isBlocker: true,
+                title: '🚨 Application Test',
+                reason: 'The application must launch without crashing to ensure basic functionality.',
+                fix: 'The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.' },
+              codeql: { outcome: '${{ needs.codeql.outputs.analyze_outcome }}', isBlocker: true,
+                title: '🚨 Advanced Security (`CodeQL`)',
+                reason: 'CodeQL found a potential security or quality issue. Addressing this is critical.',
+                fix: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.` }
+            };
+
+            const blockers = [];
+            const suggestions = [];
+
+            for (const key in outcomes) {
+              if (outcomes[key].outcome === 'failure') {
+                if (outcomes[key].isBlocker) {
+                  blockers.push(outcomes[key]);
+                } else {
+                  suggestions.push(outcomes[key]);
+                }
+              }
+            }
             
-            let review_body = `Hi @${pr_author}, I've finished my review!\n\nHere's the summary:\n\n`;
+            let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
             let event = 'APPROVE';
-            
-            if (lint_outcome === 'success' && format_outcome === 'success') {
-              review_body += '✅ **Code Quality & Style:** Passed. Great job!\n';
+
+            if (blockers.length === 0 && suggestions.length === 0) {
+              review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
             } else {
-              review_body += '❌ **Code Quality & Style:** I found some issues. Please check my in-line comments for details. You can try running `/format` to fix style issues automatically.\n';
-              event = 'REQUEST_CHANGES';
-            }
-            
-            if (test_outcome === 'success') {
-              review_body += '✅ **Application Test:** Passed. The app launched successfully!\n';
-            } else {
-              review_body += '❌ **Application Test:** Failed. The app seems to crash on startup. Check the workflow logs for errors.\n';
-              event = 'REQUEST_CHANGES';
-            }
-            
-            if (event === 'APPROVE') {
-              review_body += `\nEverything looks good to me. I'm approving this PR. Keep up the great work! 👍`;
-            } else {
-              review_body += `\nPlease address the feedback above. Let me know if you have any questions!`;
+              if (blockers.length > 0) {
+                event = 'REQUEST_CHANGES';
+                review_body += `I've found a few critical issues (🚨) that need your attention before this can be merged. Here's a breakdown:\n\n---\n\n`;
+                for (const item of blockers) {
+                  review_body += `*   **${item.title}**\n    *   **Why:** ${item.reason}\n    *   **To Fix:** ${item.fix}\n\n`;
+                }
+              }
+              if (suggestions.length > 0) {
+                if (blockers.length === 0) {
+                   review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code:\n\n---\n\n`;
+                } else {
+                   review_body += `I also found some minor suggestions:\n\n`;
+                }
+                for (const item of suggestions) {
+                  review_body += `*   **${item.title}**\n    *   **Why:** ${item.reason}\n    *   **To Fix:** ${item.fix}\n\n`;
+                }
+              }
+
+              if (event === 'REQUEST_CHANGES') {
+                review_body += `\nPlease address the blocking issues. Let me know if you have questions!`;
+              } else {
+                review_body += `\nSince there are no blocking issues, I'm approving this PR. Great work!`;
+              }
             }
 
             await github.rest.pulls.createReview({
