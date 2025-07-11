@@ -45,46 +45,54 @@ jobs:
         with:
           reviewdog_version: latest
           
-      - name: 🎨 Performing Hybrid Linting Review...
+      - name: 🎨 Performing Intelligent Linting Review...
         id: linting
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
-          # This robust script will NOT crash and WILL correctly report failures.
-          echo "flake8_status=PASSED" >> $GITHUB_OUTPUT
-          echo "black_status=PASSED" >> $GITHUB_OUTPUT
-          echo "isort_status=PASSED" >> $GITHUB_OUTPUT
-          echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
-          LINTER_FAILED_ANY=false
-
-          run_linter() {
-              local name="$1"; local cmd="$2"; local reviewdog_flags="$3"
-              echo "--- Running $name ---"
-              
-              # This structure is guaranteed to not crash the step.
-              lint_output=$($cmd 2>&1 || true)
-              exit_code=${PIPESTATUS[0]}
-              echo "-> $name finished with real exit code: $exit_code"
-              
-              if [ $exit_code -ne 0 ]; then
-                  echo "-> $name found issues. Reporting failure."
-                  LINTER_FAILED_ANY=true
-                  echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
-                  echo "$lint_output" > "${name}_report.txt"
-                  echo "$lint_output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
-              fi
-          }
-          run_linter "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
-          run_linter "black" "black --check --diff src" "-f=diff -f.diff.strip=1"
-          run_linter "isort" "isort --check --diff src" "-f=diff"
-          run_linter "mypy" "mypy src" "-f=mypy"
-
-          if [ "$LINTER_FAILED_ANY" = true ]; then
-            echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
-          else
-            echo "overall_status=PASSED" >> "$GITHUB_OUTPUT"
+          # Default all statuses to PASSED
+          PR_SPECIFIC_ISSUES=false
+          CODEBASE_WIDE_ISSUES=false
+          
+          # This robust logic now distinguishes between PR-specific and codebase-wide failures.
+          echo "--- [1/4] Running flake8 ---"
+          flake8_output=$(flake8 src 2>&1)
+          if [ $? -ne 0 ]; then
+            # We check if reviewdog would post any comments on the diff.
+            if ! echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -level=error -fail-on-error=true; then
+              PR_SPECIFIC_ISSUES=true
+            fi
+            # Always save the full report for the summary.
+            echo "$flake8_output" > flake8_report.txt
+            CODEBASE_WIDE_ISSUES=true
+          fi
+          
+          echo "--- [2/4] Running black ---"
+          black_output=$(black --check --diff src 2>&1)
+          if [ $? -ne 0 ]; then
+            if ! echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -level=error -fail-on-error=true; then
+              PR_SPECIFIC_ISSUES=true
+            fi
+            echo "$black_output" > black_report.txt
+            CODEBASE_WIDE_ISSUES=true
           fi
 
+          echo "--- [3/4] Running isort ---"
+          if ! isort_output=$(isort --check src 2>&1); then
+            CODEBASE_WIDE_ISSUES=true
+            echo "$isort_output" > isort_report.txt
+          fi
+
+          echo "--- [4/4] Running mypy ---"
+          if ! mypy_output=$(mypy src 2>&1); then
+            CODEBASE_WIDE_ISSUES=true
+            echo "$mypy_output" > mypy_report.txt
+          fi
+          
+          echo "pr_issues_found=$PR_SPECIFIC_ISSUES" >> "$GITHUB_OUTPUT"
+          echo "codebase_issues_found=$CODEBASE_WIDE_ISSUES" >> "$GITHUB_OUTPUT"
+          echo "Linting complete. Statuses: PR Issues - $PR_SPECIFIC_ISSUES, Codebase Issues - $CODEBASE_WIDE_ISSUES"
+          
       - name: 🖥️ Preparing the testing environment...
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
@@ -106,41 +114,38 @@ jobs:
             const fs = require('fs');
             const pr_author = context.payload.pull_request.user.login;
             const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
-            const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
-            const flake8_status = "${{ steps.linting.outputs.flake8_status }}";
-            const black_status = "${{ steps.linting.outputs.black_status }}";
-            const isort_status = "${{ steps.linting.outputs.isort_status }}";
-            const mypy_status = "${{ steps.linting.outputs.mypy_status }}";
-            
-            const app_check = app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌';
-            const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
+            const pr_issues = "${{ steps.linting.outputs.pr_issues_found }}" === "true";
+            const codebase_issues = "${{ steps.linting.outputs.codebase_issues_found }}" === "true";
 
-            let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+            let review_event = 'APPROVE'; // Default to Approve
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've finished my review. Here's what I found:\n\n- **Application Test:** ${app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌'}\n- **Linters:** ${!codebase_issues ? 'Looks good! ✨' : 'Found some areas for improvement 🔬'}\n\n`;
 
             function getReport(name) {
               if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
-              return 'No output captured (linter passed).';
+              return '';
             }
-
+            
             if (app_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
-            } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
+            } else if (pr_issues) {
+              // Rule A: Issues found on the PR's changed lines. This is a mandatory change request.
               review_event = 'REQUEST_CHANGES';
-              
-              // This is the new, clearer explanation for the developer.
-              body += "To help you focus, I've separated my findings into two groups:\n\n" +
-                      "🔹 **For this PR:** I've left inline comments for any issues found on the specific lines you've changed.\n" +
-                      "🔹 **Codebase-Wide:** For pre-existing issues found elsewhere in the project, I've included the full reports in the collapsible sections below. **You are not expected to fix these to get this PR approved.**\n\n---\n\n";
-              
-              if (flake8_status === 'FAILED') { body += `<details><summary><strong>flake8 found issues:</strong></summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n` }
-              if (black_status === 'FAILED') { body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`}
-              if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
-              if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
-
-              body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
+              body += "I found some issues on the lines you changed in this PR and left inline comments for you. Please address these to get the PR approved.\n\n"
+            } else if (codebase_issues) {
+              // Rule B: No issues on the PR lines, but issues exist elsewhere. This is informational.
+              review_event = 'COMMENT'; // Post a neutral comment, not a request/approval.
+              body += "Your changes look good! 👍 However, I did find some pre-existing issues in other parts of the codebase. You are not required to fix these, but I wanted to make you aware of them:\n\n"
+              const black_report = getReport('black');
+              const flake8_report = getReport('flake8');
+              const isort_report = getReport('isort');
+              const mypy_report = getReport('mypy');
+              if (flake8_report) { body += `<details><summary><strong>flake8 Report</strong></summary>\n\n\`\`\`\n${flake8_report}\n\`\`\`\n\n</details>\n`; }
+              if (black_report) { body += `<details><summary><strong>Black Report</strong></summary>\n\n\`\`\`diff\n${black_report}\n\`\`\`\n\n</details>\n`; }
+              if (isort_report) { body += `<details><summary><strong>isort Report</strong></summary>\n\n\`\`\`\n${isort_report}\n\`\`\`\n\n</details>\n`; }
+              if (mypy_report) { body += `<details><summary><strong>mypy Report</strong></summary>\n\n\`\`\`\n${mypy_report}\n\`\`\`\n\n</details>\n`; }
             } else {
+              // Rule C: App passed and no linter issues were found anywhere.
               review_event = 'APPROVE';
               body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
             }
