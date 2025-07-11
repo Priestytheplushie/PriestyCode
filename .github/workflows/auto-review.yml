@@ -5,7 +5,7 @@ name: PriestyBot PR Reviewer
 
 on:
   pull_request:
-    types: [review_requested, synchronize] # Trigger on review requests AND new commits
+    types: [review_requested] # Trigger ONLY on review requests
 
 permissions:
   contents: write
@@ -249,7 +249,7 @@ jobs:
               owner,
               repo,
               pull_number: pr_number,
-              body: body + final_message, # Combine summary and final message
+              body: body + final_message, // Combine summary and final message
               event: event_type,
             });
         # This step consolidates all results, generates a friendly summary,
