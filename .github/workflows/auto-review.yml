@@ -1,12 +1,9 @@
 name: PriestyBot Auto-Review & CodeQL
 
 on:
-  # FIXED: Add the required trigger for pushes to the main branch
   push:
     branches:
-      - main # Or your default branch name
-
-  # Keep the existing triggers for pull requests
+      - main
   pull_request:
     types: [review_requested, synchronize]
 
@@ -27,11 +24,9 @@ permissions:
 jobs:
   lint-and-test:
     name: Lint & Test
-    # FIXED: This job should only run on pull requests, not on pushes to main.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      # ... outputs ...
       flake8_outcome: ${{ steps.flake8.outcome }}
       black_outcome: ${{ steps.black.outcome }}
       isort_outcome: ${{ steps.isort.outcome }}
@@ -39,7 +34,6 @@ jobs:
       mypy_outcome: ${{ steps.mypy.outcome }}
       app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
-      # ... all linting and test steps remain the same ...
       - name: 💬 Acknowledging the review request...
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
@@ -64,11 +58,18 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
+      # FIXED: Correctly install reviewdog using its own action
+      - name: Set up reviewdog
+        uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install flake8 black isort mypy bandit reviewdog
+          # FIXED: Removed 'reviewdog' from pip install
+          pip install flake8 black isort mypy bandit
           sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: 💧 Run Linter (flake8)
@@ -91,7 +92,7 @@ jobs:
           reporter: github-pr-check
           level: warning
           black_args: "--check --diff src"
-
+      
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
@@ -130,7 +131,6 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
-    # This job should run for both push to main and for PRs
     runs-on: ubuntu-latest
     permissions:
       security-events: write
@@ -140,7 +140,6 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        # For PRs, check out the PR head. For pushes, check out the commit.
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
@@ -161,7 +160,6 @@ jobs:
     name: Post Final Review
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
-    # FIXED: Ensure this job ONLY runs for pull requests and not pushes to main.
     if: always() && github.event_name == 'pull_request'
     steps:
       - name: 📝 Post Final Review Summary
@@ -169,64 +167,39 @@ jobs:
         with:
           github-token: ${{ env.APPROVER_TOKEN }}
           script: |
-            # ... (the script for posting the review remains exactly the same) ...
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
             const codeqlJobResult = '${{ needs.codeql.result }}';
             let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
             let event = 'APPROVE';
 
-            // FIXED: Master check to see if the jobs themselves crashed.
             if (lintJobResult === 'failure' || codeqlJobResult === 'failure') {
               event = 'REQUEST_CHANGES';
-              review_body += '❌ **Workflow Error:** One of the main check jobs (`Lint & Test` or `CodeQL`) failed unexpectedly. This is usually due to a configuration issue in the workflow file itself, not a problem with your code.\n\n';
-              review_body += 'Please check the workflow logs in the "Checks" tab for the exact error message. I cannot approve this PR until the workflow runs successfully.';
-            
+              review_body += `❌ **Workflow Error:** One of the main check jobs ('Lint & Test' or 'CodeQL') failed unexpectedly. This is usually due to a configuration issue in the workflow file itself, not a problem with your code.\n\n`;
+              review_body += `Please check the workflow logs in the "Checks" tab for the exact error message. I cannot approve this PR until the workflow runs successfully.`;
             } else {
-              // This detailed analysis will now only run if the jobs completed.
               const outcomes = {
-                flake8: { outcome: '${{ needs.lint-and-test.outputs.flake8_outcome }}', isBlocker: false,
-                  title: '🎨 Linting Issues (`flake8`)',
-                  reason: 'This check helps maintain code quality and catch potential bugs or anti-patterns.',
-                  fix: 'I have left inline comments with the details. Please review them and apply the suggested fixes.' },
-                black: { outcome: '${{ needs.lint-and-test.outputs.black_outcome }}', isBlocker: false,
-                  title: '🎨 Formatting & Style (`black`)',
-                  reason: 'Consistent code style makes the project easier for everyone to read and maintain.',
-                  fix: 'You can run `black src` locally to fix this. For an even easier fix, just **comment `/format` on this PR**, and I will do it for you!' },
-                isort: { outcome: '${{ needs.lint-and-test.outputs.isort_outcome }}', isBlocker: false,
-                  title: '🎨 Import Order (`isort`)',
-                  reason: 'Keeping imports sorted makes dependencies clear and organized.',
-                  fix: 'You can run `isort src` locally. This will also be fixed automatically if you use the **`/format`** command.' },
-                bandit: { outcome: '${{ needs.lint-and-test.outputs.bandit_outcome }}', isBlocker: true,
-                  title: '🚨 Security Analysis (`bandit`)',
-                  reason: 'This check found a potential security vulnerability in the code.',
-                  fix: 'Please check my inline comments for the specific vulnerability and how to address it.' },
-                mypy: { outcome: '${{ needs.lint-and-test.outputs.mypy_outcome }}', isBlocker: true,
-                  title: '🚨 Type Checking (`mypy`)',
-                  reason: 'This check prevents bugs by ensuring data types are used correctly.',
-                  fix: 'Check the `mypy` logs in the "Checks" tab for the exact line and error, or review my inline comments.' },
-                app_test: { outcome: '${{ needs.lint-and-test.outputs.app_test_outcome }}', isBlocker: true,
-                  title: '🚨 Application Test',
-                  reason: 'The application must launch without crashing to ensure basic functionality.',
-                  fix: 'The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.' },
-                codeql: { outcome: '${{ needs.codeql.outputs.analyze_outcome }}', isBlocker: true,
-                  title: '🚨 Advanced Security (`CodeQL`)',
-                  reason: 'CodeQL found a potential security or quality issue. Addressing this is critical.',
-                  fix: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.` }
+                flake8: { outcome: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
+                black: { outcome: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
+                isort: { outcome: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
+                bandit: { outcome: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
+                mypy: { outcome: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
+                app_test: { outcome: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
+                codeql: { outcome: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
               };
               
-              const blockers = [];
-              const suggestions = [];
+              const fix_guides = {
+                  flake8: `I have left inline comments with the details. Please review them and apply the suggested fixes.`,
+                  black: `You can run \`black src\` locally to fix this. For an even easier fix, just **comment \`/format\` on this PR**, and I will do it for you!`,
+                  isort: `You can run \`isort src\` locally. This will also be fixed automatically if you use the **\`/format\`** command.`,
+                  bandit: `Please check my inline comments for the specific vulnerability and how to address it.`,
+                  mypy: `Check the \`mypy\` logs in the "Checks" tab for the exact line and error, or review my inline comments.`,
+                  app_test: `The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.`,
+                  codeql: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.`
+              };
 
-              for (const key in outcomes) {
-                if (outcomes[key].outcome === 'failure') {
-                  if (outcomes[key].isBlocker) {
-                    blockers.push(outcomes[key]);
-                  } else {
-                    suggestions.push(outcomes[key]);
-                  }
-                }
-              }
+              const blockers = Object.keys(outcomes).filter(key => outcomes[key].isBlocker && outcomes[key].outcome === 'failure');
+              const suggestions = Object.keys(outcomes).filter(key => !outcomes[key].isBlocker && outcomes[key].outcome === 'failure');
 
               if (blockers.length === 0 && suggestions.length === 0) {
                 review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
@@ -234,18 +207,18 @@ jobs:
                 if (blockers.length > 0) {
                   event = 'REQUEST_CHANGES';
                   review_body += `I've found a few critical issues (🚨) that need your attention before this can be merged. Here's a breakdown:\n\n---\n\n`;
-                  for (const item of blockers) {
-                    review_body += `*   **${item.title}**\n    *   **Why:** ${item.reason}\n    *   **To Fix:** ${item.fix}\n\n`;
+                  for (const key of blockers) {
+                    review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`;
                   }
                 }
                 if (suggestions.length > 0) {
                   if (blockers.length === 0) {
-                    review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code:\n\n---\n\n`;
+                     review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code:\n\n---\n\n`;
                   } else {
-                    review_body += `I also found some minor suggestions:\n\n`;
+                     review_body += `I also found some minor suggestions:\n\n`;
                   }
-                  for (const item of suggestions) {
-                    review_body += `*   **${item.title}**\n    *   **Why:** ${item.reason}\n    *   **To Fix:** ${item.fix}\n\n`;
+                  for (const key of suggestions) {
+                    review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`;
                   }
                 }
 
