@@ -19,7 +19,7 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done." });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done. Wish me luck! 🚀" });
 
       - name: 🚚 Getting the code...
         uses: actions/checkout@v4
@@ -45,39 +45,38 @@ jobs:
         with:
           reviewdog_version: latest
           
-      - name: 🎨 Reviewing Code Style (and posting inline comments)...
+      - name: 🎨 Performing Hybrid Linting Review...
         id: linting
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
-          # This robust script captures raw output and posts inline comments.
+          # Default all statuses to PASSED
+          echo "flake8_status=PASSED" >> $GITHUB_OUTPUT
+          echo "black_status=PASSED" >> $GITHUB_OUTPUT
+          echo "isort_status=PASSED" >> $GITHUB_OUTPUT
+          echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
-          run_linter() {
-            local name="$1"
-            local cmd="$2"
-            local reporter_flags="$3"
-            
-            # Run the command, capture its output and exit code
-            output=$(eval "$cmd" 2>&1)
-            exit_code=$?
-            
-            # Post inline comments for reviewdog
-            echo "$output" | reviewdog -name="$name" -reporter=github-pr-review $reporter_flags
+          set -o pipefail
+          
+          # --- Group 1: Inline Comment Linters ---
+          # These post comments directly on the PR for immediate feedback.
+          echo "--- Running flake8 and black for inline comments ---"
+          flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review || (LINTER_FAILED_ANY=true && echo "flake8_status=FAILED" >> $GITHUB_OUTPUT)
+          black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review || (LINTER_FAILED_ANY=true && echo "black_status=FAILED" >> $GITHUB_OUTPUT)
 
-            # If the linter failed, save its output and mark it as failed.
-            if [ $exit_code -ne 0 ]; then
+          # --- Group 2: Summary Report Linters ---
+          # These run on the whole codebase and their raw output is captured for the summary.
+          echo "--- Running isort and mypy for summary reports ---"
+          if ! isort --check src > isort_report.txt 2>&1; then
               LINTER_FAILED_ANY=true
-              echo "$output" > "${name}_report.txt"
-              echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
-            else
-              echo "${name}_status=PASSED" >> $GITHUB_OUTPUT
-            fi
-          }
-          run_linter "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
-          run_linter "mypy" "mypy src" "-f=mypy"
-          run_linter "black" "black --check --diff src" "-f=diff"
-          run_linter "isort" "isort --check --diff src" "-f=diff"
-
+              echo "isort_status=FAILED" >> $GITHUB_OUTPUT
+          fi
+          if ! mypy src > mypy_report.txt 2>&1; then
+              LINTER_FAILED_ANY=true
+              echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
+          fi
+          
+          # Report the final overall status
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
           else
@@ -100,7 +99,7 @@ jobs:
             fi
           fi
 
-      - name: 📝 Final Review and Team Huddle!
+      - name: 📝 Final, Intelligent Review and Team Huddle!
         if: always()
         uses: actions/github-script@v7
         with:
@@ -108,23 +107,20 @@ jobs:
           script: |
             const fs = require('fs');
             const pr_author = context.payload.pull_request.user.login;
-
             const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
             const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
-            const black_status = "${{ steps.linting.outputs.black_status || 'FAILED' }}";
-            const isort_status = "${{ steps.linting.outputs.isort_status || 'FAILED' }}";
+            const isort_status = "${{ steps.linting.outputs.isort_status }}";
+            const mypy_status = "${{ steps.linting.outputs.mypy_status }}";
             
             const app_check = app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌';
             const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             function getReport(name) {
-              if (fs.existsSync(`${name}_report.txt`)) {
-                return fs.readFileSync(`${name}_report.txt`, 'utf8');
-              }
-              return '';
+              if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
+              return 'No output captured.';
             }
 
             if (app_status === 'FAILED') {
@@ -132,16 +128,13 @@ jobs:
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
+              body += "I've left some inline comments for `flake8` and `black` on the relevant lines in this PR. For the other linters, here are their full reports:\n\n";
 
-              // Add raw linter output to the summary for clarity.
-              if (black_status === 'FAILED') {
-                body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`
-              }
-              if (isort_status === 'FAILED') {
-                body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n`
-              }
+              // Only show the summary reports for the ones that actually failed.
+              if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues across the codebase:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
+              if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues across the codebase:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
 
-              body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.\n\nRequesting changes due to linter issues. Please check the details above and any inline comments I've left. Remember, you can use \`/approve\` to bypass them if needed.`
+              body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
             } else {
               review_event = 'APPROVE';
               body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
