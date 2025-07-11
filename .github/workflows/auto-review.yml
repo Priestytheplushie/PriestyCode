@@ -1,5 +1,5 @@
+# .github/workflows/priestybot.yml
 # This workflow defines PriestyBot, a GitHub Action that automatically reviews Python pull requests.
-# It posts inline comments for linter issues and a final summary review (Approve/Request Changes).
 
 name: PriestyBot PR Reviewer
 
@@ -8,9 +8,8 @@ on:
     types: [review_requested] # Trigger ONLY on review requests
 
 permissions:
-  contents: write      # For checking out code
+  contents: write
   pull-requests: write # Required for creating reviews and comments
-  checks: write        # Required for reviewdog to post inline annotations (check runs)
 
 jobs:
   review:
@@ -19,6 +18,8 @@ jobs:
     steps:
       - name: 🛑 Cancel Previous Runs
         uses: styfle/cancel-workflow-action@0.12.1
+        # This action cancels any in-progress or queued workflow runs for the same PR.
+        # This ensures only the latest commit's review is active, preventing stale reviews.
 
       - name: 🤖 Checkout Code
         uses: actions/checkout@v4
@@ -28,225 +29,204 @@ jobs:
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
-
-      - name: 📦 Cache Python Dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-python-${{ hashFiles('**/requirements.txt', '**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-python-
+          python-version: '3.13' # Specify the Python version for the environment
 
       - name: 📦 Install Python Dependencies
         run: |
+          # Upgrade pip to ensure the latest package manager
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Install all required linters
           pip install bandit mypy flake8 black isort
+          # Install other project dependencies if a requirements.txt file exists
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        # This step ensures all necessary tools and project dependencies are available.
 
       - name: 🐶 Install Reviewdog
         uses: reviewdog/action-setup@v1
         with:
           reviewdog_version: latest
+        # Sets up reviewdog, which is crucial for posting inline comments.
 
       - name: 📊 Configure Git
         run: |
+          # Configure Git user for any potential operations (though not directly used for commits here)
           git config user.name "PriestyBot"
           git config user.email "priestybot@users.noreply.github.com"
 
-      - name: 👋 Say Hello and Start Review
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const pr_number = context.issue.number;
-            github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: pr_number,
-              body: "👋 Hello there! PriestyBot here, ready to review your pull request. I'm just getting started by checking for any previous review instructions or approvals. Please bear with me while I go through your amazing code! 😊"
-            });
-
-      - name: 🏃‍♂️ Run Linters and Post Inline Comments with Reviewdog
-        id: linters_run
+      - name: 🔍 Check for Stop Command or Prior Clean Approval
+        id: stop_check # ID for referencing outputs from this step
         env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.APPROVER_TOKEN }} # Use the PAT for GitHub API calls
         run: |
-          # Initialize flags for each linter's failure status
-          BANDIT_FAILED=false
-          MYPY_FAILED=false
-          FLAKE8_FAILED=false
-          BLACK_FAILED=false
-          ISORT_FAILED=false
+          STOP_COMMAND="@PriestyBot stop"
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${{ github.event.repository.name }}
 
-          set -o pipefail # Ensure pipe failures are caught
+          echo "Checking for explicit stop command in PR comments..."
+          # Fetch comments on the pull request issue
+          PR_COMMENTS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/issues/$PR_NUMBER/comments")
+          
+          # Check if the stop command exists in any comment
+          if echo "$PR_COMMENTS" | grep -q "$STOP_COMMAND"; then
+            echo "stop_review=true" >> $GITHUB_OUTPUT
+            echo "Stop command found. Halting review process."
+            exit 0 # Exit early if stop command is found
+          fi
+
+          echo "Checking for prior clean approval from PriestyBot..."
+          # Fetch all reviews for the pull request
+          PR_REVIEWS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUMBER/reviews")
+
+          # Define the approval message string
+          APPROVAL_MESSAGE="Everything looks great! I'm approving this pull request."
+
+          # Use jq to filter reviews by PriestyBot, check for 'APPROVED' state,
+          # and look for the specific approval message indicating a clean run.
+          # Pass the approval message as an argument to jq to avoid quoting issues.
+          if echo "$PR_REVIEWS" | jq -e --arg msg "$APPROVAL_MESSAGE" '.[] | select(.user.login == "PriestyBot" and .state == "APPROVED" and .body | contains($msg))' > /dev/null; then
+            echo "stop_review=true" >> $GITHUB_OUTPUT
+            echo "Prior clean approval by PriestyBot found. Halting review process."
+            exit 0 # Exit early if clean approval is found
+          fi
+
+          # If neither condition is met, set stop_review to false to continue the workflow
+          echo "stop_review=false" >> $GITHUB_OUTPUT
+        # This step determines if the bot should proceed with the review based on user commands
+        # or if it has already successfully approved the PR without issues.
+
+      - name: 🏃‍♂️ Run Linters with Reviewdog
+        id: linters_run # ID for referencing outputs from this step
+        if: steps.stop_check.outputs.stop_review != 'true' # Only run if not stopped
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }} # Token for reviewdog API calls
+        run: |
+          # Initialize a flag to track if any linter failed
+          LINTER_FAILED=false
 
           echo "Running Bandit (Security Linter)..."
-          # Using -filter-mode=nofilter to show ALL issues found, not just those on changed lines.
-          if ! bandit -r . -f json | tee bandit_raw_output.txt | reviewdog -f=rdjson -name="Bandit (Security)" -reporter=github-pr-check -level=warning -filter-mode=nofilter; then
-            BANDIT_FAILED=true
-          fi
+          # Run Bandit and pipe its JSON output to reviewdog.
+          # '|| true' prevents the step from failing immediately, allowing us to capture overall status.
+          bandit -r . -f json | reviewdog -f=rdjson -name="Bandit (Security)" -reporter=github-pr-review || LINTER_FAILED=true
 
           echo "Running MyPy (Type Checker)..."
-          if ! mypy . --ignore-missing-imports | reviewdog -f=mypy -name="MyPy (Types)" -reporter=github-pr-check -level=warning -filter-mode=nofilter; then
-            MYPY_FAILED=true
-          fi
+          # Run MyPy and pipe its output to reviewdog.
+          mypy . --ignore-missing-imports | reviewdog -f=mypy -name="MyPy (Types)" -reporter=github-pr-review || LINTER_FAILED=true
 
           echo "Running Flake8..."
-          if ! flake8 . | reviewdog -f=flake8 -name="Flake8" -reporter=github-pr-check -level=warning -filter-mode=nofilter; then
-            FLAKE8_FAILED=true
-          fi
+          # Run Flake8 and pipe its output to reviewdog.
+          flake8 . | reviewdog -f=flake8 -name="Flake8" -reporter=github-pr-review || LINTER_FAILED=true
 
           echo "Running Black (Code Formatter Check)..."
-          if ! black --check --diff . 2> black_results.txt | reviewdog -f=diff -f.diff.strip=1 -name="Black (Formatter)" -reporter=github-pr-check -filter-mode=nofilter; then
-            BLACK_FAILED=true
+          # Run Black in check-only mode. Capture its output.
+          # If Black finds issues, its output will be non-empty.
+          black_output=$(black --check . 2>&1 || true)
+          if [ -n "$black_output" ]; then
+            echo "$black_output" > black_results.txt # Save output to file for later use
+            LINTER_FAILED=true
+            echo "Black found formatting issues."
           else
-            > black_results.txt # Clear file on success
+            echo "" > black_results.txt # Ensure file is empty if no issues
+            echo "Black found no formatting issues. ✨"
           fi
 
           echo "Running isort (Import Sorter Check)..."
-          if ! isort --check-only --diff . 2> isort_results.txt | reviewdog -f=diff -f.diff.strip=1 -name="isort (Import Sorter)" -reporter=github-pr-check -filter-mode=nofilter; then
-            ISORT_FAILED=true
+          # Run isort in check-only mode. Capture its output.
+          # If isort finds issues, its output will be non-empty.
+          isort_output=$(isort --check-only . 2>&1 || true)
+          if [ -n "$isort_output" ]; then
+            echo "$isort_output" > isort_results.txt # Save output to file for later use
+            LINTER_FAILED=true
+            echo "isort found import sorting issues."
           else
-            > isort_results.txt # Clear file on success
+            echo "" > isort_results.txt # Ensure file is empty if no issues
+            echo "isort found no import sorting issues. ✨"
           fi
 
-          # Set output variables for each linter's status
-          echo "bandit_failed=$BANDIT_FAILED" >> $GITHUB_OUTPUT
-          echo "mypy_failed=$MYPY_FAILED" >> $GITHUB_OUTPUT
-          echo "flake8_failed=$FLAKE8_FAILED" >> $GITHUB_OUTPUT
-          echo "black_failed=$BLACK_FAILED" >> $GITHUB_OUTPUT
-          echo "isort_failed=$ISORT_FAILED" >> $GITHUB_OUTPUT
-
-          if $BANDIT_FAILED || $MYPY_FAILED || $FLAKE8_FAILED || $BLACK_FAILED || $ISORT_FAILED; then
-            echo "linter_failed=true" >> $GITHUB_OUTPUT
-          else
-            echo "linter_failed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 💬 Post Linter Status
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const pr_number = context.issue.number;
-            const bandit_failed = "${{ steps.linters_run.outputs.bandit_failed }}" === "true";
-            const mypy_failed = "${{ steps.linters_run.outputs.mypy_failed }}" === "true";
-            const flake8_failed = "${{ steps.linters_run.outputs.flake8_failed }}" === "true";
-            const black_failed = "${{ steps.linters_run.outputs.black_failed }}" === "true";
-            const isort_failed = "${{ steps.linters_run.outputs.isort_failed }}" === "true";
-            const linter_failed_overall = "${{ steps.linters_run.outputs.linter_failed }}" === "true";
-
-            let message = "Alright, I've finished my initial linter checks! Here's a quick peek at how each one performed:\n\n";
-            message += `* **Bandit (Security):** ${bandit_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            message += `* **MyPy (Types):** ${mypy_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            message += `* **Flake8:** ${flake8_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            message += `* **Black (Code Formatter):** ${black_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            message += `* **isort (Import Sorter):** ${isort_failed ? 'Failed ❌' : 'Passed ✅'}\n\n`;
-
-            if (linter_failed_overall) {
-              message += "I've posted some inline comments where I found specific issues. Remember, these are suggestions to help keep your code super clean! Next up, I'll run the application tests. Stay tuned! 🚀";
-            } else {
-              message += "Great news! All linters passed with flying colors! Your code is looking good so far. Now, let's see how the application tests perform! 🚀";
-            }
-
-            github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: pr_number,
-              body: message
-            });
+          # Set an output variable indicating if any linter failed
+          echo "linter_failed=$LINTER_FAILED" >> $GITHUB_OUTPUT
+        # This step runs all specified linters and uses reviewdog for inline comments.
+        # It also captures the overall linter status for the review generation step.
 
       - name: 🧪 Run Tkinter App Test
-        id: app_test
-        continue-on-error: true
+        id: app_test # ID for referencing outputs from this step
+        if: steps.stop_check.outputs.stop_review != 'true' # Only run if not stopped
+        continue-on-error: true # Allow the workflow to continue even if the app test fails
         run: |
           echo "Installing xvfb for Tkinter app test..."
+          # Install xvfb for running GUI applications in a headless environment
           sudo apt-get update && sudo apt-get install -y xvfb
+
           echo "Running Tkinter App Test..."
+          # Execute the Tkinter application test
           if xvfb-run timeout 10s python -m src.main; then
             echo "App test PASSED: Exited cleanly before timeout."
-            echo "status=success" >> $GITHUB_OUTPUT
+            echo "status=success" >> $GITHUB_OUTPUT # Set output status for success
             exit 0
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
               echo "App test PASSED: Ran for 10s and was terminated as expected."
-              echo "status=success" >> $GITHUB_OUTPUT
+              echo "status=success" >> $GITHUB_OUTPUT # Set output status for success (expected timeout)
               exit 0
             else
               echo "App test FAILED: App crashed with exit code $exit_code."
-              echo "status=failure" >> $GITHUB_OUTPUT
+              echo "status=failure" >> $GITHUB_OUTPUT # Set output status for failure
               exit 1
             fi
           fi
+        # This step runs your specific Tkinter application test and reports its success or failure.
 
-      - name: 💬 Post App Test Status
+      - name: 📝 Generate and Post Review
+        if: steps.stop_check.outputs.stop_review != 'true' # Only run if not stopped
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const pr_number = context.issue.number;
-            const app_test_status = "${{ steps.app_test.outputs.status }}";
-            let message;
-
-            if (app_test_status === 'success') {
-              message = "Fantastic news! The application tests passed successfully! 🎉 Your app seems to be running just as expected. I'm now compiling my final review based on all the checks.";
-            } else {
-              message = "Oh no! It looks like the application tests encountered an issue. 💔 This is a critical step, so I'll need to request changes. I'm preparing my full review now with all the details.";
-            }
-
-            github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: pr_number,
-              body: message
-            });
-
-      - name: 📝 Generate and Post Final Summary Review
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: ${{ secrets.APPROVER_TOKEN }} # Use the PAT for GitHub API interactions
           script: |
             const { owner, repo } = context.repo;
             const pr_number = context.issue.number;
             const app_test_status = "${{ steps.app_test.outputs.status }}";
             const linter_failed_overall = "${{ steps.linters_run.outputs.linter_failed }}" === "true";
-            const bandit_failed = "${{ steps.linters_run.outputs.bandit_failed }}" === "true";
-            const mypy_failed = "${{ steps.linters_run.outputs.mypy_failed }}" === "true";
-            const flake8_failed = "${{ steps.linters_run.outputs.flake8_failed }}" === "true";
-            const black_failed = "${{ steps.linters_run.outputs.black_failed }}" === "true";
-            const isort_failed = "${{ steps.linters_run.outputs.isort_failed }}" === "true";
             const fs = require('fs');
 
-            let bandit_output = fs.readFileSync('bandit_raw_output.txt', 'utf8').trim().replace(/`/g, '\\`');
+            // Read output from black and isort checks
+            let black_output = fs.readFileSync('black_results.txt', 'utf8').trim();
+            let isort_output = fs.readFileSync('isort_results.txt', 'utf8').trim();
+
+            let linter_summary_details = [];
+            let needs_format_recommendation = false;
+
+            // Add Black and isort output to summary details if issues were found
+            if (black_output) {
+              linter_summary_details.push(`**Black (Code Formatter):**\n\`\`\`\n${black_output}\n\`\`\``);
+              needs_format_recommendation = true;
+            } else {
+              linter_summary_details.push(`**Black (Code Formatter):** Passed ✅`);
+            }
+            
+            if (isort_output) {
+              linter_summary_details.push(`**isort (Import Sorter):**\n\`\`\`\n${isort_output}\n\`\`\``);
+              needs_format_recommendation = true;
+            } else {
+              linter_summary_details.push(`**isort (Import Sorter):** Passed ✅`);
+            }
 
             // Construct the main review body
-            let body = `### PriestyBot Final Review Summary\n\nHello again! Here's the complete summary of my review on your Python code:\n\n`;
+            let body = `### PriestyBot Review Summary\n\nHello there! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n`;
             body += `* **Application Test:** ${app_test_status === 'success' ? 'Passed ✅' : 'Failed ❌'}\n`;
-            body += `\n**Detailed Linter Results:**\n`;
-            body += `* **Bandit (Security):** ${bandit_failed ? 'Failed ❌ (Critical!)' : 'Passed ✅'}\n`;
-            body += `* **MyPy (Types):** ${mypy_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            body += `* **Flake8:** ${flake8_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            body += `* **Black (Code Formatter):** ${black_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
-            body += `* **isort (Import Sorter):** ${isort_failed ? 'Failed ❌' : 'Passed ✅'}\n`;
 
             if (linter_failed_overall) {
-              body += `\n\nI found some issues during the review. **Please check the inline comments I've left directly on the code in the 'Files changed' tab for specific details.**\n`;
-
-              if (bandit_failed) {
-                body += `\nFor reference, here is the full security report from Bandit:\n\`\`\`json\n${bandit_output}\n\`\`\`\n`;
-              }
+              body += `* **Linters:** Found some areas for improvement 🔍\n\n`;
+              body += linter_summary_details.join('\n\n'); // Join linter details
               
-              if (black_failed || isort_failed) {
-                  body += `\n💡 **Pro-Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR. It's super handy!`;
+              if (needs_format_recommendation) {
+                  body += `\n\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.`;
               }
-              body += `\n\nRemember, these linter suggestions are advisory. If you've reviewed them and believe they are not applicable, or if you wish to proceed anyway, you can always use the \`/approve\` command. Your decision is final!`;
+              body += `\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`;
             } else {
-                body += `\n\nAll linters passed! 🎉 Your code looks sparkling clean and follows our style guidelines beautifully!`;
+              body += `* **Linters:** All passed! 🎉 Your code looks sparkling clean!\n`;
             }
 
             let event_type;
@@ -255,16 +235,16 @@ jobs:
             // Determine the review event type and final message based on results
             if (app_test_status === 'failure') {
               event_type = 'REQUEST_CHANGES';
-              final_message = "\n\n**Decision: Requesting Changes**\n\nUnfortunately, I have to request changes because the application tests failed. This is a critical issue that needs to be addressed. Please fix the issues and push your changes so I can review again. I'm here to help if you get stuck! 😊";
+              final_message = "\n\nI have to request changes because the application tests failed. Please fix the issues and push your changes so I can review again.";
             } else if (linter_failed_overall) {
               event_type = 'REQUEST_CHANGES';
-              final_message = "\n\n**Decision: Requesting Changes**\n\nBased on the linter findings, I'm requesting changes. Please review the details above and any inline comments. Remember, linters are advisory, and you can use `/approve` to bypass them if needed. Let's get this code polished! ✨";
+              final_message = "\n\nRequesting changes due to linter issues. Please check the details above and any inline comments. Remember, linters are advisory, and you can use `/approve` to bypass them if needed.";
             } else {
               event_type = 'APPROVE';
-              final_message = "\n\n**Decision: Approved!**\n\nEverything looks absolutely fantastic! Both the application tests and all linters passed with flying colors. Great job! 👍 Your code is ready to merge! Keep up the amazing work! 🥳";
+              final_message = "\n\nEverything looks great! I'm approving this pull request. Great job! 👍 Your code is ready to merge!";
             }
 
-            // Post the final review
+            // Post the review
             github.rest.pulls.createReview({
               owner,
               repo,
@@ -272,3 +252,5 @@ jobs:
               body: body + final_message, // Combine summary and final message
               event: event_type,
             });
+        # This step consolidates all results, generates a friendly summary,
+        # and posts the appropriate review (APPROVE or REQUEST_CHANGES) to the PR.
