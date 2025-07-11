@@ -20,15 +20,9 @@ jobs:
       - name: 🕵️‍♀️ Acknowledging Security Scan Start
         uses: actions/github-script@v7
         with:
-          # --- Use APPROVER_TOKEN for this comment ---
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "I've also started the deep security scan with CodeQL! 🕵️‍♀️ This will run in the background and report its findings separately. I'll continue with the rest of the review now!"
-            });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "I've also started the deep security scan with CodeQL! 🕵️‍♀️ This will run in the background. I'll post another update here as soon as it's done!" });
 
       - name: ⬇️ Checking out the code
         uses: actions/checkout@v4
@@ -41,6 +35,18 @@ jobs:
       - name: 🔬 Performing CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
+      - name: ✅ Announce Security Scan Completion
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.APPROVER_TOKEN }}
+          script: |
+            const conclusion = "${{ job.status }}";
+            const body = (conclusion === 'success')
+              ? "Security scan complete! ✅ I didn't find any new vulnerabilities. Great job keeping our code safe!"
+              : "Security scan complete! ⚠️ I found some potential issues. Please check the 'Security' tab on the PR for the full details.";
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: body });
+
   # Job 2: Run linting, testing, and provide the final summary review
   code-review:
     if: github.event.requested_reviewer.login == 'PriestyBot'
@@ -49,15 +55,9 @@ jobs:
       - name: 🤖 PriestyBot, Reporting for Duty!
         uses: actions/github-script@v7
         with:
-          # --- Use APPROVER_TOKEN for this comment ---
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "PriestyBot, reporting for duty! 🫡 Thanks for having me. I'm starting the review process right now and will be back with updates soon! 🚀"
-            });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 Thanks for having me. I'm starting the review process right now and will be back with updates soon! 🚀" });
 
       - name: ⬇️ Checking out the code...
         uses: actions/checkout@v4
@@ -86,31 +86,35 @@ jobs:
         with:
           reviewdog_version: latest
           
-      - name: 🎨 Reviewing Code Style (Linters)
+      - name: 🎨 Reviewing Code Style (Linting All Files)
         id: linting
         continue-on-error: true
         env:
-          # Inline comments use the default GITHUB_TOKEN, which is standard practice for check annotations
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # This ensures that if any command in a pipe fails, the pipe's exit code is that command's exit code.
+          set -o pipefail
+          
           FLAKE8_STATUS=PASSED; BLACK_STATUS=PASSED; ISORT_STATUS=PASSED; MYPY_STATUS=PASSED
-          echo "--- Running flake8 ---"
-          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8 (advisory)" -reporter=github-pr-review; then FLAKE8_STATUS=FAILED; fi
-          echo "--- Running black ---"
-          if ! black --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="black (advisory)" -reporter=github-pr-review; then BLACK_STATUS=FAILED; fi
-          echo "--- Running isort ---"
-          if ! isort --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="isort (advisory)" -reporter=github-pr-review; then ISORT_STATUS=FAILED; fi
-          echo "--- Running mypy ---"
-          if ! mypy src | reviewdog -f=mypy -name="mypy (advisory)" -reporter=github-pr-review; then MYPY_STATUS=FAILED; fi
+          
+          # These linters naturally check all specified files
+          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -filter-mode=nofilter; then FLAKE8_STATUS=FAILED; fi
+          if ! mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -filter-mode=nofilter; then MYPY_STATUS=FAILED; fi
+          
+          # For formatters, we check the whole directory. If that fails, we re-run with --diff to get parsable output for reviewdog.
+          if ! black --check src; then
+            BLACK_STATUS=FAILED
+            black --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -filter-mode=nofilter
+          fi
+          if ! isort --check src; then
+            ISORT_STATUS=FAILED
+            isort --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -filter-mode=nofilter
+          fi
 
-          echo "FLAKE8_STATUS=$FLAKE8_STATUS" >> "$GITHUB_ENV"
-          echo "BLACK_STATUS=$BLACK_STATUS" >> "$GITHUB_ENV"
-          echo "ISORT_STATUS=$ISORT_STATUS" >> "$GITHUB_ENV"
-          echo "MYPY_STATUS=$MYPY_STATUS" >> "$GITHUB_ENV"
+          echo "FLAKE8_STATUS=$FLAKE8_STATUS" >> "$GITHUB_ENV"; echo "BLACK_STATUS=$BLACK_STATUS" >> "$GITHUB_ENV"; echo "ISORT_STATUS=$ISORT_STATUS" >> "$GITHUB_ENV"; echo "MYPY_STATUS=$MYPY_STATUS" >> "$GITHUB_ENV"
           
           if [[ "$FLAKE8_STATUS" == "FAILED" || "$BLACK_STATUS" == "FAILED" || "$ISORT_STATUS" == "FAILED" || "$MYPY_STATUS" == "FAILED" ]]; then
               echo "LINTER_OVERALL_STATUS=FAILED" >> "$GITHUB_ENV"
-              exit 1
           else
               echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
           fi
@@ -125,16 +129,15 @@ jobs:
           echo "Running the Tkinter App Test now! This is the exciting part. Fingers crossed! 🤞"
           if xvfb-run timeout 10s python src/main.py; then
             echo "App test PASSED: Exited cleanly before timeout."
-            echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV"; echo "status=success" >> $GITHUB_OUTPUT;
+            echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV";
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
               echo "App test PASSED: Ran for 10s and was terminated as expected."
-              echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV"; echo "status=success" >> $GITHUB_OUTPUT;
+              echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV";
             else
               echo "App test FAILED: App crashed with exit code $exit_code."
-              echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV"; echo "status=failure" >> $GITHUB_OUTPUT;
-              exit 1
+              echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV";
             fi
           fi
 
@@ -142,7 +145,6 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         with:
-          # --- Use APPROVER_TOKEN for the final review ---
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             const app_status = "${{ env.APP_TEST_STATUS }}";
@@ -150,9 +152,12 @@ jobs:
             const linter_status = "${{ env.LINTER_OVERALL_STATUS }}";
             const black_status = "${{ env.BLACK_STATUS }}";
             const isort_status = "${{ env.ISORT_STATUS }}";
+            
+            const app_emoji = app_status === 'PASSED' ? '👍' : '👎';
+            const linter_emoji = linter_status === 'PASSED' ? '👍' : '👎';
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot's Review Summary 🤖\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** **${app_status}**\n  - _Reason: ${app_reason}_\n- **Linter Health:** **${linter_status}**\n- **CodeQL Security Scan:** 🕵️‍♀️ Running in parallel. Results will appear under the 'Security' tab.\n\n---\n\n`;
+            let body = `### PriestyBot's Review Summary\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** ${app_emoji}\n  - _Reason: ${app_reason}_\n- **Linter Health:** ${linter_emoji}\n- **CodeQL Security Scan:** 🕵️‍♀️ Running in parallel. I'll post a separate comment when it's done.\n\n---\n\n`;
 
             if (app_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
@@ -164,7 +169,7 @@ jobs:
                 body += "- **To automatically fix formatting**, just comment `/format` on this PR.\n";
               }
               body += "- **To bypass my suggestions and approve**, just comment `/approve`.\n\nLet me know how you'd like to proceed! I'm requesting changes for now, but you have the power to override me."
-            } else { // Everything passed
+            } else {
               review_event = 'APPROVE';
               body += "🎉 **WE DID IT! EVERYTHING IS PERFECT!** 🎉\n\nThis is amazing! The code is clean, the app test passed with flying colors... this is a thing of beauty. I'm so proud of this work! I'm smashing that **Approve** button. Let's get this merged! 🥳";
             }
