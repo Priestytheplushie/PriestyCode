@@ -50,39 +50,48 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
-          # This robust script will NOT crash if a linter finds issues.
+          # This robust script will NOT crash and WILL correctly report failures.
           echo "flake8_status=PASSED" >> $GITHUB_OUTPUT
           echo "black_status=PASSED" >> $GITHUB_OUTPUT
           echo "isort_status=PASSED" >> $GITHUB_OUTPUT
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
-          set -o pipefail # Important for capturing the correct exit code from piped commands
+          
+          # This 'if ! command' structure is the canonical way to handle errors without crashing the step.
+          echo "--- [1/4] Running flake8 for inline comments ---"
+          if ! flake8_output=$(flake8 src 2>&1); then
+            echo "-> flake8 found issues."
+            LINTER_FAILED_ANY=true
+            echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
+            echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
+            echo "$flake8_output" > flake8_report.txt
+          fi
 
-          run_linter() {
-              local name="$1"; local cmd="$2"; local reviewdog_flags="$3"
-              echo "--- Running $name ---"
-              
-              # The `|| true` at the end of the line ensures the step NEVER crashes.
-              output=$(eval "$cmd" 2>&1 || true)
-              # PIPESTATUS[0] holds the REAL exit code of the linter, ignoring the `|| true`.
-              exit_code=${PIPESTATUS[0]}
-              echo "-> $name finished with real exit code: $exit_code"
-              
-              if [ $exit_code -ne 0 ]; then
-                  echo "-> $name found issues. Reporting failure."
-                  LINTER_FAILED_ANY=true
-                  echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
-                  echo "$output" > "${name}_report.txt"
-                  
-                  # Also attempt to post inline comments.
-                  echo "$output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
-              fi
-          }
-          run_linter "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
-          run_linter "black" "black --check --diff src" "-f=diff -f.diff.strip=1"
-          run_linter "isort" "isort --check --diff src" "-f=diff"
-          run_linter "mypy" "mypy src" "-f=mypy"
+          echo "--- [2/4] Running black for inline comments ---"
+          if ! black_output=$(black --check --diff src 2>&1); then
+            echo "-> black found formatting issues."
+            LINTER_FAILED_ANY=true
+            echo "black_status=FAILED" >> $GITHUB_OUTPUT
+            echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
+            echo "$black_output" > black_report.txt
+          fi
+          
+          echo "--- [3/4] Running isort for summary report ---"
+          if ! isort_output=$(isort --check src 2>&1); then
+              echo "-> isort found import sorting issues. Saving report."
+              LINTER_FAILED_ANY=true
+              echo "isort_status=FAILED" >> $GITHUB_OUTPUT
+              echo "$isort_output" > isort_report.txt
+          fi
 
+          echo "--- [4/4] Running mypy for summary report ---"
+          if ! mypy_output=$(mypy src 2>&1); then
+              echo "-> mypy found type checking issues. Saving report."
+              LINTER_FAILED_ANY=true
+              echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
+              echo "$mypy_output" > mypy_report.txt
+          fi
+          
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
             echo "Linting complete: Found one or more issues."
@@ -134,7 +143,7 @@ jobs:
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "I tried to leave inline comments for any issues on lines you've changed. For a complete picture, here are the full reports from all linters that found issues:\n\n";
+              body += "I tried to leave inline comments for any issues on lines you've changed. For a complete picture of all findings, here are the full reports from all linters that found issues:\n\n";
               
               if (flake8_status === 'FAILED') { body += `<details><summary><strong>flake8 found issues:</strong></summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n` }
               if (black_status === 'FAILED') { body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`}
