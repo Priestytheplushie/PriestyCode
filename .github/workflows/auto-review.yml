@@ -62,11 +62,13 @@ jobs:
               issue_number: context.issue.number,
               body: `Just noticed you pushed new changes! Taking another look... 🧐`
             });
+
+      # FIXED CHECKOUT STEP
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0 # IMPORTANT: Fetches full history for reviewdog's diff filter
+          fetch-depth: 0 # Fetches full history for reviewdog's diff filter
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -135,7 +137,6 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
-    # ... (This job remains unchanged) ...
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
@@ -164,7 +165,6 @@ jobs:
 
   final-review:
     name: Post Final Review
-    # ... (This job remains unchanged) ...
     if: always() && needs.lint-and-test.result != 'skipped'
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
@@ -183,7 +183,6 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             
-            // Part 1: Gather all inline comments from the downloaded rdjson files.
             const comments = [];
             const reportDir = './linter-reports';
             try {
@@ -209,7 +208,6 @@ jobs:
               console.log("Could not process linter reports, likely none were generated:", error.message);
             }
 
-            // Part 2: Build the review body and determine the final event type.
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
             const codeqlJobResult = '${{ needs.codeql.result }}';
@@ -265,7 +263,6 @@ jobs:
                  is_perfect = true;
             }
 
-            // Part 3: Post the single review with summary body and all inline comments.
             if (comments.length > 0 || event === 'REQUEST_CHANGES' || is_perfect) {
               await github.rest.pulls.createReview({
                 owner: context.repo.owner,
@@ -277,7 +274,6 @@ jobs:
               });
             }
             
-            // Part 4: Clean up the label if the PR was perfect.
             if (is_perfect) {
               try {
                 await github.rest.issues.removeLabel({
