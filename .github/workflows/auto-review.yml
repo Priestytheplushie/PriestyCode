@@ -1,3 +1,32 @@
+=name: CodeQL Baseline Security Scan
+
+on:
+  push:
+    branches: [ main ] # Change to `master` if that's your default branch
+
+permissions:
+  security-events: write
+
+jobs:
+  codeql-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3```
+
+***
+
+### **2. The Definitive PR Review Workflow: `.github/workflows/review-bot.yml`**
+
+*(The only change is in the final `github-script` step, which is now much smarter.)*
+
+```yaml
 name: PriestyBot PR Review
 
 on:
@@ -50,7 +79,6 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
-          # Default all statuses to PASSED
           echo "flake8_status=PASSED" >> $GITHUB_OUTPUT
           echo "black_status=PASSED" >> $GITHUB_OUTPUT
           echo "isort_status=PASSED" >> $GITHUB_OUTPUT
@@ -58,30 +86,15 @@ jobs:
           LINTER_FAILED_ANY=false
           set -o pipefail
           
-          # --- Group 1: Inline Comment Linters ---
-          # These post comments directly on the PR for immediate feedback.
           echo "--- Running flake8 and black for inline comments ---"
-          flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review || (LINTER_FAILED_ANY=true && echo "flake8_status=FAILED" >> $GITHUB_OUTPUT)
-          black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review || (LINTER_FAILED_ANY=true && echo "black_status=FAILED" >> $GITHUB_OUTPUT)
+          if ! (flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review); then LINTER_FAILED_ANY=true; echo "flake8_status=FAILED" >> $GITHUB_OUTPUT; fi
+          if ! (black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review); then LINTER_FAILED_ANY=true; echo "black_status=FAILED" >> $GITHUB_OUTPUT; fi
 
-          # --- Group 2: Summary Report Linters ---
-          # These run on the whole codebase and their raw output is captured for the summary.
           echo "--- Running isort and mypy for summary reports ---"
-          if ! isort --check src > isort_report.txt 2>&1; then
-              LINTER_FAILED_ANY=true
-              echo "isort_status=FAILED" >> $GITHUB_OUTPUT
-          fi
-          if ! mypy src > mypy_report.txt 2>&1; then
-              LINTER_FAILED_ANY=true
-              echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
-          fi
+          if ! isort --check src > isort_report.txt 2>&1; then LINTER_FAILED_ANY=true; echo "isort_status=FAILED" >> $GITHUB_OUTPUT; fi
+          if ! mypy src > mypy_report.txt 2>&1; then LINTER_FAILED_ANY=true; echo "mypy_status=FAILED" >> $GITHUB_OUTPUT; fi
           
-          # Report the final overall status
-          if [ "$LINTER_FAILED_ANY" = true ]; then
-            echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
-          else
-            echo "overall_status=PASSED" >> "$GITHUB_OUTPUT"
-          fi
+          if [ "$LINTER_FAILED_ANY" = true ]; then echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"; else echo "overall_status=PASSED" >> "$GITHUB_OUTPUT"; fi
 
       - name: 🖥️ Preparing the testing environment...
         run: sudo apt-get update && sudo apt-get install -y xvfb
@@ -89,14 +102,10 @@ jobs:
       - name: 🧪 Running the critical App Test...
         id: app_test
         run: |
-          if xvfb-run timeout 10s python src/main.py; then
-            echo "status=PASSED" >> "$GITHUB_OUTPUT";
+          if xvfb-run timeout 10s python src/main.py; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
           else
-            exit_code=$?; if [ $exit_code -eq 124 ]; then
-              echo "status=PASSED" >> "$GITHUB_OUTPUT";
-            else
-              echo "status=FAILED" >> "$GITHUB_OUTPUT";
-            fi
+            exit_code=$?; if [ $exit_code -eq 124 ]; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
+            else echo "status=FAILED" >> "$GITHUB_OUTPUT"; fi
           fi
 
       - name: 📝 Final, Intelligent Review and Team Huddle!
@@ -109,6 +118,8 @@ jobs:
             const pr_author = context.payload.pull_request.user.login;
             const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
             const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
+            const flake8_status = "${{ steps.linting.outputs.flake8_status }}";
+            const black_status = "${{ steps.linting.outputs.black_status }}";
             const isort_status = "${{ steps.linting.outputs.isort_status }}";
             const mypy_status = "${{ steps.linting.outputs.mypy_status }}";
             
@@ -128,11 +139,18 @@ jobs:
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "I've left some inline comments for `flake8` and `black` on the relevant lines in this PR. For the other linters, here are their full reports:\n\n";
 
-              // Only show the summary reports for the ones that actually failed.
-              if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues across the codebase:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
-              if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues across the codebase:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
+              const inline_failed = (flake8_status === 'FAILED' || black_status === 'FAILED');
+              const summary_failed = (isort_status === 'FAILED' || mypy_status === 'FAILED');
+
+              if (inline_failed) {
+                body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n";
+              }
+              if (summary_failed) {
+                body += "For our codebase-wide checks, I've found some issues and included the full reports below:\n\n";
+                if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
+                if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
+              }
 
               body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
             } else {
@@ -140,10 +158,4 @@ jobs:
               body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
             }
             
-            await github.rest.pulls.createReview({ 
-              owner: context.repo.owner, 
-              repo: context.repo.repo, 
-              pull_number: context.issue.number, 
-              body: body, 
-              event: review_event,
-            });
+            await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, body: body, event: review_event });
