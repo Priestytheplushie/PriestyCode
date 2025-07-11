@@ -47,20 +47,36 @@ jobs:
           
       - name: 🎨 Reviewing Code Style (and posting inline comments)...
         id: linting
-        continue-on-error: true # Ensures workflow continues to the summary step
         env:
-          # This ensures PriestyBot posts the inline comments
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
+          # This robust script captures raw output and posts inline comments.
           LINTER_FAILED_ANY=false
-          set -o pipefail
+          run_linter() {
+            local name="$1"
+            local cmd="$2"
+            local reporter_flags="$3"
+            
+            # Run the command, capture its output and exit code
+            output=$(eval "$cmd" 2>&1)
+            exit_code=$?
+            
+            # Post inline comments for reviewdog
+            echo "$output" | reviewdog -name="$name" -reporter=github-pr-review $reporter_flags
 
-          # This logic posts comments directly AS IT FINDS THEM and reliably reports the overall status.
-          # The -reporter=github-pr-review is ESSENTIAL for inline comments.
-          if ! (flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
-          if ! (mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
-          if ! (black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
-          if ! (isort --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -fail-on-error=true); then LINTER_FAILED_ANY=true; fi
+            # If the linter failed, save its output and mark it as failed.
+            if [ $exit_code -ne 0 ]; then
+              LINTER_FAILED_ANY=true
+              echo "$output" > "${name}_report.txt"
+              echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
+            else
+              echo "${name}_status=PASSED" >> $GITHUB_OUTPUT
+            fi
+          }
+          run_linter "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
+          run_linter "mypy" "mypy src" "-f=mypy"
+          run_linter "black" "black --check --diff src" "-f=diff"
+          run_linter "isort" "isort --check --diff src" "-f=diff"
 
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
@@ -90,23 +106,42 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            const fs = require('fs');
+            const pr_author = context.payload.pull_request.user.login;
+
             const app_status = "${{ steps.app_test.outputs.status || 'FAILED' }}";
             const linter_status = "${{ steps.linting.outputs.overall_status || 'FAILED' }}";
-            const pr_author = context.payload.pull_request.user.login;
+            const black_status = "${{ steps.linting.outputs.black_status || 'FAILED' }}";
+            const isort_status = "${{ steps.linting.outputs.isort_status || 'FAILED' }}";
             
             const app_check = app_status === 'PASSED' ? 'Passed ✅' : 'Failed ❌';
             const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
 
             let review_event = 'REQUEST_CHANGES';
-            // Start the message by addressing the user!
-            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+
+            function getReport(name) {
+              if (fs.existsSync(`${name}_report.txt`)) {
+                return fs.readFileSync(`${name}_report.txt`, 'utf8');
+              }
+              return '';
+            }
 
             if (app_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += `💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.\n\nRequesting changes due to linter issues. Please check the details in any inline comments I've left. Remember, you can use \`/approve\` to bypass them if needed.`
+
+              // Add raw linter output to the summary for clarity.
+              if (black_status === 'FAILED') {
+                body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`
+              }
+              if (isort_status === 'FAILED') {
+                body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n`
+              }
+
+              body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.\n\nRequesting changes due to linter issues. Please check the details above and any inline comments I've left. Remember, you can use \`/approve\` to bypass them if needed.`
             } else {
               review_event = 'APPROVE';
               body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
