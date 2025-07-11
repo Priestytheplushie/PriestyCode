@@ -30,7 +30,7 @@ jobs:
       isort_outcome: ${{ steps.isort.conclusion }}
       bandit_outcome: ${{ steps.bandit.conclusion }}
       mypy_outcome: ${{ steps.mypy.conclusion }}
-      app_test_outcome: ${{ steps.app_test.conclusion }}
+      app_test_outcome: ${{ steps.app_test.conclusion }} # This will be success/failure of the step
     steps:
       - name: Add 'priestybot-review' Label
         if: github.event.action == 'review_requested'
@@ -126,7 +126,9 @@ jobs:
         run: |
           bandit -r src -f json > bandit_raw_output.json || true
           if [ -s bandit_raw_output.json ]; then
-            cat bandit_raw_output.json | reviewdog -f=rdjson -name="bandit" -reporter=rdjson -filter-mode=nofilter > linter-reports/bandit.rdjson
+            # reviewdog -f=json is the correct parser for generic JSON.
+            # Make sure to handle potential empty files or JSON parsing errors.
+            cat bandit_raw_output.json | reviewdog -f=json -name="bandit" -reporter=rdjson -filter-mode=nofilter > linter-reports/bandit.rdjson
           else
             echo "{ \"diagnostics\": [] }" > linter-reports/bandit.rdjson
           fi
@@ -144,20 +146,25 @@ jobs:
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
-        continue-on-error: true
+        continue-on-error: true # Crucial to set this to true so the final-review job always runs
         run: |
           echo "Starting the Tkinter app in a virtual display..."
+          # xvfb-run executes command in a virtual display.
+          # timeout 10s runs the command for a max of 10 seconds.
+          # If python exits with 0 (cleanly), the 'if' block runs.
+          # If it times out (exit code 124) or crashes (other non-zero), the 'else' block runs.
           if xvfb-run timeout 10s python -m src.main; then
             echo "App test result: PASSED (exited cleanly before timeout)"
+            exit 0 # Explicitly succeed this step
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
-              echo "App test result: PASSED (ran for 10s without crashing)"
-              exit 0
+              echo "App test result: FAILED (timed out after 10s, app likely didn't close cleanly or hung)."
+              exit 1 # Mark as failure so `app_test_outcome` is 'failure'
             else
-              echo "App test result: FAILED (crashed with an unexpected error)"
-              exit $exit_code
-            YI
+              echo "App test result: FAILED (app crashed with exit code $exit_code)."
+              exit $exit_code # Mark as failure if it crashed for other reasons
+            fi
           fi
       
       - name: Upload Linter Reports
@@ -216,8 +223,8 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             
-            const inlineComments = []; // For comments posted as inline code suggestions
-            const summaryDiagnostics = {}; // To store diagnostics for the summary message
+            const inlineComments = []; 
+            const summaryDiagnostics = {}; 
 
             const reportDir = './linter-reports';
             try {
@@ -237,33 +244,38 @@ jobs:
                       continue;
                   }
                   
+                  const sourceName = report.source?.name || path.basename(file, '.rdjson'); 
+                  summaryDiagnostics[sourceName] = summaryDiagnostics[sourceName] || []; 
+
                   if (!report.diagnostics || report.diagnostics.length === 0) {
                       console.log(`No diagnostics found in ${file}.`);
                       continue;
                   }
 
-                  const sourceName = report.source.name;
-                  summaryDiagnostics[sourceName] = []; // Initialize for this linter
-
                   for (const diag of report.diagnostics) {
-                    if (diag.location && diag.location.path && diag.location.range && typeof diag.location.range.start.line === 'number') {
-                      // Decide which diagnostics go inline and which go to summary
-                      // Example: Bandit and Mypy go inline for critical errors
-                      // Flake8, Black, Isort, potentially go to summary if there are many.
-                      const fullMessage = `**[${sourceName}]** ${diag.message} at \`${diag.location.path}:${diag.location.range.start.line}\``;
+                    const location = diag.location || diag.primaryLocation; 
+                    const filePath = location?.path;
+                    const startLine = location?.range?.start?.line || location?.span?.start?.line; 
+                    
+                    if (filePath && typeof startLine === 'number') {
+                      const fullMessage = `${diag.message} at \`${filePath}:${startLine}\``;
                       
+                      // Bandit and Mypy issues or explicit 'error' level always go inline for visibility
                       if (sourceName === 'bandit' || sourceName === 'mypy' || diag.level === 'error') {
                         inlineComments.push({
-                          path: diag.location.path,
-                          line: diag.location.range.start.line,
+                          path: filePath,
+                          line: startLine,
                           body: `**[${sourceName}]**: ${diag.message}`
                         });
                       } else {
-                        // Aggregate other issues for the review summary
+                        // All other diagnostics (Flake8, Black, Isort, non-error Bandit/Mypy) go to summary
                         summaryDiagnostics[sourceName].push(fullMessage);
                       }
                     } else {
-                        console.log(`Skipping diagnostic due to missing location info: ${JSON.stringify(diag)}`);
+                        console.log(`Skipping diagnostic from ${sourceName} due to missing location info: ${JSON.stringify(diag)}`);
+                        if (diag.message) { // Still add to summary if there's a message but no precise location
+                             summaryDiagnostics[sourceName].push(`[${sourceName}] (General Issue): ${diag.message}`);
+                        }
                     }
                   }
                 }
@@ -275,84 +287,92 @@ jobs:
             const pr_author = context.payload.pull_request.user.login;
             let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
             let event = 'APPROVE';
-            let is_perfect = false;
+            let is_perfect = false; // Tracks if ALL checks are perfectly clean
 
             const outcomes = {
               flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
               black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
               isort: { conclusion: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
-              bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
-              mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
-              app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
+              bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` }, // Bandit is a blocker if its step fails
+              mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` }, // Mypy is a blocker if its step fails
+              app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` }, // App test is THE blocker
               codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
             };
 
-            const hasWorkflowFailure = Object.values(outcomes).some(o => o.conclusion === 'failure');
-            const hasInlineComments = inlineComments.length > 0;
-            const hasSummaryDiagnostics = Object.values(summaryDiagnostics).some(arr => arr.length > 0);
+            const appTestFailed = outcomes.app_test.conclusion === 'failure';
+            const hasAnyLinterIssues = inlineComments.length > 0 || Object.values(summaryDiagnostics).some(arr => arr.length > 0);
+            const hasCodeQLFailures = outcomes.codeql.conclusion === 'failure';
 
 
-            if (hasWorkflowFailure || hasInlineComments || hasSummaryDiagnostics) {
-                const fix_guides = {
-                    flake8: `Found issues (see summary). Running \`/format\` can fix some.`,
-                    black: `Found issues (see summary). Running \`/format\` will fix this.`,
-                    isort: `Found issues (see summary). Running \`/format\` will fix this.`,
-                    bandit: `Please see inline comments for details on security issues.`,
-                    mypy: `Please see inline comments for details on type-checking errors.`,
-                    app_test: `The app failed to run for 10 seconds. Check workflow logs in "Lint & Test" job.`,
-                    codeql: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice.`
-                };
+            // --- Determine Review Event and Body Content ---
 
-                const blockers = Object.keys(outcomes).filter(key => outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
-                const suggestions = Object.keys(outcomes).filter(key => !outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
+            if (appTestFailed) {
+                event = 'REQUEST_CHANGES';
+                review_body += `**🚨 Urgent: The Tkinter application failed to run for 10 seconds or crashed!**\n`;
+                review_body += `Please ensure the \`src/main.py\` application starts correctly and remains stable for at least 10 seconds without throwing unhandled exceptions. This is a critical issue that must be resolved before merging.\n\n`;
                 
-                if (blockers.length > 0 || hasInlineComments) { // Critical failures or specific inline comments trigger a request for changes
-                    event = 'REQUEST_CHANGES'; 
-                } else if (hasSummaryDiagnostics) { // If only summary diagnostics and no blockers, still request changes for visibility
-                    event = 'REQUEST_CHANGES'; 
-                }
-
-                if (blockers.length > 0) {
-                  review_body += `I've found a few critical issues (🚨) that need your attention before this can be merged. Here's a breakdown:\n\n---\n\n`;
-                  for (const key of blockers) { review_body += `* **${outcomes[key].title}**\n    * **To Fix:** ${fix_guides[key]}\n\n`; }
-                }
-
-                // Add aggregated diagnostics to the summary
-                let aggregatedDetails = '';
-                for (const linterName in summaryDiagnostics) {
-                    if (summaryDiagnostics[linterName].length > 0) {
-                        aggregatedDetails += `\n### ${outcomes[linterName]?.title || linterName} (Additional Details):\n`;
-                        for (const msg of summaryDiagnostics[linterName]) {
-                            aggregatedDetails += `- ${msg}\n`;
-                        }
+                // If app test failed, then all other failures become blocking as well
+                const allFailedOutcomes = Object.keys(outcomes).filter(key => outcomes[key].conclusion === 'failure' && key !== 'app_test');
+                if (allFailedOutcomes.length > 0) {
+                    review_body += `---\n\nAdditionally, I found other issues:\n\n`;
+                    for (const key of allFailedOutcomes) {
+                        review_body += `* **${outcomes[key].title}**\n    * **To Fix:** ${fix_guides[key]}\n\n`;
                     }
                 }
+                review_body += `\n---\n\nPlease fix the application test failure first. Once that's resolved, I can re-review.`;
 
-                if (aggregatedDetails) {
-                    review_body += `\n---\n\n## 📋 Detailed Linter Findings (Aggregated):\n`;
-                    review_body += aggregatedDetails;
+            } else { // App Test Passed (Good!)
+                if (hasAnyLinterIssues || hasCodeQLFailures) {
+                    // App Test passed, so linters/CodeQL are advisory. Still APPROVE.
+                    event = 'APPROVE';
+                    review_body += `Everything looks good to merge! The application test passed successfully. 👍\n\n`;
+                    review_body += `However, I've found some **advisory suggestions** to improve the code quality. These are not blockers for merging but are highly recommended:\n\n---\n\n`;
+                    
+                    const advisoryOutcomes = Object.keys(outcomes).filter(key => 
+                        (outcomes[key].conclusion === 'failure' && key !== 'app_test') || 
+                        (summaryDiagnostics[key] && summaryDiagnostics[key].length > 0) ||
+                        (inlineComments.some(c => c.body.includes(`[${key}]`))) // Check if any inline comments are from this linter
+                    );
+
+                    for (const key of advisoryOutcomes) {
+                        review_body += `* **${outcomes[key]?.title || key}**\n`;
+                        if (key === 'bandit' || key === 'mypy') {
+                            review_body += `    * Please see the inline comments for details on specific issues.`;
+                        } else if (key === 'codeql') {
+                            review_body += `    * Go to the **'Security' tab** for detailed advice.`;
+                        } else { // Generic linter fix guides
+                             review_body += `    * See the 'Detailed Linter Findings' below or run \`/format\` to fix.`;
+                        }
+                        review_body += `\n`;
+                    }
+
                     review_body += `\n---\n`;
-                }
+                    // Add aggregated diagnostics to the summary
+                    let aggregatedDetails = '';
+                    for (const linterName in summaryDiagnostics) {
+                        if (summaryDiagnostics[linterName].length > 0) {
+                            aggregatedDetails += `\n### ${outcomes[linterName]?.title || linterName} (Aggregated):\n`;
+                            for (const msg of summaryDiagnostics[linterName]) {
+                                aggregatedDetails += `- ${msg}\n`;
+                            }
+                        }
+                    }
 
-                if (suggestions.length > 0) {
-                  if (blockers.length === 0 && !hasInlineComments && !hasSummaryDiagnostics) { // Only suggestions, nothing critical
-                      review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code. Here's a summary:\n\n---\n\n`;
-                  } else { // If there are blockers or inline comments, these are additional suggestions
-                      review_body += `\nI also found some minor suggestions:\n\n`;
-                  }
-                  for (const key of suggestions) { review_body += `* **${outcomes[key].title}**\n    * **To Fix:** ${fix_guides[key]}\n\n`; }
-                }
-                
-                if (event === 'REQUEST_CHANGES') {
-                  review_body += `\nPlease address the issues mentioned above and any specific inline comments. Let me know if you have questions!`;
+                    if (aggregatedDetails) {
+                        review_body += `\n## 📋 Detailed Linter Findings (Aggregated):\n`;
+                        review_body += aggregatedDetails;
+                        review_body += `\n---\n`;
+                    }
+
+                    review_body += `\nFeel free to merge, but addressing these suggestions would be great!`;
+
                 } else {
-                  review_body += `\nSince there are no blocking issues, I'm approving this PR. Please consider addressing the suggestions.`;
+                    review_body += `Everything looks great! All checks passed, including the application test. Keep up the fantastic work! 👍`;
+                    is_perfect = true;
                 }
-            } else {
-                review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
-                is_perfect = true;
             }
 
+            // Post the review
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -362,6 +382,7 @@ jobs:
               comments: inlineComments // Only the prioritized comments go here
             });
             
+            // Remove label only if perfect (app test passed, no linter/codeql issues)
             if (is_perfect) {
               try {
                 await github.rest.issues.removeLabel({
