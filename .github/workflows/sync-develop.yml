@@ -1,0 +1,56 @@
+name: Sync Main to Develop (Rebase)
+
+on:
+  push:
+    branches:
+      - main # Trigger this workflow whenever new commits are pushed to the 'main' branch
+
+permissions:
+  # The default GITHUB_TOKEN has 'contents: write' permission by default,
+  # but for pushing to protected branches or if APPROVER_TOKEN has more specific
+  # permissions, we'll explicitly use APPROVER_TOKEN for git operations.
+  contents: write # This ensures the workflow has permission to write, necessary for checkout and other actions.
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout develop branch
+        uses: actions/checkout@v4
+        with:
+          ref: develop # Checkout the 'develop' branch
+          # Use the PriestyBot token (APPROVER_TOKEN) for cloning and subsequent push permissions.
+          # Ensure this token has 'repo' scope or at least 'contents: write' permissions.
+          token: ${{ secrets.APPROVER_TOKEN }}
+
+      - name: Configure Git for Automation
+        run: |
+          # Set a distinct user name and email for the automated sync commits
+          git config user.name "PriestyBot-Sync"
+          git config user.email "priestybot-sync@users.noreply.github.com"
+          
+          # Configure Git to use the token for subsequent push operations
+          # This ensures the 'git push' command has the necessary authentication
+          git remote set-url origin https://x-access-token:${{ secrets.APPROVER_TOKEN }}@github.com/${{ github.repository }}
+
+      - name: Rebase develop onto main
+        run: |
+          # Fetch the latest state of the 'main' branch to ensure it's up-to-date locally
+          git fetch origin main
+
+          # Perform a rebase of 'develop' onto 'main'.
+          # This command will attempt to replay 'develop's commits on top of 'main's history,
+          # creating a linear history and avoiding a merge commit.
+          # If conflicts occur, 'git rebase' will stop, and the workflow step will fail.
+          if git rebase origin/main; then
+            echo "Rebase successful. Pushing changes to remote develop branch."
+            # Push the rebased develop branch.
+            # '--force-with-lease' is safer than '--force' as it checks if no one else has pushed
+            # to the remote 'develop' branch since the last fetch.
+            git push origin develop --force-with-lease
+          else
+            echo "::error::Automatic rebase failed due to merge conflicts."
+            echo "::error::Manual intervention is required to resolve conflicts in 'develop'."
+            echo "::error::To resolve: Locally checkout 'develop', run 'git pull', then 'git rebase main', resolve conflicts, and 'git push origin develop --force-with-lease'."
+            exit 1 # Fail the workflow to indicate manual intervention is needed
+          fi
