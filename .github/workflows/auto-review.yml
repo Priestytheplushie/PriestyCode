@@ -1,1 +1,179 @@
-# empty for now
+name: PriestyBot PR Review
+
+on:
+  pull_request:
+    types: [review_requested]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  code-review:
+    # IMPORTANT: This job will only run if the reviewer requested is 'PriestyBot'
+    if: github.event.requested_reviewer.login == 'PriestyBot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🤖 PriestyBot, Reporting for Duty!
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "PriestyBot, reporting for duty! 🫡 Thanks for asking me to take a look at this PR. I'm so excited to dive in! I'll start by getting everything set up, then I'll look at the code style, run the app test, and give you a final summary. Let's do this! 🚀"
+            });
+
+      - name: ⬇️ Checking out the code...
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setting up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 📦 Caching and Installing Dependencies
+        id: cache-dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: 💻 Installing all the tools...
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install reviewdog-cli mypy flake8 black isort
+
+      - name: 🛡️ Gearing up for Security Analysis with CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+          
+      - name: 🎨 Reviewing Code Style (Linters)
+        id: linting
+        continue-on-error: true # So important! This makes linters advisory.
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # We'll check each linter and report on them individually
+          FLAKE8_STATUS=PASSED
+          BLACK_STATUS=PASSED
+          ISORT_STATUS=PASSED
+          MYPY_STATUS=PASSED
+
+          echo "--- Running flake8 ---"
+          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8 (advisory)" -reporter=github-pr-review; then
+              FLAKE8_STATUS=FAILED
+          fi
+          echo "--- Running black ---"
+          if ! black --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="black (advisory)" -reporter=github-pr-review; then
+              BLACK_STATUS=FAILED
+          fi
+          echo "--- Running isort ---"
+          if ! isort --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="isort (advisory)" -reporter=github-pr-review; then
+              ISORT_STATUS=FAILED
+          fi
+          echo "--- Running mypy ---"
+          if ! mypy src | reviewdog -f=mypy -name="mypy (advisory)" -reporter=github-pr-review; then
+              MYPY_STATUS=FAILED
+          fi
+
+          # Setting results for the next steps
+          echo "FLAKE8_STATUS=$FLAKE8_STATUS" >> "$GITHUB_ENV"
+          echo "BLACK_STATUS=$BLACK_STATUS" >> "$GITHUB_ENV"
+          echo "ISORT_STATUS=$ISORT_STATUS" >> "$GITHUB_ENV"
+          echo "MYPY_STATUS=$MYPY_STATUS" >> "$GITHUB_ENV"
+          
+          if [[ "$FLAKE8_STATUS" == "FAILED" || "$BLACK_STATUS" == "FAILED" || "$ISORT_STATUS" == "FAILED" || "$MYPY_STATUS" == "FAILED" ]]; then
+              echo "LINTER_OVERALL_STATUS=FAILED" >> "$GITHUB_ENV"
+              exit 1 # Marks step as failed, but workflow continues
+          else
+              echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
+          fi
+
+      - name: 📄 Linting Status Update
+        if: always() 
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const lint_status = "${{ env.LINTER_OVERALL_STATUS }}";
+            let body = "";
+            if (lint_status === 'PASSED') {
+              body = "Woohoo! 🎉 I just finished checking the code style, and it's looking absolutely pristine! So clean! ✨ Now, onto the main event: the app test!";
+            } else {
+              body = "Okay, I've finished the first pass on code style! 🎨 I found a few spots that could use a little touch-up and left some comments right in the code for you. No big deal, just some friendly advice! Remember, these are just suggestions. Next up, the really important part—the app test! Let's see how it runs. 👀";
+            }
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: 🖥️ Installing Display Server for App Test
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: 🧪 Time for the App Test!
+        id: app_test
+        continue-on-error: true # Our script inside handles the pass/fail logic
+        run: |
+          echo "Running the Tkinter App Test now! This is the exciting part. Fingers crossed! 🤞"
+          if xvfb-run timeout 10s python src/main.py; then
+            echo "App test PASSED: Exited cleanly before timeout."
+            echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV"; echo "status=success" >> $GITHUB_OUTPUT;
+          else
+            exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+              echo "App test PASSED: Ran for 10s and was terminated as expected."
+              echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV"; echo "status=success" >> $GITHUB_OUTPUT;
+            else
+              echo "App test FAILED: App crashed with exit code $exit_code."
+              echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV"; echo "status=failure" >> $GITHUB_OUTPUT;
+              exit 1
+            fi
+          fi
+
+      - name: 🛡️ Finishing CodeQL Security Scan
+        uses: github/codeql-action/analyze@v3
+
+      - name: 📝 Final Review and Team Huddle!
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const app_status = "${{ env.APP_TEST_STATUS }}";
+            const app_reason = "${{ env.APP_TEST_REASON }}";
+            const linter_status = "${{ env.LINTER_OVERALL_STATUS }}";
+            const black_status = "${{ env.BLACK_STATUS }}";
+            const isort_status = "${{ env.ISORT_STATUS }}";
+
+            let review_event = 'REQUEST_CHANGES'; // Default to changes-requested
+            let body = `### PriestyBot's Review Summary 🤖\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** **${app_status}**\n  - _Reason: ${app_reason}_\n- **Linter Health:** **${linter_status}**\n\n---\n\n`;
+
+            if (app_status === 'FAILED') {
+              review_event = 'REQUEST_CHANGES';
+              body += "🚨 **Okay team, let's huddle up!** 🚨\n\nThe most critical check, the **app test, has failed**. This is our top priority! Let's focus our amazing brainpower on fixing this. I have full faith we can solve it.\n\nI also left some notes on code style, but we can totally ignore those until the app test is green. ✅";
+            } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
+              review_event = 'REQUEST_CHANGES';
+              body += "⭐ **Fantastic news! The app test passed beautifully!** The application is solid! ⭐\n\nOn the code style front, I did find a few areas for improvement and left some advisory comments. Since these are just suggestions, this PR is very close!\n\nHere are your options:\n";
+              if (black_status === 'FAILED' || isort_status === 'FAILED') {
+                body += "- **To automatically fix formatting**, just comment `/format` on this PR.\n";
+              }
+              body += "- **To bypass my suggestions and approve**, just comment `/approve`.\n\nLet me know how you'd like to proceed! I'm requesting changes for now, but you have the power to override me."
+            } else { // Everything passed
+              review_event = 'APPROVE';
+              body += "🎉 **WE DID IT! EVERYTHING IS PERFECT!** 🎉\n\nThis is amazing! The code is clean, the app test passed with flying colors... this is a thing of beauty. I'm so proud of this work! I'm smashing that **Approve** button. Let's get this merged! 🥳";
+            }
+            
+            github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              body: body,
+              event: review_event,
+            });
