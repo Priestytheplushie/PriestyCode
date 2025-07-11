@@ -4,26 +4,59 @@ on:
   pull_request:
     types: [review_requested]
 
+# Granting permissions for the entire workflow
 permissions:
   contents: read
   pull-requests: write
   checks: write
+  security-events: write
 
 jobs:
+  # Job 1: Run the CodeQL security scan in parallel
+  security-scan:
+    if: github.event.requested_reviewer.login == 'PriestyBot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🕵️‍♀️ Acknowledging Security Scan Start
+        uses: actions/github-script@v7
+        with:
+          # --- Use APPROVER_TOKEN for this comment ---
+          github-token: ${{ secrets.APPROVER_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "I've also started the deep security scan with CodeQL! 🕵️‍♀️ This will run in the background and report its findings separately. I'll continue with the rest of the review now!"
+            });
+
+      - name: ⬇️ Checking out the code
+        uses: actions/checkout@v4
+
+      - name: 🛡️ Initializing CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+
+      - name: 🔬 Performing CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # Job 2: Run linting, testing, and provide the final summary review
   code-review:
-    # We'll only run this job if PriestyBot is the one requested for review!
     if: github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
     steps:
       - name: 🤖 PriestyBot, Reporting for Duty!
         uses: actions/github-script@v7
         with:
+          # --- Use APPROVER_TOKEN for this comment ---
+          github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: "PriestyBot, reporting for duty! 🫡 Thanks for asking me to take a look at this PR. I'm so excited to dive in! I'll start by getting everything set up, then I'll look at the code style, run the app test, and give you a final summary. Let's do this! 🚀"
+              body: "PriestyBot, reporting for duty! 🫡 Thanks for having me. I'm starting the review process right now and will be back with updates soon! 🚀"
             });
 
       - name: ⬇️ Checking out the code...
@@ -35,7 +68,6 @@ jobs:
           python-version: '3.13'
 
       - name: 📦 Caching and Installing Dependencies
-        id: cache-dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -47,23 +79,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install mypy flake8 black isort # We only install the python linters here
+          pip install mypy flake8 black isort
 
-      # --- ACTION REQUIRED: Correctly set up reviewdog ---
       - name: 🐶 Setting up reviewdog
         uses: reviewdog/action-setup@v1
         with:
           reviewdog_version: latest
-
-      - name: 🛡️ Gearing up for Security Analysis with CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: 'python'
           
       - name: 🎨 Reviewing Code Style (Linters)
         id: linting
-        continue-on-error: true # So important! This makes linters advisory.
+        continue-on-error: true
         env:
+          # Inline comments use the default GITHUB_TOKEN, which is standard practice for check annotations
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FLAKE8_STATUS=PASSED; BLACK_STATUS=PASSED; ISORT_STATUS=PASSED; MYPY_STATUS=PASSED
@@ -88,17 +115,6 @@ jobs:
               echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
           fi
 
-      - name: 📄 Linting Status Update
-        if: always() 
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const lint_status = "${{ env.LINTER_OVERALL_STATUS }}";
-            let body = (lint_status === 'PASSED')
-              ? "Woohoo! 🎉 I just finished checking the code style, and it's looking absolutely pristine! So clean! ✨ Now, onto the main event: the app test!"
-              : "Okay, I've finished the first pass on code style! 🎨 I found a few spots that could use a little touch-up and left some comments right in the code for you. No big deal, just some friendly advice! Next up, the really important part—the app test! Let's see how it runs. 👀";
-            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: body });
-
       - name: 🖥️ Installing Display Server for App Test
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
@@ -122,16 +138,12 @@ jobs:
             fi
           fi
 
-      - name: 🛡️ Finishing CodeQL Security Scan
-        uses: github/codeql-action/analyze@v3
-
-      # --- ACTION REQUIRED: Use the APPROVER_TOKEN for the final review ---
       - name: 📝 Final Review and Team Huddle!
         if: always()
         uses: actions/github-script@v7
         with:
-          # We use the APPROVER_TOKEN here so the bot has permission to APPROVE.
-          token: ${{ secrets.APPROVER_TOKEN }}
+          # --- Use APPROVER_TOKEN for the final review ---
+          github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             const app_status = "${{ env.APP_TEST_STATUS }}";
             const app_reason = "${{ env.APP_TEST_REASON }}";
@@ -140,7 +152,7 @@ jobs:
             const isort_status = "${{ env.ISORT_STATUS }}";
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot's Review Summary 🤖\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** **${app_status}**\n  - _Reason: ${app_reason}_\n- **Linter Health:** **${linter_status}**\n\n---\n\n`;
+            let body = `### PriestyBot's Review Summary 🤖\n\nHi team! I've finished my complete review. Here's the rundown:\n\n- **App Test:** **${app_status}**\n  - _Reason: ${app_reason}_\n- **Linter Health:** **${linter_status}**\n- **CodeQL Security Scan:** 🕵️‍♀️ Running in parallel. Results will appear under the 'Security' tab.\n\n---\n\n`;
 
             if (app_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
