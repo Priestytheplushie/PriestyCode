@@ -4,7 +4,6 @@ on:
   pull_request:
     types: [review_requested]
 
-# Granting permissions for the entire workflow
 permissions:
   contents: read
   pull-requests: write
@@ -12,7 +11,6 @@ permissions:
   security-events: write
 
 jobs:
-  # Job 1: Run the CodeQL security scan in parallel
   security-scan:
     if: github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
@@ -47,7 +45,6 @@ jobs:
               : "Security scan complete! ⚠️ I found some potential issues. Please check the 'Security' tab on the PR for the full details.";
             github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: body });
 
-  # Job 2: Run linting, testing, and provide the final summary review
   code-review:
     if: github.event.requested_reviewer.login == 'PriestyBot'
     runs-on: ubuntu-latest
@@ -86,37 +83,25 @@ jobs:
         with:
           reviewdog_version: latest
           
-      - name: 🎨 Reviewing Code Style (Linting All Files)
+      - name: 🎨 Reviewing Code Style (Linters)
         id: linting
-        continue-on-error: true
+        continue-on-error: true # Keep workflow running
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # This ensures that if any command in a pipe fails, the pipe's exit code is that command's exit code.
           set -o pipefail
+          LINTING_FAILED=false
           
-          FLAKE8_STATUS=PASSED; BLACK_STATUS=PASSED; ISORT_STATUS=PASSED; MYPY_STATUS=PASSED
+          echo "--- Running Linters ---"
+          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
+          if ! mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
+          if ! black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
+          if ! isort --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -filter-mode=nofilter -fail-on-error=true; then LINTING_FAILED=true; fi
           
-          # These linters naturally check all specified files
-          if ! flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review -filter-mode=nofilter; then FLAKE8_STATUS=FAILED; fi
-          if ! mypy src | reviewdog -f=mypy -name="mypy" -reporter=github-pr-review -filter-mode=nofilter; then MYPY_STATUS=FAILED; fi
-          
-          # For formatters, we check the whole directory. If that fails, we re-run with --diff to get parsable output for reviewdog.
-          if ! black --check src; then
-            BLACK_STATUS=FAILED
-            black --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review -filter-mode=nofilter
-          fi
-          if ! isort --check src; then
-            ISORT_STATUS=FAILED
-            isort --check --diff src 2>&1 | reviewdog -f=diff -f.diff.strip=1 -name="isort" -reporter=github-pr-review -filter-mode=nofilter
-          fi
-
-          echo "FLAKE8_STATUS=$FLAKE8_STATUS" >> "$GITHUB_ENV"; echo "BLACK_STATUS=$BLACK_STATUS" >> "$GITHUB_ENV"; echo "ISORT_STATUS=$ISORT_STATUS" >> "$GITHUB_ENV"; echo "MYPY_STATUS=$MYPY_STATUS" >> "$GITHUB_ENV"
-          
-          if [[ "$FLAKE8_STATUS" == "FAILED" || "$BLACK_STATUS" == "FAILED" || "$ISORT_STATUS" == "FAILED" || "$MYPY_STATUS" == "FAILED" ]]; then
-              echo "LINTER_OVERALL_STATUS=FAILED" >> "$GITHUB_ENV"
+          if [ "$LINTING_FAILED" = true ]; then
+            echo "LINTER_OVERALL_STATUS=FAILED" >> "$GITHUB_ENV"
           else
-              echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
+            echo "LINTER_OVERALL_STATUS=PASSED" >> "$GITHUB_ENV"
           fi
 
       - name: 🖥️ Installing Display Server for App Test
@@ -126,18 +111,15 @@ jobs:
         id: app_test
         continue-on-error: true
         run: |
-          echo "Running the Tkinter App Test now! This is the exciting part. Fingers crossed! 🤞"
+          echo "Running the Tkinter App Test now! Fingers crossed! 🤞"
+          # App Test script remains the same...
           if xvfb-run timeout 10s python src/main.py; then
-            echo "App test PASSED: Exited cleanly before timeout."
-            echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV";
+            echo "App test PASSED: Exited cleanly before timeout."; echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Exited cleanly before timeout." >> "$GITHUB_ENV";
           else
-            exit_code=$?
-            if [ $exit_code -eq 124 ]; then
-              echo "App test PASSED: Ran for 10s and was terminated as expected."
-              echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV";
+            exit_code=$?; if [ $exit_code -eq 124 ]; then
+              echo "App test PASSED: Ran for 10s and was terminated as expected."; echo "APP_TEST_STATUS=PASSED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=Ran for 10s and was terminated as expected." >> "$GITHUB_ENV";
             else
-              echo "App test FAILED: App crashed with exit code $exit_code."
-              echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV";
+              echo "App test FAILED: App crashed with exit code $exit_code."; echo "APP_TEST_STATUS=FAILED" >> "$GITHUB_ENV"; echo "APP_TEST_REASON=App crashed with exit code $exit_code." >> "$GITHUB_ENV";
             fi
           fi
 
@@ -147,11 +129,12 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            // This script remains the same, but will now receive the CORRECT LINTER_OVERALL_STATUS
             const app_status = "${{ env.APP_TEST_STATUS }}";
             const app_reason = "${{ env.APP_TEST_REASON }}";
             const linter_status = "${{ env.LINTER_OVERALL_STATUS }}";
-            const black_status = "${{ env.BLACK_STATUS }}";
-            const isort_status = "${{ env.ISORT_STATUS }}";
+            const black_status = "${{ env.BLACK_STATUS }}"; // This is less relevant now, but harmless
+            const isort_status = "${{ env.ISORT_STATUS }}"; // This is less relevant now, but harmless
             
             const app_emoji = app_status === 'PASSED' ? '👍' : '👎';
             const linter_emoji = linter_status === 'PASSED' ? '👍' : '👎';
@@ -164,12 +147,8 @@ jobs:
               body += "🚨 **Okay team, let's huddle up!** 🚨\n\nThe most critical check, the **app test, has failed**. This is our top priority! Let's focus our amazing brainpower on fixing this. I have full faith we can solve it.\n\nI also left some notes on code style, but we can totally ignore those until the app test is green. ✅";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "⭐ **Fantastic news! The app test passed beautifully!** The application is solid! ⭐\n\nOn the code style front, I did find a few areas for improvement and left some advisory comments. Since these are just suggestions, this PR is very close!\n\nHere are your options:\n";
-              if (black_status === 'FAILED' || isort_status === 'FAILED') {
-                body += "- **To automatically fix formatting**, just comment `/format` on this PR.\n";
-              }
-              body += "- **To bypass my suggestions and approve**, just comment `/approve`.\n\nLet me know how you'd like to proceed! I'm requesting changes for now, but you have the power to override me."
-            } else {
+              body += "⭐ **Fantastic news! The app test passed beautifully!** The application is solid! ⭐\n\nOn the code style front, I did find a few areas for improvement and left some advisory comments. Since these are just suggestions, this PR is very close!\n\nHere are your options:\n- **To automatically fix formatting**, just comment `/format` on this PR.\n- **To bypass my suggestions and approve**, just comment `/approve`.\n\nLet me know how you'd like to proceed! I'm requesting changes for now, but you have the power to override me."
+            } else { // Everything passed
               review_event = 'APPROVE';
               body += "🎉 **WE DID IT! EVERYTHING IS PERFECT!** 🎉\n\nThis is amazing! The code is clean, the app test passed with flying colors... this is a thing of beauty. I'm so proud of this work! I'm smashing that **Approve** button. Let's get this merged! 🥳";
             }
