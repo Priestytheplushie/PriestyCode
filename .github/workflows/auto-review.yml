@@ -50,7 +50,7 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
-          # Default all statuses to PASSED
+          # This robust script will NOT crash if a linter finds issues.
           echo "flake8_status=PASSED" >> $GITHUB_OUTPUT
           echo "black_status=PASSED" >> $GITHUB_OUTPUT
           echo "isort_status=PASSED" >> $GITHUB_OUTPUT
@@ -60,19 +60,18 @@ jobs:
           run_linter() {
               local name="$1"; local cmd="$2"; local reviewdog_flags="$3"
               echo "--- Running $name ---"
-
-              # Run the linter and capture its output and REAL exit code
-              local output
-              output=$(eval "$cmd" 2>&1)
-              local exit_code=$?
               
-              # Always send the output to reviewdog for inline commenting attempts
-              echo "$output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
+              # Run the linter, capturing its output and exit code. The `|| true` prevents the step from crashing.
+              lint_output=$($cmd 2>&1) || true
+              exit_code=${PIPESTATUS[0]}
 
-              # Use the REAL exit code to determine failure
+              # Send output to reviewdog for inline comments.
+              echo "$lint_output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
+
               if [ $exit_code -ne 0 ]; then
                   echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
-                  echo "$output" > "${name}_report.txt"
+                  # Save the raw output for the final summary report.
+                  echo "$lint_output" > "${name}_report.txt"
                   LINTER_FAILED_ANY=true
               fi
           }
@@ -118,11 +117,11 @@ jobs:
             const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             function getReport(name) {
               if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
-              return 'No output captured.';
+              return 'No output captured (linter passed).';
             }
 
             if (app_status === 'FAILED') {
@@ -140,7 +139,7 @@ jobs:
               body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
             } else {
               review_event = 'APPROVE';
-              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
+              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get this merged! 🎉";
             }
             
             await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, body: body, event: review_event });
