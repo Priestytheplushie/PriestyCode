@@ -57,34 +57,29 @@ jobs:
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
 
-          # Robust logic that captures full output for all linters if they fail,
-          # while still posting inline comments for changed files.
-          run_linter_and_report() {
-              local name=$1; shift
-              local cmd=$1; shift
-              local reviewdog_flags="$@"
-              
+          run_linter() {
+              local name="$1"; local cmd="$2"; local reviewdog_flags="$3"
               echo "--- Running $name ---"
-              # The `tee` command allows us to both capture the output to a file and pass it to reviewdog.
-              # `|| true` ensures the pipe doesn't cause the step to fail prematurely.
-              lint_output=$($cmd 2>&1 | tee "${name}_report.txt")
-              exit_code=${PIPESTATUS[0]}
 
-              # Always send the output to reviewdog for inline commenting on changed lines.
-              echo "$lint_output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
+              # Run the linter and capture its output and REAL exit code
+              local output
+              output=$(eval "$cmd" 2>&1)
+              local exit_code=$?
+              
+              # Always send the output to reviewdog for inline commenting attempts
+              echo "$output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
 
+              # Use the REAL exit code to determine failure
               if [ $exit_code -ne 0 ]; then
                   echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
+                  echo "$output" > "${name}_report.txt"
                   LINTER_FAILED_ANY=true
-              else
-                  # If the linter passed, we don't need its report file.
-                  rm "${name}_report.txt"
               fi
           }
-          run_linter_and_report "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
-          run_linter_and_report "black" "black --check --diff src" "-f=diff -f.diff.strip=1"
-          run_linter_and_report "isort" "isort --check --diff src" "-f=diff"
-          run_linter_and_report "mypy" "mypy src" "-f=mypy"
+          run_linter "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
+          run_linter "black" "black --check --diff src" "-f=diff -f.diff.strip=1"
+          run_linter "isort" "isort --check --diff src" "-f=diff"
+          run_linter "mypy" "mypy src" "-f=mypy"
 
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
@@ -123,7 +118,7 @@ jobs:
             const linter_check = linter_status === 'PASSED' ? 'Looks good! ✨' : 'Found some areas for improvement 🔬';
 
             let review_event = 'REQUEST_CHANGES';
-            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
+            let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             function getReport(name) {
               if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
@@ -135,7 +130,7 @@ jobs:
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
-              body += "I've left inline comments for any issues on lines you've changed. For a complete picture, here are the full reports from all linters that found issues:\n\n";
+              body += "I've left inline comments for any issues on lines you've changed. For a complete picture of all findings, here are the full reports from all linters that found issues:\n\n";
               
               if (flake8_status === 'FAILED') { body += `<details><summary><strong>flake8 found issues:</strong></summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n` }
               if (black_status === 'FAILED') { body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`}
