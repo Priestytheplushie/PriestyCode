@@ -5,7 +5,7 @@ name: PriestyBot PR Reviewer
 
 on:
   pull_request:
-    types: [review_requested, synchronize] # Trigger on review requests and new commits
+    types: [review_requested, synchronize] # Trigger on review requests AND new commits
 
 permissions:
   contents: write
@@ -80,10 +80,13 @@ jobs:
           PR_REVIEWS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
             "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/pulls/$PR_NUMBER/reviews")
 
+          # Define the approval message string
+          APPROVAL_MESSAGE="Everything looks great! I'm approving this pull request."
+
           # Use jq to filter reviews by PriestyBot, check for 'APPROVED' state,
           # and look for the specific approval message indicating a clean run.
-          # This ensures the bot stops if it has already given a final, clean approval.
-          if echo "$PR_REVIEWS" | jq -e '.[] | select(.user.login == "PriestyBot" and .state == "APPROVED" and .body | contains("Everything looks great! I\'m approving this pull request."))' > /dev/null; then
+          # Pass the approval message as an argument to jq to avoid quoting issues.
+          if echo "$PR_REVIEWS" | jq -e --arg msg "$APPROVAL_MESSAGE" '.[] | select(.user.login == "PriestyBot" and .state == "APPROVED" and .body | contains($msg))' > /dev/null; then
             echo "stop_review=true" >> $GITHUB_OUTPUT
             echo "Prior clean approval by PriestyBot found. Halting review process."
             exit 0 # Exit early if clean approval is found
@@ -249,3 +252,5 @@ jobs:
               body: body + final_message, # Combine summary and final message
               event: event_type,
             });
+        # This step consolidates all results, generates a friendly summary,
+        # and posts the appropriate review (APPROVE or REQUEST_CHANGES) to the PR.
