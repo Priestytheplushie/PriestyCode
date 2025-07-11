@@ -22,8 +22,6 @@ jobs:
     name: Lint & Test
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # FIXED: Re-instating the environment variable so reviewdog uses your PAT.
-    # This will now work because you've added the `checks: write` scope to the PAT.
     env:
       REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
     outputs:
@@ -38,7 +36,6 @@ jobs:
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
         with:
-          # This action should also use the bot's token for consistency
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             await github.rest.issues.createComment({
@@ -89,25 +86,27 @@ jobs:
           fail_on_error: true
           reporter: github-pr-check
           level: warning
-          black_args: "--check --diff src"
+          # FIXED: Removed the '--diff' flag to ensure it always checks the files consistently.
+          black_args: "--check src"
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
         run: |
-          (isort --check --diff src || true) | reviewdog -f=diff -f.isort --reporter=github-pr-check --level=warning -name="isort-check" -fail-on-error
+          # FIXED: Removed '--diff' to ensure it always checks the files consistently.
+          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-check -level=warning -fail-on-error
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
         run: |
-          (bandit -r src -f txt || true) | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error
+          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
         run: |
-          (mypy src || true) | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error
+          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
