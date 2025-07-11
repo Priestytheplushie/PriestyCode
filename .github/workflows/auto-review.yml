@@ -1,171 +1,142 @@
+# .github/workflows/priestybot.yml
+# This workflow defines PriestyBot, a GitHub Action that automatically reviews Python pull requests.
+
 name: PriestyBot PR Reviewer
 
 on:
   pull_request:
-    types: [review_requested, synchronize]
+    types: [review_requested]
 
-# These permissions are required for the bot to post check annotations and submit a review.
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
-  checks: write
 
 jobs:
   review:
     name: PriestyBot Review
     runs-on: ubuntu-latest
     steps:
-      # Step 1: Checkout the pull request code
-      - name: ⬇️ Checkout Code
+      - name: 🛑 Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@v0.12.1
+
+      - name: 🤖 Checkout Code
         uses: actions/checkout@v4
-
-      # Step 2: Set up the Python environment
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v4
         with:
-          python-version: '3.10' # You can change this to your project's Python version
+          fetch-depth: 0
 
-      # Step 3: Install project dependencies and the tools for the bot
-      - name: 🛠️ Install Dependencies & Tools
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install project dependencies from requirements.txt
+          pip install bandit mypy pylint flake8 black isort reviewdog-github-pr-review tkinter
+          # Install other project dependencies if needed from requirements.txt
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Install the linters and reviewdog for the bot
-          pip install flake8 black bandit mypy
-          # Install reviewdog, which is used to post inline comments
-          wget -O - -q https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh| sh -s -- -b /usr/local/bin
 
-      # Step 4: Run the Tkinter app test to determine the core outcome (pass/fail)
+      - name: 📊 Configure Git
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "priestybot@users.noreply.github.com"
+
+      - name: 🔍 Check for Stop Command
+        id: stop_check
+        run: |
+          STOP_COMMAND="@PriestyBot stop"
+          PR_COMMENTS=$(curl -s -H "Authorization: Bearer ${{ secrets.APPROVER_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments")
+          if echo "$PR_COMMENTS" | grep -q "$STOP_COMMAND"; then
+            echo "::set-output name=stop::true"
+            echo "Stop command found. Halting review process."
+          fi
+        continue-on-error: true
+
+      - name: 🏃‍♂️ Run Linters with Reviewdog
+        if: steps.stop_check.outputs.stop != 'true'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+        run: |
+          # Run linters and pipe output to reviewdog
+          bandit -r . -f json | reviewdog -f=rdjson -name="Bandit (Security)" -reporter=github-pr-review
+          mypy . --ignore-missing-imports | reviewdog -f=mypy -name="MyPy (Types)" -reporter=github-pr-review
+          pylint **/*.py | reviewdog -f=pylint -name="Pylint" -reporter=github-pr-review
+          flake8 . | reviewdog -f=flake8 -name="Flake8" -reporter=github-pr-review
+          black --check . 2> black_results.txt || true
+          isort --check-only . 2> isort_results.txt || true
+
       - name: 🧪 Run Tkinter App Test
         id: app_test
-        continue-on-error: true # This ensures the workflow continues to the review step even if the test fails
+        if: steps.stop_check.outputs.stop != 'true'
+        continue-on-error: true
         run: |
-          # We need to install a virtual framebuffer to run a GUI app in a headless environment
           sudo apt-get update && sudo apt-get install -y xvfb
-          
-          # This is the test script you provided
           if xvfb-run timeout 10s python -m src.main; then
-            echo "✅ App test PASSED: The app exited cleanly before the 10s timeout."
-            echo "outcome=success" >> $GITHUB_OUTPUT
+            echo "App test PASSED: Exited cleanly before timeout."
+            echo "status=success" >> $GITHUB_OUTPUT
             exit 0
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
-              echo "✅ App test PASSED: The app ran for the full 10s and was terminated as expected."
-              echo "outcome=success" >> $GITHUB_OUTPUT
+              echo "App test PASSED: Ran for 10s and was terminated as expected."
+              echo "status=success" >> $GITHUB_OUTPUT
               exit 0
             else
-              echo "❌ App test FAILED: The app crashed with exit code $exit_code."
-              echo "outcome=failure" >> $GITHUB_OUTPUT
+              echo "App test FAILED: App crashed with exit code $exit_code."
+              echo "status=failure" >> $GITHUB_OUTPUT
               exit 1
             fi
           fi
 
-      # Step 5: Run linters. Reviewdog will post findings as "Check Annotations".
-      - name: 🧐 Run Linters & Post Annotations
-        id: linters
-        continue-on-error: true # Linter issues are advisory, so they should not fail the workflow
-        env:
-          # This token is used by reviewdog to post annotations to the PR
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-        run: |
-          # Initialize status variables
-          flake8_found_issues=false
-          black_found_issues=false
-          bandit_found_issues=false
-          mypy_found_issues=false
+      - name: 📝 Generate and Post Review
+        if: steps.stop_check.outputs.stop != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr_number = context.issue.number;
+            const app_test_status = "${{ steps.app_test.outputs.status }}";
+            const fs = require('fs');
 
-          # --- Run Flake8 ---
-          flake8 . | tee flake8_output.txt
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            flake8_found_issues=true
-            cat flake8_output.txt | reviewdog -f="flake8" -name="Flake8 Linter" -reporter="github-pr-check" -level="warning"
-          fi
+            let black_output = fs.readFileSync('black_results.txt', 'utf8').trim();
+            let isort_output = fs.readFileSync('isort_results.txt', 'utf8').trim();
 
-          # --- Run Black ---
-          black --check --diff . > black_diff.txt 2>&1
-          if [ $? -ne 0 ]; then
-            black_found_issues=true
-          fi
+            let linter_failures = [];
+            if (black_output) linter_failures.push(`**Black:**\n\`\`\`\n${black_output}\n\`\`\``);
+            if (isort_output) linter_failures.push(`**isort:**\n\`\`\`\n${isort_output}\n\`\`\``);
 
-          # --- Run Bandit ---
-          bandit -r . -f screen | tee bandit_output.txt
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            bandit_found_issues=true
-            cat bandit_output.txt | reviewdog -name="Bandit Security" -reporter="github-pr-check" -level="warning"
-          fi
+            let body = `### PriestyBot Review Summary\n\nHello there! I've reviewed your Python code. Here's a summary of what I found:\n\n`;
+            body += `* **Application Test:** ${app_test_status === 'success' ? 'Passed ✅' : 'Failed ❌'}\n`;
 
-          # --- Run Mypy ---
-          mypy . --ignore-missing-imports | tee mypy_output.txt
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            mypy_found_issues=true
-            cat mypy_output.txt | reviewdog -f="mypy" -name="Mypy Type Checker" -reporter="github-pr-check" -level="warning"
-          fi
+            if (linter_failures.length > 0) {
+              body += `* **Linters:** Found issues 🔍\n\n`;
+              body += linter_failures.join('\n');
+              if (black_output || isort_output) {
+                  body += `\n\n💡 **Tip:** You can automatically fix formatting issues by commenting \`/format\` on this PR.`;
+              }
+              body += `\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`;
+            } else {
+              body += `* **Linters:** All passed! 🎉\n`;
+            }
 
-          # Set outputs for the final review step
-          if $flake8_found_issues || $black_found_issues || $bandit_found_issues || $mypy_found_issues; then
-            echo "status=issues_found" >> $GITHUB_OUTPUT
-          else
-            echo "status=clean" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "black_issues=$black_found_issues" >> $GITHUB_OUTPUT
-          if $black_found_issues; then
-            echo 'black_diff<<EOF' >> $GITHUB_OUTPUT
-            cat black_diff.txt >> $GITHUB_OUTPUT
-            echo 'EOF' >> $GITHUB_OUTPUT
-          fi
+            let event_type;
+            if (app_test_status === 'failure') {
+              event_type = 'REQUEST_CHANGES';
+              body += "\n\nI have to request changes because the application tests failed. Please fix the issues and push your changes.";
+            } else if (linter_failures.length > 0) {
+              event_type = 'REQUEST_CHANGES';
+              body += "\n\nRequesting changes due to linter issues. See the details above and in the inline comments.";
+            } else {
+              event_type = 'APPROVE';
+              body += "\n\nEverything looks great! I'm approving this pull request. Great job! 👍";
+            }
 
-      # Step 6: Prepare the summary message and submit the final PR review
-      - name: 📝 Prepare and Submit Review
-        env:
-          # Use the GitHub CLI, authenticated with your bot's token
-          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          # Pass step outputs as environment variables for the script
-          APP_TEST_OUTCOME: ${{ steps.app_test.outputs.outcome }}
-          LINTER_STATUS: ${{ steps.linters.outputs.status }}
-          BLACK_ISSUES: ${{ steps.linters.outputs.black_issues }}
-          BLACK_DIFF: ${{ steps.linters.outputs.black_diff }}
-        run: |
-          # --- Build the Review Body ---
-          # Set the final decision (event) and app test summary
-          if [ "$APP_TEST_OUTCOME" == "success" ]; then
-            EVENT="APPROVE"
-            APP_TEST_RESULT="✅ **App Test: Passed!** Great job, this is ready to merge."
-          else
-            EVENT="REQUEST_CHANGES"
-            APP_TEST_RESULT="❌ **App Test: Failed.** The application didn't run correctly. This is a required check and must be fixed."
-          fi
-
-          # Build the linter and formatting summary
-          if [ "$LINTER_STATUS" == "clean" ]; then
-            LINTER_SUMMARY="✨ **Linters & Formatting:** All checks passed. Your code is sparkling!"
-          else
-            LINTER_SUMMARY="### 🧼 Linters & Formatting (Advisory)\nI found a few things that could be improved. **These are only suggestions to improve code quality and are not required to pass.**\n\nI've posted all my findings as annotations directly on the changed files. If you'd like me to automatically fix the formatting issues, just comment \`/format\` on this PR."
-            if [ "$BLACK_ISSUES" == "true" ]; then
-              # Append the black diff to the summary for easy viewing
-              LINTER_SUMMARY="${LINTER_SUMMARY}\n\n**Black Formatter requires changes:**\n\`\`\`diff\n${BLACK_DIFF}\n\`\`\`"
-            fi
-          fi
-
-          # Construct the final review body using all the pieces
-          BODY=$(cat <<EOF
-          Hello! I'm PriestyBot, your friendly automated reviewer. Here's my take on your latest changes:
-
-          ${APP_TEST_RESULT}
-
-          ---
-
-          ${LINTER_SUMMARY}
-
-          ---
-          *This review was generated automatically. If you have any questions or if I made a mistake, please let my owner know!*
-          EOF
-          )
-
-          # --- Submit the Final Review ---
-          # The GitHub CLI (gh) uses the EVENT and BODY variables to submit the single, consolidated review.
-          gh pr review $PR_URL --${EVENT,,} --body "$BODY"
+            github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number: pr_number,
+              body: body,
+              event: event_type,
+            });
 
