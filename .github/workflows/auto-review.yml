@@ -69,13 +69,13 @@ jobs:
             LINTER_FAILED_ANY=true
             echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
             echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
-            echo "$flake8_output" > flake8_report.txt # Added: Capture flake8 output to a file
+            echo "$flake8_output" > flake8_report.txt # Capture flake8 output to a file if it failed
           fi
           if ! black_output=$(black --check --diff src 2>&1); then
             LINTER_FAILED_ANY=true
             echo "black_status=FAILED" >> $GITHUB_OUTPUT
             echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
-            echo "$black_output" > black_report.txt # Added: Capture black output to a file
+            echo "$black_output" > black_report.txt # Capture black output to a file if it failed
           fi
 
           echo "--- Running isort and mypy for summary reports ---"
@@ -145,16 +145,18 @@ jobs:
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
               
-              // NEW LOGIC: Check if flake8 or black actually generated a report with content
+              // Corrected Logic: Check if flake8 or black actually generated a report with content
+              // This relies on the shell script only creating the report file if there's output.
               const flake8_reported_issues = fs.existsSync('flake8_report.txt') && fs.readFileSync('flake8_report.txt', 'utf8').trim() !== '';
               const black_reported_issues = fs.existsSync('black_report.txt') && fs.readFileSync('black_report.txt', 'utf8').trim() !== '';
 
-              const inline_comments_expected = flake8_reported_issues || black_reported_issues;
               const summary_failed = (isort_status === 'FAILED' || mypy_status === 'FAILED');
 
-              if (inline_comments_expected) { // Use the new variable here
+              // Only add this message if flake8 or black genuinely reported issues
+              if (flake8_reported_issues || black_reported_issues) { 
                 body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n";
               }
+              
               if (summary_failed) {
                 body += "For our codebase-wide checks, I've found some issues and included the full reports below:\n\n";
                 if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
