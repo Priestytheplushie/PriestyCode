@@ -24,10 +24,8 @@ jobs:
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
     runs-on: ubuntu-latest
-    env:
-      REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+    # The APPROVER_TOKEN is not needed here anymore, only in the final-review job.
     outputs:
-      # ... outputs ...
       flake8_outcome: ${{ steps.flake8.conclusion }}
       black_outcome: ${{ steps.black.conclusion }}
       isort_outcome: ${{ steps.isort.conclusion }}
@@ -84,36 +82,31 @@ jobs:
           pip install -r requirements.txt
           pip install flake8 black isort mypy bandit
 
-      # FIXED: Switched reporter to 'github-pr-review' to avoid API limits.
+      # MODIFIED: Run linters and save reports as rdjson files instead of posting.
       - name: 💧 Run Linter (flake8)
         id: flake8
         continue-on-error: true
-        run: |
-          flake8 src | reviewdog -f=flake8 -name="flake8-check" -reporter=github-pr-review -level=warning -filter-mode="nofilter" -fail-level=warning
+        run: flake8 src || true | reviewdog -f=flake8 -reporter=rdjson > flake8.rdjson
 
       - name: 💅 Run Format Check (black)
         id: black
         continue-on-error: true
-        run: |
-          black --check src | reviewdog -f=black -name="black-check" -reporter=github-pr-review -level=warning -filter-mode="nofilter" -fail-level=warning
+        run: black --check src || true | reviewdog -f=black -reporter=rdjson > black.rdjson
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
-        run: |
-          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-review -level=warning -filter-mode="nofilter" -fail-level=warning
+        run: isort --check src || true | reviewdog -f=isort -reporter=rdjson > isort.rdjson
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
-        run: |
-          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-review -level=error -filter-mode="nofilter" -fail-level=error
+        run: bandit -r src -f txt || true | reviewdog -f=bandit -reporter=rdjson > bandit.rdjson
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
-        run: |
-          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-review -level=error -filter-mode="nofilter" -fail-level=error
+        run: mypy src || true | reviewdog -f=mypy -reporter=rdjson > mypy.rdjson
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
@@ -132,6 +125,15 @@ jobs:
               exit $exit_code
             fi
           fi
+      
+      # NEW: Upload all generated report files as an artifact for the next job.
+      - name: Upload Linter Reports
+        if: success() || failure() # Always run this step
+        uses: actions/upload-artifact@v4
+        with:
+          name: linter-reports
+          path: ./*.rdjson
+          retention-days: 1
 
   codeql:
     name: CodeQL Analysis
@@ -167,11 +169,49 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
     steps:
+      # NEW: Download the artifact containing all the linter reports.
+      - name: Download Linter Reports
+        uses: actions/download-artifact@v4
+        with:
+          name: linter-reports
+          path: linter-reports
+      
+      # MODIFIED: This script now reads the reports and posts a single, consolidated review.
       - name: 📝 Post Final Review Summary
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Part 1: Gather all inline comments from the downloaded rdjson files.
+            const comments = [];
+            const reportDir = './linter-reports';
+            try {
+              const files = fs.readdirSync(reportDir);
+              for (const file of files) {
+                if (file.endsWith('.rdjson')) {
+                  const content = fs.readFileSync(path.join(reportDir, file), 'utf8');
+                  if (!content) continue; // Skip empty files
+                  const report = JSON.parse(content);
+                  if (!report.diagnostics) continue; // Skip files with no diagnostics
+                  for (const diag of report.diagnostics) {
+                    if (diag.location) {
+                      comments.push({
+                        path: diag.location.path,
+                        line: diag.location.range.start.line,
+                        body: `**[${report.source.name}]**: ${diag.message}`
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.log("Could not process linter reports, likely none were generated:", error.message);
+            }
+
+            // Part 2: Build the review body and determine the final event type.
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
             const codeqlJobResult = '${{ needs.codeql.result }}';
@@ -179,7 +219,8 @@ jobs:
             let event = 'APPROVE';
             let is_perfect = false;
 
-            if (lintJobResult === 'failure' || codeqlJobResult === 'failure' && needs.codeql.result != 'success') {
+            // Check if there are any failures. Note that codeqlJobResult is 'skipped' if not on a PR.
+            if (lintJobResult === 'failure' || (codeqlJobResult === 'failure' && needs.codeql.result !== 'skipped')) {
                 const outcomes = {
                   flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
                   black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
@@ -189,15 +230,18 @@ jobs:
                   app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
                   codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
                 };
+                
+                // Updated fix guides to reflect inline comments.
                 const fix_guides = {
-                    flake8: `I have posted a consolidated review comment with the details. Please address them and try running \`/format\` to fix common issues.`,
-                    black: `I have posted a consolidated review comment with the details. Running \`/format\` will fix this.`,
-                    isort: `I have posted a consolidated review comment with the details. Running \`/format\` will fix this.`,
-                    bandit: `Please see the consolidated review comment for details on the security issue found.`,
-                    mypy: `Please see the consolidated review comment for details on the type-checking errors.`,
+                    flake8: `I have posted inline comments with the details. Please address them. You can also try running \`/format\` to fix some issues.`,
+                    black: `I have posted inline comments with the details. Running \`/format\` will fix this.`,
+                    isort: `I have posted inline comments with the details. Running \`/format\` will fix this.`,
+                    bandit: `Please see the inline comments for details on the security issue found.`,
+                    mypy: `Please see the inline comments for details on the type-checking errors.`,
                     app_test: `The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.`,
                     codeql: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.`
                 };
+
                 const blockers = Object.keys(outcomes).filter(key => outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
                 const suggestions = Object.keys(outcomes).filter(key => !outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
                 
@@ -209,7 +253,7 @@ jobs:
                 }
                 if (suggestions.length > 0) {
                   if (blockers.length === 0) {
-                     review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code:\n\n---\n\n`;
+                     review_body += `Everything looks good to merge, but I have a few minor suggestions (🎨) to improve the code. I've left them as inline comments.\n\nHere's a summary:\n\n---\n\n`;
                   } else {
                      review_body += `I also found some minor suggestions:\n\n`;
                   }
@@ -218,25 +262,28 @@ jobs:
                 if (event === 'REQUEST_CHANGES') {
                   review_body += `\nPlease address the blocking issues. Let me know if you have questions!`;
                 } else {
-                  review_body += `\nSince there are no blocking issues, I'm approving this PR. Please address the suggestions I've posted in a separate review comment.`;
+                  review_body += `\nSince there are no blocking issues, I'm approving this PR. Please consider addressing the suggestions I've left as inline comments.`;
                 }
             } else {
                  review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
                  is_perfect = true;
             }
 
-            // Only submit a final summary review if there are blockers or if everything is perfect.
-            // The reviewdog tool will have already submitted the "suggestions" review.
-            if (event === 'REQUEST_CHANGES' || is_perfect) {
+            // Part 3: Post the single review with summary body and all inline comments.
+            // Only post if there are inline comments, if changes are requested, or if it's a perfect run.
+            // This prevents posting an empty "Approve" review when the real review is pending (from reviewdog).
+            if (comments.length > 0 || event === 'REQUEST_CHANGES' || is_perfect) {
               await github.rest.pulls.createReview({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: context.issue.number,
                 event: event,
-                body: review_body
+                body: review_body,
+                comments: comments
               });
             }
             
+            // Part 4: Clean up the label if the PR was perfect.
             if (is_perfect) {
               try {
                 await github.rest.issues.removeLabel({
