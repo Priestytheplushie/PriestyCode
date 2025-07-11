@@ -19,12 +19,7 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done. Wish me luck! 🚀"
-            });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done. Wish me luck! 🚀" });
 
       - name: 🚚 Getting the code...
         uses: actions/checkout@v4
@@ -64,14 +59,21 @@ jobs:
           set -o pipefail
           
           # --- Group 1: Inline Comment Linters ---
-          echo "--- Running flake8 and black for inline comments ---"
-          if ! (flake8 src | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review); then
+          # This robust logic ONLY reports a failure if the linter EXITS with a non-zero code.
+          echo "--- Running flake8 for inline comments ---"
+          flake8_output=$(flake8 src)
+          if [ $? -ne 0 ]; then
             LINTER_FAILED_ANY=true
             echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
+            echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
           fi
-          if ! (black --check --diff src | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review); then
+
+          echo "--- Running black for inline comments ---"
+          black_output=$(black --check --diff src)
+          if [ $? -ne 0 ]; then
             LINTER_FAILED_ANY=true
             echo "black_status=FAILED" >> $GITHUB_OUTPUT
+            echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
           fi
 
           # --- Group 2: Summary Report Linters ---
@@ -85,7 +87,6 @@ jobs:
               echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
           fi
           
-          # Report the final overall status
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
           else
@@ -98,15 +99,10 @@ jobs:
       - name: 🧪 Running the critical App Test...
         id: app_test
         run: |
-          if xvfb-run timeout 10s python src/main.py; then
-            echo "status=PASSED" >> "$GITHUB_OUTPUT";
+          if xvfb-run timeout 10s python src/main.py; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
           else
-            exit_code=$?;
-            if [ $exit_code -eq 124 ]; then
-              echo "status=PASSED" >> "$GITHUB_OUTPUT";
-            else
-              echo "status=FAILED" >> "$GITHUB_OUTPUT";
-            fi
+            exit_code=$?; if [ $exit_code -eq 124 ]; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
+            else echo "status=FAILED" >> "$GITHUB_OUTPUT"; fi
           fi
 
       - name: 📝 Final, Intelligent Review and Team Huddle!
@@ -143,9 +139,7 @@ jobs:
               const inline_failed = (flake8_status === 'FAILED' || black_status === 'FAILED');
               const summary_failed = (isort_status === 'FAILED' || mypy_status === 'FAILED');
 
-              if (inline_failed) {
-                body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n";
-              }
+              if (inline_failed) { body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n"; }
               if (summary_failed) {
                 body += "For our codebase-wide checks, I've found some issues and included the full reports below:\n\n";
                 if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
@@ -154,7 +148,7 @@ jobs:
               body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
             } else {
               review_event = 'APPROVE';
-              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
+              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get this merged! 🎉";
             }
             
             await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, body: body, event: review_event });
