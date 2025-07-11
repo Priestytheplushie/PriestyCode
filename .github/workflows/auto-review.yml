@@ -20,7 +20,12 @@ permissions:
 jobs:
   lint-and-test:
     name: Lint & Test
-    if: github.event_name == 'pull_request'
+    # FIXED: This logic now ensures the bot only runs when it's an active reviewer.
+    # 1. Triggered by a new review request for the bot.
+    # 2. OR Triggered by a push (synchronize) to a PR where the bot is already a reviewer.
+    if: |
+      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
     runs-on: ubuntu-latest
     env:
       REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
@@ -32,6 +37,7 @@ jobs:
       mypy_outcome: ${{ steps.mypy.conclusion }}
       app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
+      # ... steps are unchanged ...
       - name: 💬 Acknowledging the review request...
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
@@ -72,7 +78,7 @@ jobs:
         continue-on-error: true
         uses: reviewdog/action-flake8@v3
         with:
-          filter_mode: "diff_context"
+          filter_mode: "nofilter"
           fail_on_error: true
           reporter: github-pr-check
           level: warning
@@ -82,31 +88,29 @@ jobs:
         continue-on-error: true
         uses: reviewdog/action-black@v3
         with:
-          filter_mode: "diff_context"
+          filter_mode: "nofilter"
           fail_on_error: true
           reporter: github-pr-check
           level: warning
-          # FIXED: Removed the '--diff' flag to ensure it always checks the files consistently.
           black_args: "--check src"
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
         run: |
-          # FIXED: Removed '--diff' to ensure it always checks the files consistently.
-          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-check -level=warning -fail-on-error
+          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-check -level=warning -fail-on-error -filter-mode="nofilter"
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
         run: |
-          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error
+          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error -filter-mode="nofilter"
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
         run: |
-          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error
+          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error -filter-mode="nofilter"
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
@@ -128,6 +132,11 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
+    # CodeQL runs on pushes to main (for baseline) AND on PRs the bot is reviewing.
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
     runs-on: ubuntu-latest
     permissions:
       security-events: write
@@ -155,15 +164,17 @@ jobs:
 
   final-review:
     name: Post Final Review
+    # This job only runs if the other jobs were not skipped.
+    if: always() && needs.lint-and-test.result != 'skipped'
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
-    if: always() && github.event_name == 'pull_request'
     steps:
       - name: 📝 Post Final Review Summary
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            // Script is unchanged
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
             const codeqlJobResult = '${{ needs.codeql.result }}';
