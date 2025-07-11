@@ -78,7 +78,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install flake8 black isort mypy bandit # reviewdog is installed by its action now
+          pip install flake8 black isort mypy bandit
 
       - name: Create linter-reports directory
         run: mkdir -p linter-reports
@@ -88,38 +88,191 @@ jobs:
         continue-on-error: true
         run: |
           flake8 src > flake8_raw_output.txt || true 
-          if [ -s flake8_raw_output.txt ]; then
-            # Using -f=flake8 and pipe. If BrokenPipeError persists, means reviewdog's parser isn't happy.
-            cat flake8_raw_output.txt | reviewdog -f=flake8 -reporter=rdjson -filter-mode=nofilter > linter-reports/flake8.rdjson || echo "{ \"diagnostics\": [] }" > linter-reports/flake8.rdjson
-          else
-            echo "{ \"diagnostics\": [] }" > linter-reports/flake8.rdjson
-          fi
+          cat << 'EOF' > convert_flake8_to_rdjson.py
+          import json
+          import sys
+          import re
+          import os
+
+          def convert_flake8_to_rdjson(flake8_report_path, rdjson_output_path):
+              diagnostics = []
+              flake8_pattern = re.compile(r"^(.*?):(\d+):(\d+): (\S+) (.*)$")
+
+              try:
+                  if not os.path.exists(flake8_report_path) or os.stat(flake8_report_path).st_size == 0:
+                      print(f"Flake8 report file {flake8_report_path} is empty or missing. Creating empty rdjson.")
+                      with open(rdjson_output_path, 'w') as f:
+                          json.dump({"source": {"name": "flake8"}, "diagnostics": []}, f, indent=2)
+                      return
+
+                  with open(flake8_report_path, 'r') as f:
+                      for line in f:
+                          match = flake8_pattern.match(line.strip())
+                          if match:
+                              file_path = match.group(1)
+                              line_num = int(match.group(2))
+                              col_num = int(match.group(3))
+                              code = match.group(4)
+                              message = match.group(5)
+
+                              diagnostics.append({
+                                  "message": f"[{code}] {message}",
+                                  "location": {
+                                      "path": file_path,
+                                      "range": {
+                                          "start": {"line": line_num, "column": col_num},
+                                          "end": {"line": line_num, "column": col_num}
+                                      }
+                                  },
+                                  "level": "warning", 
+                                  "code": {"value": code}
+                              })
+                          else:
+                              print(f"Skipping unparsable flake8 line: {line.strip()}")
+
+              except Exception as e:
+                  print(f"Error processing Flake8 report: {e}. Creating empty rdjson.")
+                  with open(rdjson_output_path, 'w') as f:
+                      json.dump({"source": {"name": "flake8"}, "diagnostics": []}, f, indent=2)
+                  return
+
+              rdjson_report = {
+                  "source": {"name": "flake8"},
+                  "diagnostics": diagnostics
+              }
+
+              with open(rdjson_output_path, 'w') as f:
+                  json.dump(rdjson_report, f, indent=2)
+
+          if __name__ == "__main__":
+              convert_flake8_to_rdjson(sys.argv[1], sys.argv[2])
+          EOF
+          python convert_flake8_to_rdjson.py flake8_raw_output.txt linter-reports/flake8.rdjson
 
       - name: 💅 Run Format Check (black)
         id: black
         continue-on-error: true
         run: |
-          # Black's output for --check primarily says "would reformat", lacks precise line numbers needed for inline comments.
-          # Aggregating to summary is more practical for black.
           black --check src > black_raw_output.txt 2>&1 || true
-          if [ -s black_raw_output.txt ]; then
-            cat black_raw_output.txt | reviewdog -f=black -reporter=rdjson -filter-mode=nofilter > linter-reports/black.rdjson || echo "{ \"diagnostics\": [] }" > linter-reports/black.rdjson
-          else
-            echo "{ \"diagnostics\": [] }" > linter-reports/black.rdjson
-          fi
+          cat << 'EOF' > convert_black_to_rdjson.py
+          import json
+          import sys
+          import re
+          import os
+
+          def convert_black_to_rdjson(black_report_path, rdjson_output_path):
+              diagnostics = []
+              file_pattern = re.compile(r"^would reformat (.*)$")
+
+              try:
+                  if not os.path.exists(black_report_path) or os.stat(black_report_path).st_size == 0:
+                      print(f"Black report file {black_report_path} is empty or missing. Creating empty rdjson.")
+                      with open(rdjson_output_path, 'w') as f:
+                          json.dump({"source": {"name": "black"}, "diagnostics": []}, f, indent=2)
+                      return
+
+                  with open(black_report_path, 'r') as f:
+                      for line in f:
+                          match = file_pattern.match(line.strip())
+                          if match:
+                              file_path = match.group(1).strip()
+                              diagnostics.append({
+                                  "message": "File needs reformatting by Black.",
+                                  "location": {
+                                      "path": file_path,
+                                      "range": {"start": {"line": 1}} 
+                                  },
+                                  "level": "info",
+                                  "code": {"value": "BLACK_REFORMAT"}
+                              })
+                          elif "would be reformatted" in line:
+                              diagnostics.append({
+                                  "message": line.strip(),
+                                  "level": "info",
+                                  "code": {"value": "BLACK_SUMMARY"}
+                              })
+
+              except Exception as e:
+                  print(f"Error processing Black report: {e}. Creating empty rdjson.")
+                  with open(rdjson_output_path, 'w') as f:
+                      json.dump({"source": {"name": "black"}, "diagnostics": []}, f, indent=2)
+                  return
+
+              rdjson_report = {
+                  "source": {"name": "black"},
+                  "diagnostics": diagnostics
+              }
+
+              with open(rdjson_output_path, 'w') as f:
+                  json.dump(rdjson_report, f, indent=2)
+
+          if __name__ == "__main__":
+              convert_black_to_rdjson(sys.argv[1], sys.argv[2])
+          EOF
+          python convert_black_to_rdjson.py black_raw_output.txt linter-reports/black.rdjson
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
         run: |
-          # Similar to black, isort --check output often lacks precise line numbers.
-          # Aggregating to summary is more practical.
           isort --check src > isort_raw_output.txt || true
-          if [ -s isort_raw_output.txt ]; then
-            cat isort_raw_output.txt | reviewdog -f=isort -reporter=rdjson -filter-mode=nofilter > linter-reports/isort.rdjson || echo "{ \"diagnostics\": [] }" > linter-reports/isort.rdjson
-          else
-            echo "{ \"diagnostics\": [] }" > linter-reports/isort.rdjson
-          fi
+          cat << 'EOF' > convert_isort_to_rdjson.py
+          import json
+          import sys
+          import re
+          import os
+
+          def convert_isort_to_rdjson(isort_report_path, rdjson_output_path):
+              diagnostics = []
+              file_pattern = re.compile(r"ERROR: (.*?) Imports are incorrectly sorted or formatted.$")
+
+              try:
+                  if not os.path.exists(isort_report_path) or os.stat(isort_report_path).st_size == 0:
+                      print(f"Isort report file {isort_report_path} is empty or missing. Creating empty rdjson.")
+                      with open(rdjson_output_path, 'w') as f:
+                          json.dump({"source": {"name": "isort"}, "diagnostics": []}, f, indent=2)
+                      return
+
+                  with open(isort_report_path, 'r') as f:
+                      for line in f:
+                          match = file_pattern.match(line.strip())
+                          if match:
+                              file_path = match.group(1).strip()
+                              diagnostics.append({
+                                  "message": "Imports are incorrectly sorted or formatted.",
+                                  "location": {
+                                      "path": file_path,
+                                      "range": {"start": {"line": 1}} 
+                                  },
+                                  "level": "info", 
+                                  "code": {"value": "ISORT_ERROR"}
+                              })
+                          else:
+                              if line.strip() and line.strip().startswith("ERROR:"):
+                                  diagnostics.append({
+                                      "message": line.strip(),
+                                      "level": "error",
+                                      "code": {"value": "ISORT_GENERAL_ERROR"}
+                                  })
+
+              except Exception as e:
+                  print(f"Error processing Isort report: {e}. Creating empty rdjson.")
+                  with open(rdjson_output_path, 'w') as f:
+                      json.dump({"source": {"name": "isort"}, "diagnostics": []}, f, indent=2)
+                  return
+
+              rdjson_report = {
+                  "source": {"name": "isort"},
+                  "diagnostics": diagnostics
+              }
+
+              with open(rdjson_output_path, 'w') as f:
+                  json.dump(rdjson_report, f, indent=2)
+
+          if __name__ == "__main__":
+              convert_isort_to_rdjson(sys.argv[1], sys.argv[2])
+          EOF
+          python convert_isort_to_rdjson.py isort_raw_output.txt linter-reports/isort.rdjson
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
@@ -209,7 +362,7 @@ jobs:
                               level_str = match.group(4).lower()
                               message = match.group(5)
 
-                              level = "info" # Default
+                              level = "info" 
                               if "error" in level_str:
                                   level = "error"
                               elif "warning" in level_str:
@@ -256,6 +409,8 @@ jobs:
         continue-on-error: true
         run: |
           echo "Starting the Tkinter app in a virtual display..."
+          # Use timeout and xvfb-run to handle the Tkinter app
+          # Exit code 124 means timeout, which we consider a success for non-crashing apps
           if xvfb-run timeout 10s python -m src.main; then
             echo "App test result: PASSED (exited cleanly before timeout)"
             exit 0
@@ -326,8 +481,8 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             
-            const commentsToPost = []; // This will hold all comments: inline or file-level
-            const summaryDiagnostics = {}; // For summary aggregation as a last resort
+            const inlineComments = []; 
+            const summaryDiagnostics = {}; 
 
             const reportDir = './linter-reports';
             try {
@@ -358,22 +513,18 @@ jobs:
                   for (const diag of report.diagnostics) {
                     const location = diag.location || diag.primaryLocation; 
                     const filePath = location?.path;
-                    const startLine = location?.range?.start?.line || location?.span?.start?.line; 
+                    const startLine = location?.range?.start?.line; 
                     
+                    // Prioritize inline comments if path and a valid line number exist
                     if (filePath && typeof startLine === 'number' && startLine > 0) { 
-                      // Attempt inline comment first
-                      commentsToPost.push({
+                      inlineComments.push({
                           path: filePath,
-                          line: startLine,
+                          line: startLine, // This 'line' maps to the 'position' in the diff hunk
                           body: `**[${sourceName}]**: ${diag.message}`
                       });
                     } else if (filePath) { 
-                      // If no valid line, but has a path, add as file-level comment
-                      commentsToPost.push({
-                          path: filePath,
-                          body: `**[${sourceName}]**: ${diag.message} (General issue in file)`
-                      });
-                      summaryDiagnostics[sourceName].push(`${diag.message} (File: \`${filePath}\`)`);
+                      // If no valid line, but has a path, add to summary with file context
+                      summaryDiagnostics[sourceName].push(`File \`${filePath}\`: ${diag.message}`); 
                     } else {
                         // If no path, add to summary as last resort
                         summaryDiagnostics[sourceName].push(`[${sourceName}] (General Issue): ${diag.message}`);
@@ -402,39 +553,30 @@ jobs:
             };
 
             const appTestPassed = outcomes.app_test.conclusion === 'success';
-            const hasAnyLinterIssues = commentsToPost.length > 0 || Object.values(summaryDiagnostics).some(arr => arr.length > 0);
+            const hasAnyLinterIssues = inlineComments.length > 0 || Object.values(summaryDiagnostics).some(arr => arr.length > 0);
             const codeQLFailed = outcomes.codeql.conclusion === 'failure';
             const anyLinterStepFailed = ['flake8', 'black', 'isort', 'bandit', 'mypy'].some(linter => outcomes[linter].conclusion === 'failure');
 
             // --- Core Logic: Determine APPROVE vs. REQUEST_CHANGES ---
 
             if (!appTestPassed) {
-                // If app test failed, always request changes.
                 event = 'REQUEST_CHANGES';
                 review_body += `**🚨 Critical Issue: The Tkinter application failed to run for 10 seconds!**\n`;
                 review_body += `Please ensure the \`src/main.py\` application starts correctly and remains stable for at least 10 seconds without crashing. This is a primary requirement for merging.\n\n`;
                 
-                // If the app test failed, any other failures also become important to mention.
                 if (hasAnyLinterIssues || codeQLFailed || anyLinterStepFailed) {
                     review_body += `---\n\nAdditionally, I found other issues (these become blocking since the app test failed):\n\n`;
-                    // List all specific linters/CodeQL that had issues or whose steps failed
                     if (anyLinterStepFailed) {
-                        review_body += `* **Failed Linter/Check Steps:**\n`;
-                        ['flake8', 'black', 'isort', 'bandit', 'mypy'].forEach(linter => {
-                            if (outcomes[linter].conclusion === 'failure') {
-                                review_body += `    - ${outcomes[linter].title} failed its check. See workflow logs.\n`;
-                            }
-                        });
+                        review_body += `* **Failed Linter/Check Steps:** Some linter steps failed. Please check the workflow logs for details. This is blocking.\n`;
                     }
                     if (codeQLFailed) {
-                        review_body += `* **CodeQL Analysis:** Failed. Go to the 'Security' tab for details.\n`;
+                        review_body += `* **CodeQL Analysis:** Failed. Go to the 'Security' tab for details. This is blocking.\n`;
                     }
-                    if (commentsToPost.length > 0) {
-                         review_body += `* **Linter/Static Analysis Findings:** See comments on code or aggregated details below.\n`;
+                    if (inlineComments.length > 0) {
+                         review_body += `* **Inline Comments:** See comments directly on the code for specific issues. These are now blocking.\n`;
                     }
                 }
                 
-                // Add aggregated diagnostics to the summary (even if app test failed)
                 let aggregatedDetails = '';
                 for (const linterName in summaryDiagnostics) {
                     if (summaryDiagnostics[linterName].length > 0) {
@@ -457,7 +599,6 @@ jobs:
                 review_body += `The Tkinter application passed its 10-second run test successfully! 🎉 This PR is good to merge.\n\n`;
                 
                 if (hasAnyLinterIssues || codeQLFailed || anyLinterStepFailed) {
-                    // App Test passed, so linters/CodeQL are advisory. Still APPROVE.
                     event = 'APPROVE'; 
                     review_body += `However, I've found some **advisory suggestions** to improve the code quality. These are not blockers for merging but are highly recommended:\n\n---\n\n`;
                     
@@ -467,13 +608,12 @@ jobs:
                     if (codeQLFailed) {
                         review_body += `* **CodeQL Analysis:** Failed. Go to the 'Security' tab for detailed advice.\n`;
                     }
-                    if (commentsToPost.length > 0) {
-                        review_body += `* **Code Comments:** Please check the code for inline or file-level comments outlining specific suggestions.\n`;
+                    if (inlineComments.length > 0) {
+                        review_body += `* **Inline Comments:** Please check the code for inline comments outlining specific suggestions.\n`;
                     } else {
                         review_body += `* **Aggregated Linter Findings:** No specific code comments were generated, but review the 'Detailed Linter Findings' section below for aggregated advice.\n`;
                     }
                     
-                    // Add aggregated diagnostics to the summary
                     let aggregatedDetails = '';
                     for (const linterName in summaryDiagnostics) {
                         if (summaryDiagnostics[linterName].length > 0) {
@@ -493,23 +633,20 @@ jobs:
                     review_body += `\nFeel free to merge this PR. Addressing these suggestions would be beneficial for code quality!`;
                     is_perfect_run = false; 
                 } else {
-                    // App test passed, AND no linter/CodeQL issues
                     review_body += `Everything looks perfectly clean! All checks passed, including the application test. Keep up the fantastic work! 👍`;
                     is_perfect_run = true;
                 }
             }
 
-            // Post the review
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
               event: event,
               body: review_body,
-              comments: commentsToPost 
+              comments: inlineComments // Only pass valid inline comments here
             });
             
-            // Remove label only if the entire run was "perfect"
             if (is_perfect_run) {
               try {
                 await github.rest.issues.removeLabel({
