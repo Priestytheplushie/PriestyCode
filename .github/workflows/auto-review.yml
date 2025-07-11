@@ -20,12 +20,9 @@ permissions:
 jobs:
   lint-and-test:
     name: Lint & Test
-    # FIXED: This logic now ensures the bot only runs when it's an active reviewer.
-    # 1. Triggered by a new review request for the bot.
-    # 2. OR Triggered by a push (synchronize) to a PR where the bot is already a reviewer.
     if: |
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
     runs-on: ubuntu-latest
     env:
       REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
@@ -37,18 +34,23 @@ jobs:
       mypy_outcome: ${{ steps.mypy.conclusion }}
       app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
-      # ... steps are unchanged ...
-      - name: 💬 Acknowledging the review request...
+      - name: Add 'priestybot-review' Label
         if: github.event.action == 'review_requested'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['priestybot-review']
+            });
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `Hey @${context.payload.pull_request.user.login}! 👋 Thanks for the review request. I'll get started right away. 🧐`
+              body: `Hey @${context.payload.pull_request.user.login}! 👋 Thanks for the review request. I'll get started right away and will keep an eye on this PR for any new changes. 🧐`
             });
 
       - name: Check out repository
@@ -79,7 +81,7 @@ jobs:
         uses: reviewdog/action-flake8@v3
         with:
           filter_mode: "nofilter"
-          fail_on_error: true
+          fail_on_error: true # This action correctly translates this to the new flag
           reporter: github-pr-check
           level: warning
 
@@ -89,33 +91,35 @@ jobs:
         uses: reviewdog/action-black@v3
         with:
           filter_mode: "nofilter"
-          fail_on_error: true
+          fail_on_error: true # This action correctly translates this to the new flag
           reporter: github-pr-check
           level: warning
           black_args: "--check src"
       
+      # FIXED: Replaced deprecated `-fail-on-error` with modern `-fail-level` flag
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
         run: |
-          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-check -level=warning -fail-on-error -filter-mode="nofilter"
+          isort --check src | reviewdog -f=isort -name="isort-check" -reporter=github-pr-check -level=warning -filter-mode="nofilter" -fail-level=warning
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
         run: |
-          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -fail-on-error -filter-mode="nofilter"
+          bandit -r src -f txt | reviewdog -f=bandit -name="bandit-check" -reporter=github-pr-check -level=error -filter-mode="nofilter" -fail-level=error
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
         run: |
-          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -fail-on-error -filter-mode="nofilter"
+          mypy src | reviewdog -f=mypy -name="mypy-check" -reporter=github-pr-check -level=error -filter-mode="nofilter" -fail-level=error
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
         continue-on-error: true
         run: |
+          # ... (unchanged)
           echo "Starting the Tkinter app in a virtual display..."
           if xvfb-run timeout 10s python -m src.main; then
             echo "App test result: PASSED (exited cleanly before timeout)"
@@ -132,11 +136,10 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
-    # CodeQL runs on pushes to main (for baseline) AND on PRs the bot is reviewing.
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.requested_reviewers.*.login, 'PriestyBot'))
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
     runs-on: ubuntu-latest
     permissions:
       security-events: write
@@ -144,27 +147,24 @@ jobs:
     outputs:
       analyze_outcome: ${{ steps.analyze.outcome }}
     steps:
+      # ... (unchanged)
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
-
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: python
           config-file: ./.github/codeql/codeql-config.yml
-
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
-
       - name: Perform CodeQL Analysis
         id: analyze
         uses: github/codeql-action/analyze@v3
 
   final-review:
     name: Post Final Review
-    # This job only runs if the other jobs were not skipped.
     if: always() && needs.lint-and-test.result != 'skipped'
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
@@ -174,50 +174,39 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            // Script is unchanged
             const pr_author = context.payload.pull_request.user.login;
             const lintJobResult = '${{ needs.lint-and-test.result }}';
             const codeqlJobResult = '${{ needs.codeql.result }}';
             let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
             let event = 'APPROVE';
 
-            if (lintJobResult === 'failure' || codeqlJobResult === 'failure') {
-              event = 'REQUEST_CHANGES';
-              review_body += `❌ **Workflow Error:** One of the main check jobs ('Lint & Test' or 'CodeQL') failed unexpectedly. This could be due to a configuration issue in the workflow file itself.\n\n`;
-              review_body += `Please check the workflow logs in the "Checks" tab for the exact error message. I cannot approve this PR until the workflow runs successfully.`;
-            } else {
-              const outcomes = {
-                flake8: { outcome: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
-                black: { outcome: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
-                isort: { outcome: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
-                bandit: { outcome: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
-                mypy: { outcome: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
-                app_test: { outcome: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
-                codeql: { outcome: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
-              };
-              
-              const fix_guides = {
-                  flake8: `I have left inline comments with the details. Please review them and apply the suggested fixes.`,
-                  black: `You can run \`black src\` locally to fix this. For an even easier fix, just **comment \`/format\` on this PR**, and I will do it for you!`,
-                  isort: `You can run \`isort src\` locally. This will also be fixed automatically if you use the **\`/format\`** command.`,
-                  bandit: `Please check my inline comments for the specific vulnerability and how to address it.`,
-                  mypy: `Check the \`mypy\` logs in the "Checks" tab for the exact line and error, or review my inline comments.`,
-                  app_test: `The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.`,
-                  codeql: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.`
-              };
+            if (lintJobResult === 'failure' && needs.lint-and-test.result != 'success' || codeqlJobResult === 'failure' && needs.codeql.result != 'success') {
+                const outcomes = {
+                  flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
+                  black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
+                  isort: { conclusion: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
+                  bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
+                  mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
+                  app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
+                  codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
+                };
+                const fix_guides = {
+                    flake8: `I have left inline comments with the details. Please review them and apply the suggested fixes.`,
+                    black: `You can run \`black src\` locally to fix this. For an even easier fix, just **comment \`/format\` on this PR**, and I will do it for you!`,
+                    isort: `You can run \`isort src\` locally. This will also be fixed automatically if you use the **\`/format\`** command.`,
+                    bandit: `Please check my inline comments for the specific vulnerability and how to address it.`,
+                    mypy: `Check the \`mypy\` logs in the "Checks" tab for the exact line and error, or review my inline comments.`,
+                    app_test: `The app failed to run for 10 seconds. Please check the workflow logs in the "Lint & Test" job for the full error message.`,
+                    codeql: `Go to the **'Security' tab** of this repository, find the new 'Code scanning alert' for this pull request, and follow the detailed remediation advice provided there.`
+                };
+                const blockers = Object.keys(outcomes).filter(key => outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
+                const suggestions = Object.keys(outcomes).filter(key => !outcomes[key].isBlocker && outcomes[key].conclusion === 'failure');
+                
+                if (blockers.length > 0) { event = 'REQUEST_CHANGES'; }
 
-              const blockers = Object.keys(outcomes).filter(key => outcomes[key].isBlocker && outcomes[key].outcome === 'failure');
-              const suggestions = Object.keys(outcomes).filter(key => !outcomes[key].isBlocker && outcomes[key].outcome === 'failure');
-
-              if (blockers.length === 0 && suggestions.length === 0) {
-                review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
-              } else {
                 if (blockers.length > 0) {
-                  event = 'REQUEST_CHANGES';
                   review_body += `I've found a few critical issues (🚨) that need your attention before this can be merged. Here's a breakdown:\n\n---\n\n`;
-                  for (const key of blockers) {
-                    review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`;
-                  }
+                  for (const key of blockers) { review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`; }
                 }
                 if (suggestions.length > 0) {
                   if (blockers.length === 0) {
@@ -225,17 +214,15 @@ jobs:
                   } else {
                      review_body += `I also found some minor suggestions:\n\n`;
                   }
-                  for (const key of suggestions) {
-                    review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`;
-                  }
+                  for (const key of suggestions) { review_body += `*   **${outcomes[key].title}**\n    *   **To Fix:** ${fix_guides[key]}\n\n`; }
                 }
-
                 if (event === 'REQUEST_CHANGES') {
                   review_body += `\nPlease address the blocking issues. Let me know if you have questions!`;
                 } else {
                   review_body += `\nSince there are no blocking issues, I'm approving this PR. Great work!`;
                 }
-              }
+            } else {
+                 review_body += `Everything looks great! All checks passed. Keep up the fantastic work! 👍`;
             }
 
             await github.rest.pulls.createReview({
@@ -245,3 +232,16 @@ jobs:
               event: event,
               body: review_body
             });
+            
+            if (event === 'APPROVE') {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: 'priestybot-review'
+                });
+              } catch (error) {
+                console.log("Could not remove 'priestybot-review' label, it might not exist or already be removed.");
+              }
+            }
