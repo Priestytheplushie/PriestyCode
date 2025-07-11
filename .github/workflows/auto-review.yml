@@ -1,3 +1,32 @@
+name: CodeQL Baseline Security Scan
+
+on:
+  push:
+    branches: [ main ] # Change to `master` if that's your default branch
+
+permissions:
+  security-events: write
+
+jobs:
+  codeql-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'python'
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3```
+
+***
+
+### **2. The Definitive PR Review Workflow: `.github/workflows/review-bot.yml`**
+
+*(This version contains the critically important fix to the `linting` script to prevent crashes.)*
+
+```yaml
 name: PriestyBot PR Review
 
 on:
@@ -57,34 +86,34 @@ jobs:
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
           set -o pipefail
-          
+
           # --- Group 1: Inline Comment Linters ---
-          # This robust logic ONLY reports a failure if the linter EXITS with a non-zero code.
+          # This robust logic prevents the step from crashing if a linter fails.
           echo "--- Running flake8 for inline comments ---"
-          flake8_output=$(flake8 src)
-          if [ $? -ne 0 ]; then
+          if ! flake8_output=$(flake8 src 2>&1); then
             LINTER_FAILED_ANY=true
             echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
             echo "$flake8_output" | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
           fi
 
           echo "--- Running black for inline comments ---"
-          black_output=$(black --check --diff src)
-          if [ $? -ne 0 ]; then
+          if ! black_output=$(black --check --diff src 2>&1); then
             LINTER_FAILED_ANY=true
             echo "black_status=FAILED" >> $GITHUB_OUTPUT
             echo "$black_output" | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
           fi
-
+          
           # --- Group 2: Summary Report Linters ---
           echo "--- Running isort and mypy for summary reports ---"
-          if ! isort --check src > isort_report.txt 2>&1; then
+          if ! isort_output=$(isort --check src 2>&1); then
               LINTER_FAILED_ANY=true
               echo "isort_status=FAILED" >> $GITHUB_OUTPUT
+              echo "$isort_output" > isort_report.txt
           fi
-          if ! mypy src > mypy_report.txt 2>&1; then
+          if ! mypy_output=$(mypy src 2>&1); then
               LINTER_FAILED_ANY=true
               echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
+              echo "$mypy_output" > mypy_report.txt
           fi
           
           if [ "$LINTER_FAILED_ANY" = true ]; then
