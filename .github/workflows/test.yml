@@ -1,0 +1,47 @@
+# .github/workflows/linter-full-scan.yml
+
+name: Flake8 Linter (Full Scan)
+
+# This workflow runs ONLY when a review is requested on a pull request.
+on:
+  pull_request:
+    types: [review_requested]
+
+permissions:
+  # Required to read the code from the repository.
+  contents: read
+  # Required to post review comments on the pull request.
+  pull-requests: write
+
+jobs:
+  flake8-full-scan:
+    name: Run Flake8 with Reviewdog (Full Scan)
+    runs-on: ubuntu-latest
+
+    # This job will only run if the user requested for review is 'PriestyBot'.
+    if: github.event.requested_reviewer.login == 'PriestyBot'
+
+    steps:
+      # Step 1: Checkout the pull request's head commit.
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Step 2: Run the reviewdog action for flake8.
+      - name: Run reviewdog with flake8
+        uses: reviewdog/action-flake8@v3
+        with:
+          # This token will be used to post the review.
+          github_token: ${{ secrets.APPROVER_TOKEN }}
+
+          # 'github-pr-review' posts all findings as a single review.
+          reporter: github-pr-review
+
+          # --- THIS IS THE KEY CHANGE ---
+          # 'nofilter' reports all issues found by flake8 in the entire
+          # scanned project, not just the ones on changed lines in the PR.
+          filter_mode: nofilter
+
+          # The minimum severity level to report.
+          level: warning
