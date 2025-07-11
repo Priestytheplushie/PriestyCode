@@ -30,7 +30,7 @@ jobs:
       isort_outcome: ${{ steps.isort.conclusion }}
       bandit_outcome: ${{ steps.bandit.conclusion }}
       mypy_outcome: ${{ steps.mypy.conclusion }}
-      app_test_outcome: ${{ steps.app_test.outcome }}
+      app_test_outcome: ${{ steps.app_test.conclusion }}
     steps:
       - name: Add 'priestybot-review' Label
         if: github.event.action == 'review_requested'
@@ -62,12 +62,14 @@ jobs:
               issue_number: context.issue.number,
               body: `Just noticed you pushed new changes! Taking another look... 🧐`
             });
-
-      # FIXED CHECKOUT STEP
+      
+      # FIX #1: Explicitly check out the PR branch to provide correct git context for reviewdog.
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetches full history for reviewdog's diff filter
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -137,6 +139,7 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
+    # ... (This job remains unchanged) ...
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
@@ -209,23 +212,24 @@ jobs:
             }
 
             const pr_author = context.payload.pull_request.user.login;
-            const lintJobResult = '${{ needs.lint-and-test.result }}';
-            const codeqlJobResult = '${{ needs.codeql.result }}';
             let review_body = `Hi @${pr_author}, I've finished my review!\n\n`;
             let event = 'APPROVE';
             let is_perfect = false;
 
-            if (lintJobResult === 'failure' || (codeqlJobResult === 'failure' && needs.codeql.result !== 'skipped')) {
-                const outcomes = {
-                  flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
-                  black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
-                  isort: { conclusion: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
-                  bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
-                  mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
-                  app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
-                  codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
-                };
-                
+            const outcomes = {
+              flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
+              black: { conclusion: `${{ needs.lint-and-test.outputs.black_outcome }}`, isBlocker: false, title: `🎨 Formatting & Style (\`black\`)` },
+              isort: { conclusion: `${{ needs.lint-and-test.outputs.isort_outcome }}`, isBlocker: false, title: `🎨 Import Order (\`isort\`)` },
+              bandit: { conclusion: `${{ needs.lint-and-test.outputs.bandit_outcome }}`, isBlocker: true, title: `🚨 Security Analysis (\`bandit\`)` },
+              mypy: { conclusion: `${{ needs.lint-and-test.outputs.mypy_outcome }}`, isBlocker: true, title: `🚨 Type Checking (\`mypy\`)` },
+              app_test: { conclusion: `${{ needs.lint-and-test.outputs.app_test_outcome }}`, isBlocker: true, title: `🚨 Application Test` },
+              codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
+            };
+
+            // FIX #2: Check the individual step conclusions, not the misleading job result.
+            const hasFailure = Object.values(outcomes).some(o => o.conclusion === 'failure');
+
+            if (hasFailure) {
                 const fix_guides = {
                     flake8: `I have posted inline comments with the details. Please address them. You can also try running \`/format\` to fix some issues.`,
                     black: `I have posted inline comments with the details. Running \`/format\` will fix this.`,
