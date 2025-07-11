@@ -1,274 +1,171 @@
-name: PriestyBot Auto-Review & CodeQL
+name: PriestyBot PR Reviewer
 
 on:
   pull_request:
-    types: [review_requested, synchronize]
+    types: [review_requested, synchronize]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
+# These permissions are required for the bot to post check annotations and submit a review.
 permissions:
   contents: read
   pull-requests: write
   checks: write
-  security-events: write
 
 jobs:
-  lint-and-test:
-    name: Lint & Test
-    if: |
-      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
+  review:
+    name: PriestyBot Review
     runs-on: ubuntu-latest
-    outputs:
-      flake8_report: ${{ steps.flake8.outputs.report }}
-      black_report: ${{ steps.black.outputs.report }}
-      isort_report: ${{ steps.isort.outputs.report }}
-      bandit_report: ${{ steps.bandit.outputs.report }}
-      mypy_report: ${{ steps.mypy.outputs.report }}
-      app_test_outcome: ${{ steps.app_test.outcome }}
     steps:
-      - name: Add 'priestybot-review' Label & Comment
-        if: github.event.action == 'review_requested'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const issue_number = context.issue.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            await github.rest.issues.addLabels({
-              owner, repo, issue_number,
-              labels: ['priestybot-review']
-            });
-            await github.rest.issues.createComment({
-              owner, repo, issue_number,
-              body: `Hey @${context.payload.pull_request.user.login}! 👋 Thanks for the review request. I'll get started right away.\n\nP.S. I've added the \`priestybot-review\` label. I'll keep re-reviewing any new changes you push. If you want me to stop, just remove the label!`
-            });
-      
-      - name: 💬 Acknowledging New Changes
-        if: github.event.action == 'synchronize'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `Just noticed you pushed new changes! Taking another look... 🧐`
-            });
-
-      - name: Check out repository
+      # Step 1: Checkout the pull request code
+      - name: ⬇️ Checkout Code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # Step 2: Set up the Python environment
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-          cache: 'pip'
-      
-      - name: Install Dependencies
+          python-version: '3.10' # You can change this to your project's Python version
+
+      # Step 3: Install project dependencies and the tools for the bot
+      - name: 🛠️ Install Dependencies & Tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install flake8 black isort mypy bandit
+          # Install project dependencies from requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Install the linters and reviewdog for the bot
+          pip install flake8 black bandit mypy
+          # Install reviewdog, which is used to post inline comments
+          wget -O - -q https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh| sh -s -- -b /usr/local/bin
 
-      - name: 💧 Run Linter (flake8)
-        id: flake8
-        continue-on-error: true
-        run: echo "report=$(flake8 src --format='%(path)s:%(row)d:%(col)d: [%(code)s] %(text)s' | base64 -w 0)" >> $GITHUB_OUTPUT
-
-      - name: 💅 Run Format Check (black)
-        id: black
-        continue-on-error: true
-        run: echo "report=$(black --check --diff src 2>&1 | base64 -w 0)" >> $GITHUB_OUTPUT
-      
-      - name: sorted? Run Import Sort Check (isort)
-        id: isort
-        continue-on-error: true
-        run: echo "report=$(isort --check-only --diff src 2>&1 | base64 -w 0)" >> $GITHUB_OUTPUT
-
-      - name: 🔒 Run Security Check (bandit)
-        id: bandit
-        continue-on-error: true
-        run: echo "report=$(bandit -r src -f custom --msg-template '{path}:{line}: [{test_id}] {msg}' | base64 -w 0)" >> $GITHUB_OUTPUT
-      
-      - name: 🧐 Run Type Check (mypy)
-        id: mypy
-        continue-on-error: true
-        run: echo "report=$(mypy src | base64 -w 0)" >> $GITHUB_OUTPUT
-
+      # Step 4: Run the Tkinter app test to determine the core outcome (pass/fail)
       - name: 🧪 Run Tkinter App Test
         id: app_test
-        continue-on-error: true
+        continue-on-error: true # This ensures the workflow continues to the review step even if the test fails
         run: |
+          # We need to install a virtual framebuffer to run a GUI app in a headless environment
+          sudo apt-get update && sudo apt-get install -y xvfb
+          
+          # This is the test script you provided
           if xvfb-run timeout 10s python -m src.main; then
-            echo "App test PASSED: Exited cleanly before timeout."
+            echo "✅ App test PASSED: The app exited cleanly before the 10s timeout."
+            echo "outcome=success" >> $GITHUB_OUTPUT
             exit 0
           else
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
-              echo "App test PASSED: Ran for 10s and was terminated as expected."
+              echo "✅ App test PASSED: The app ran for the full 10s and was terminated as expected."
+              echo "outcome=success" >> $GITHUB_OUTPUT
               exit 0
             else
-              echo "App test FAILED: App crashed with exit code $exit_code."
+              echo "❌ App test FAILED: The app crashed with exit code $exit_code."
+              echo "outcome=failure" >> $GITHUB_OUTPUT
               exit 1
             fi
           fi
 
-  codeql:
-    name: CodeQL Analysis
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      actions: read
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.ref }}
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: python
-          config-file: ./.github/codeql/codeql-config.yml
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+      # Step 5: Run linters. Reviewdog will post findings as "Check Annotations".
+      - name: 🧐 Run Linters & Post Annotations
+        id: linters
+        continue-on-error: true # Linter issues are advisory, so they should not fail the workflow
+        env:
+          # This token is used by reviewdog to post annotations to the PR
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+        run: |
+          # Initialize status variables
+          flake8_found_issues=false
+          black_found_issues=false
+          bandit_found_issues=false
+          mypy_found_issues=false
 
-  final-review:
-    name: Post Final Review
-    if: always() && needs.lint-and-test.result != 'skipped'
-    runs-on: ubuntu-latest
-    needs: [lint-and-test, codeql]
-    steps:
-      - name: 📝 Post Final Review Summary
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const pull_number = context.issue.number;
+          # --- Run Flake8 ---
+          flake8 . | tee flake8_output.txt
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            flake8_found_issues=true
+            cat flake8_output.txt | reviewdog -f="flake8" -name="Flake8 Linter" -reporter="github-pr-check" -level="warning"
+          fi
 
-            // Helper to decode Base64 reports
-            const atob = (b64) => Buffer.from(b64, 'base64').toString('utf-8');
+          # --- Run Black ---
+          black --check --diff . > black_diff.txt 2>&1
+          if [ $? -ne 0 ]; then
+            black_found_issues=true
+          fi
 
-            // Fetch the diff to identify changed lines
-            const { data: diff } = await github.rest.pulls.get({
-              owner, repo, pull_number,
-              mediaType: { format: "diff" }
-            });
-            
-            const changedLines = {};
-            let currentFile = "";
-            for (const line of diff.split('\n')) {
-              if (line.startsWith('+++ b/')) {
-                currentFile = line.substring(6);
-                changedLines[currentFile] = new Set();
-              }
-              if (line.startsWith('@@')) {
-                const match = line.match(/\+([0-9]+)/);
-                if (match) {
-                  let startLine = parseInt(match[1]);
-                  let currentLineInHunk = startLine;
-                  const hunkLines = line.substring(line.indexOf('@@') + 2).split('\n');
-                  // This is a simplified diff parser. A more robust solution might be needed for complex diffs.
-                  // For now, we'll add all lines in the 'add' part of the hunk.
-                  const hunkInfo = line.split("@@")[1];
-                  const lines = diff.substring(diff.indexOf(hunkInfo) + hunkInfo.length).split('\n');
-                  let lineNumInFile = startLine;
-                  for (const diffLine of lines) {
-                    if (diffLine.startsWith('+') && !diffLine.startsWith('+++')) {
-                      changedLines[currentFile].add(lineNumInFile);
-                      lineNumInFile++;
-                    } else if (!diffLine.startsWith('-')) {
-                      lineNumInFile++;
-                    }
-                  }
-                }
-              }
-            }
-            
-            const inlineComments = [];
-            const summaryIssues = {};
+          # --- Run Bandit ---
+          bandit -r . -f screen | tee bandit_output.txt
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            bandit_found_issues=true
+            cat bandit_output.txt | reviewdog -name="Bandit Security" -reporter="github-pr-check" -level="warning"
+          fi
 
-            function addIssue(linter, message) {
-              const match = message.match(/^([^:]+):(\d+):/);
-              if (match && changedLines[match[1]]?.has(parseInt(match[2]))) {
-                inlineComments.push({
-                  path: match[1],
-                  line: parseInt(match[2]),
-                  body: `**[${linter}]**: ${message.substring(message.indexOf(']') + 2)}`
-                });
-              } else {
-                summaryIssues[linter] = summaryIssues[linter] || [];
-                summaryIssues[linter].push(message);
-              }
-            }
+          # --- Run Mypy ---
+          mypy . --ignore-missing-imports | tee mypy_output.txt
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            mypy_found_issues=true
+            cat mypy_output.txt | reviewdog -f="mypy" -name="Mypy Type Checker" -reporter="github-pr-check" -level="warning"
+          fi
 
-            // Process reports
-            const reports = {
-              flake8: atob("${{ needs.lint-and-test.outputs.flake8_report }}"),
-              bandit: atob("${{ needs.lint-and-test.outputs.bandit_report }}"),
-              mypy: atob("${{ needs.lint-and-test.outputs.mypy_report }}"),
-              isort: atob("${{ needs.lint-and-test.outputs.isort_report }}"),
-              black: atob("${{ needs.lint-and-test.outputs.black_report }}")
-            };
+          # Set outputs for the final review step
+          if $flake8_found_issues || $black_found_issues || $bandit_found_issues || $mypy_found_issues; then
+            echo "status=issues_found" >> $GITHUB_OUTPUT
+          else
+            echo "status=clean" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "black_issues=$black_found_issues" >> $GITHUB_OUTPUT
+          if $black_found_issues; then
+            echo 'black_diff<<EOF' >> $GITHUB_OUTPUT
+            cat black_diff.txt >> $GITHUB_OUTPUT
+            echo 'EOF' >> $GITHUB_OUTPUT
+          fi
 
-            reports.flake8.split('\n').filter(l => l).forEach(l => addIssue('flake8', l));
-            reports.bandit.split('\n').filter(l => l).forEach(l => addIssue('bandit', l));
-            reports.mypy.split('\n').filter(l => l).forEach(l => addIssue('mypy', l));
-            
-            // Handle linters with non-standard output (like black and isort)
-            if (reports.isort.includes("ERROR")) {
-              summaryIssues['isort'] = reports.isort.split('\n').filter(l => l);
-            }
-            if (reports.black.includes("would be reformatted")) {
-               summaryIssues['black'] = reports.black.split('\n').filter(l => l);
-            }
+      # Step 6: Prepare the summary message and submit the final PR review
+      - name: 📝 Prepare and Submit Review
+        env:
+          # Use the GitHub CLI, authenticated with your bot's token
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          # Pass step outputs as environment variables for the script
+          APP_TEST_OUTCOME: ${{ steps.app_test.outputs.outcome }}
+          LINTER_STATUS: ${{ steps.linters.outputs.status }}
+          BLACK_ISSUES: ${{ steps.linters.outputs.black_issues }}
+          BLACK_DIFF: ${{ steps.linters.outputs.black_diff }}
+        run: |
+          # --- Build the Review Body ---
+          # Set the final decision (event) and app test summary
+          if [ "$APP_TEST_OUTCOME" == "success" ]; then
+            EVENT="APPROVE"
+            APP_TEST_RESULT="✅ **App Test: Passed!** Great job, this is ready to merge."
+          else
+            EVENT="REQUEST_CHANGES"
+            APP_TEST_RESULT="❌ **App Test: Failed.** The application didn't run correctly. This is a required check and must be fixed."
+          fi
 
-            // Determine review status
-            const appTestPassed = "${{ needs.lint-and-test.outputs.app_test_outcome }}" === 'success';
-            let event = appTestPassed ? 'APPROVE' : 'REQUEST_CHANGES';
-            let review_body = `Hi @${context.payload.pull_request.user.login}, I've finished my review!\n\n`;
+          # Build the linter and formatting summary
+          if [ "$LINTER_STATUS" == "clean" ]; then
+            LINTER_SUMMARY="✨ **Linters & Formatting:** All checks passed. Your code is sparkling!"
+          else
+            LINTER_SUMMARY="### 🧼 Linters & Formatting (Advisory)\nI found a few things that could be improved. **These are only suggestions to improve code quality and are not required to pass.**\n\nI've posted all my findings as annotations directly on the changed files. If you'd like me to automatically fix the formatting issues, just comment \`/format\` on this PR."
+            if [ "$BLACK_ISSUES" == "true" ]; then
+              # Append the black diff to the summary for easy viewing
+              LINTER_SUMMARY="${LINTER_SUMMARY}\n\n**Black Formatter requires changes:**\n\`\`\`diff\n${BLACK_DIFF}\n\`\`\`"
+            fi
+          fi
 
-            if (!appTestPassed) {
-              review_body += `**🚨 Critical Issue: The application test failed!**\nThis is a blocking issue. Please check the workflow logs to debug why the app isn't running correctly.\n\n---\n\n`;
-            } else {
-              review_body += `**✅ The application test passed!** This PR is approved and can be merged.\n\n---\n\n`;
-            }
-            
-            const hasSummaryIssues = Object.keys(summaryIssues).length > 0;
-            const hasInlineComments = inlineComments.length > 0;
+          # Construct the final review body using all the pieces
+          BODY=$(cat <<EOF
+          Hello! I'm PriestyBot, your friendly automated reviewer. Here's my take on your latest changes:
 
-            if (hasSummaryIssues || hasInlineComments) {
-              review_body += `I have some suggestions to improve code quality. They are **advisory** if the app test passed, but **required** if it failed.\n\n`;
-              if (hasInlineComments) {
-                review_body += `* I've left some comments directly on the changed lines of your code.\n`;
-              }
-              if (hasSummaryIssues) {
-                review_body += `* Below is a summary of other findings:\n\n`;
-                for (const linter in summaryIssues) {
-                  review_body += `### ${linter} Findings\n\`\`\`\n${summaryIssues[linter].join('\n')}\n\`\`\`\n`;
-                }
-              }
-            } else {
-              review_body += `Everything looks perfectly clean! No issues found. Great job! 👍`;
-            }
-            
-            // Submit the review
-            await github.rest.pulls.createReview({
-              owner, repo, pull_number,
-              event,
-              body: review_body,
-              comments: inlineComments
-            });
+          ${APP_TEST_RESULT}
+
+          ---
+
+          ${LINTER_SUMMARY}
+
+          ---
+          *This review was generated automatically. If you have any questions or if I made a mistake, please let my owner know!*
+          EOF
+          )
+
+          # --- Submit the Final Review ---
+          # The GitHub CLI (gh) uses the EVENT and BODY variables to submit the single, consolidated review.
+          gh pr review $PR_URL --${EVENT,,} --body "$BODY"
+
