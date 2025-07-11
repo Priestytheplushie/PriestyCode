@@ -19,12 +19,7 @@ jobs:
         with:
           github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done. Wish me luck! 🚀"
-            });
+            github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: "PriestyBot, reporting for duty! 🫡 I'll start my review now and post a final summary once I'm done. Wish me luck! 🚀" });
 
       - name: 🚚 Getting the code...
         uses: actions/checkout@v4
@@ -40,7 +35,7 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-             ${{ runner.os }}-pip-
+            ${{ runner.os }}-pip-
 
       - name: 🛠️ Installing tools and linters...
         run: python -m pip install --upgrade pip && pip install -r requirements.txt && pip install mypy flake8 black isort
@@ -61,45 +56,36 @@ jobs:
           echo "isort_status=PASSED" >> $GITHUB_OUTPUT
           echo "mypy_status=PASSED" >> $GITHUB_OUTPUT
           LINTER_FAILED_ANY=false
-          
-          # --- Running flake8 and black for inline comments ---
-          # Always capture output to file, then check file content for failure
-          echo "--- Running flake8 for inline comments ---"
-          # Run flake8 and capture its output to flake8_report.txt
-          # Using `|| true` to prevent script from exiting if flake8 fails,
-          # allowing us to check the file content.
-          flake8 src 2>&1 | tee flake8_raw_output.txt
-          if [ -s flake8_raw_output.txt ]; then # Check if file exists and is not empty
-            LINTER_FAILED_ANY=true
-            echo "flake8_status=FAILED" >> $GITHUB_OUTPUT
-            # Send the output to reviewdog for inline comments
-            cat flake8_raw_output.txt | reviewdog -efm="%f:%l:%c: %m" -name="flake8" -reporter=github-pr-review
-          fi
 
-          echo "--- Running black for inline comments ---"
-          # Run black and capture its output to black_report.txt
-          black --check --diff src 2>&1 | tee black_raw_output.txt
-          if [ -s black_raw_output.txt ]; then # Check if file exists and is not empty
-            LINTER_FAILED_ANY=true
-            echo "black_status=FAILED" >> $GITHUB_OUTPUT
-            # Send the output to reviewdog for inline comments
-            cat black_raw_output.txt | reviewdog -f=diff -f.diff.strip=1 -name="black" -reporter=github-pr-review
-          fi
+          # Robust logic that captures full output for all linters if they fail,
+          # while still posting inline comments for changed files.
+          run_linter_and_report() {
+              local name=$1; shift
+              local cmd=$1; shift
+              local reviewdog_flags="$@"
+              
+              echo "--- Running $name ---"
+              # The `tee` command allows us to both capture the output to a file and pass it to reviewdog.
+              # `|| true` ensures the pipe doesn't cause the step to fail prematurely.
+              lint_output=$($cmd 2>&1 | tee "${name}_report.txt")
+              exit_code=${PIPESTATUS[0]}
 
-          echo "--- Running isort and mypy for summary reports ---"
-          # isort output for summary report
-          if ! isort_output=$(isort --check src 2>&1); then
-                LINTER_FAILED_ANY=true
-                echo "isort_status=FAILED" >> $GITHUB_OUTPUT
-                echo "$isort_output" > isort_report.txt
-          fi
-          # mypy output for summary report
-          if ! mypy_output=$(mypy src 2>&1); then
-                LINTER_FAILED_ANY=true
-                echo "mypy_status=FAILED" >> $GITHUB_OUTPUT
-                echo "$mypy_output" > mypy_report.txt
-          fi
-          
+              # Always send the output to reviewdog for inline commenting on changed lines.
+              echo "$lint_output" | reviewdog -name="$name" -reporter=github-pr-review $reviewdog_flags
+
+              if [ $exit_code -ne 0 ]; then
+                  echo "${name}_status=FAILED" >> $GITHUB_OUTPUT
+                  LINTER_FAILED_ANY=true
+              else
+                  # If the linter passed, we don't need its report file.
+                  rm "${name}_report.txt"
+              fi
+          }
+          run_linter_and_report "flake8" "flake8 src" "-efm='%f:%l:%c: %m'"
+          run_linter_and_report "black" "black --check --diff src" "-f=diff -f.diff.strip=1"
+          run_linter_and_report "isort" "isort --check --diff src" "-f=diff"
+          run_linter_and_report "mypy" "mypy src" "-f=mypy"
+
           if [ "$LINTER_FAILED_ANY" = true ]; then
             echo "overall_status=FAILED" >> "$GITHUB_OUTPUT"
           else
@@ -112,15 +98,10 @@ jobs:
       - name: 🧪 Running the critical App Test...
         id: app_test
         run: |
-          if xvfb-run timeout 10s python src/main.py; then
-            echo "status=PASSED" >> "$GITHUB_OUTPUT";
+          if xvfb-run timeout 10s python src/main.py; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
           else
-            exit_code=$?;
-            if [ $exit_code -eq 124 ]; then
-              echo "status=PASSED" >> "$GITHUB_OUTPUT";
-            else
-              echo "status=FAILED" >> "$GITHUB_OUTPUT";
-            fi
+            exit_code=$?; if [ $exit_code -eq 124 ]; then echo "status=PASSED" >> "$GITHUB_OUTPUT";
+            else echo "status=FAILED" >> "$GITHUB_OUTPUT"; fi
           fi
 
       - name: 📝 Final, Intelligent Review and Team Huddle!
@@ -145,12 +126,8 @@ jobs:
             let body = `### PriestyBot Review Summary\n\nHello @${pr_author}! I've just finished reviewing your Python code. Here's a quick rundown of what I found:\n\n- **Application Test:** ${app_check}\n- **Linters:** ${linter_check}\n\n`;
 
             function getReport(name) {
-              // Ensure we check for the existence before reading
-              if (fs.existsSync(`${name}_report.txt`)) {
-                  const content = fs.readFileSync(`${name}_report.txt`, 'utf8').trim();
-                  return content !== '' ? content : 'No output captured or no issues found.';
-              }
-              return 'Report file not generated (no issues found by this linter).';
+              if (fs.existsSync(`${name}_report.txt`)) { return fs.readFileSync(`${name}_report.txt`, 'utf8'); }
+              return 'No output captured.';
             }
 
             if (app_status === 'FAILED') {
@@ -158,27 +135,17 @@ jobs:
               body += "The application test failed, which is the most critical issue. Please address that first!\n\n";
             } else if (app_status === 'PASSED' && linter_status === 'FAILED') {
               review_event = 'REQUEST_CHANGES';
+              body += "I've left inline comments for any issues on lines you've changed. For a complete picture, here are the full reports from all linters that found issues:\n\n";
               
-              // NEW LOGIC FOR INLINE COMMENTS MESSAGE
-              // We check the actual status outputs from the linting step,
-              // and the presence/content of the raw output files for clarity.
-              const flake8_has_issues = flake8_status === 'FAILED';
-              const black_has_issues = black_status === 'FAILED';
-              const summary_failed = (isort_status === 'FAILED' || mypy_status === 'FAILED');
+              if (flake8_status === 'FAILED') { body += `<details><summary><strong>flake8 found issues:</strong></summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n` }
+              if (black_status === 'FAILED') { body += `<details><summary><strong>Black (Code Formatter) found issues:</strong></summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n`}
+              if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
+              if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
 
-              if (flake8_has_issues || black_has_issues) { 
-                body += "I've left some inline comments for issues I found with `flake8` and/or `black`. Please check the 'Files Changed' tab for details.\n\n";
-              }
-              
-              if (summary_failed) {
-                body += "For our codebase-wide checks, I've found some issues and included the full reports below:\n\n";
-                if (isort_status === 'FAILED') { body += `<details><summary><strong>isort (Import Sorter) found issues:</strong></summary>\n\n\`\`\`\n${getReport('isort')}\n\`\`\`\n\n</details>\n` }
-                if (mypy_status === 'FAILED') { body += `<details><summary><strong>mypy (Type Checker) found issues:</strong></summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n` }
-              }
               body += `\n💡 **Tip:** For quick fixes on formatting and import sorting, you can comment \`/format\` on this PR.\n\nThese linter suggestions are advisory. If you believe they are incorrect or wish to proceed anyway, you can use the \`/approve\` command.`
             } else {
               review_event = 'APPROVE';
-              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get this merged! 🎉";
+              body += "Everything looks fantastic! Great job. I'm approving this PR. Let's get it merged! 🎉";
             }
             
             await github.rest.pulls.createReview({ owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, body: body, event: review_event });
