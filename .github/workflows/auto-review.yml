@@ -24,7 +24,6 @@ jobs:
       (github.event.action == 'review_requested' && github.event.requested_reviewer.login == 'PriestyBot') ||
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'priestybot-review'))
     runs-on: ubuntu-latest
-    # The APPROVER_TOKEN is not needed here anymore, only in the final-review job.
     outputs:
       flake8_outcome: ${{ steps.flake8.conclusion }}
       black_outcome: ${{ steps.black.conclusion }}
@@ -82,31 +81,31 @@ jobs:
           pip install -r requirements.txt
           pip install flake8 black isort mypy bandit
 
-      # MODIFIED: Run linters and save reports as rdjson files instead of posting.
+      # FIXED: Removed '|| true' so that step conclusion is 'failure' when linters find issues.
       - name: 💧 Run Linter (flake8)
         id: flake8
         continue-on-error: true
-        run: flake8 src || true | reviewdog -f=flake8 -reporter=rdjson > flake8.rdjson
+        run: flake8 src | reviewdog -f=flake8 -reporter=rdjson > flake8.rdjson
 
       - name: 💅 Run Format Check (black)
         id: black
         continue-on-error: true
-        run: black --check src || true | reviewdog -f=black -reporter=rdjson > black.rdjson
+        run: black --check src | reviewdog -f=black -reporter=rdjson > black.rdjson
       
       - name: sorted? Run Import Sort Check (isort)
         id: isort
         continue-on-error: true
-        run: isort --check src || true | reviewdog -f=isort -reporter=rdjson > isort.rdjson
+        run: isort --check src | reviewdog -f=isort -reporter=rdjson > isort.rdjson
       
       - name: 🔒 Run Security Check (bandit)
         id: bandit
         continue-on-error: true
-        run: bandit -r src -f txt || true | reviewdog -f=bandit -reporter=rdjson > bandit.rdjson
+        run: bandit -r src -f txt | reviewdog -f=bandit -reporter=rdjson > bandit.rdjson
 
       - name: 🧐 Run Type Check (mypy)
         id: mypy
         continue-on-error: true
-        run: mypy src || true | reviewdog -f=mypy -reporter=rdjson > mypy.rdjson
+        run: mypy src | reviewdog -f=mypy -reporter=rdjson > mypy.rdjson
 
       - name: 🧪 Run Tkinter App Test
         id: app_test
@@ -126,7 +125,6 @@ jobs:
             fi
           fi
       
-      # NEW: Upload all generated report files as an artifact for the next job.
       - name: Upload Linter Reports
         if: success() || failure() # Always run this step
         uses: actions/upload-artifact@v4
@@ -169,14 +167,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint-and-test, codeql]
     steps:
-      # NEW: Download the artifact containing all the linter reports.
       - name: Download Linter Reports
         uses: actions/download-artifact@v4
         with:
           name: linter-reports
           path: linter-reports
       
-      # MODIFIED: This script now reads the reports and posts a single, consolidated review.
       - name: 📝 Post Final Review Summary
         uses: actions/github-script@v7
         with:
@@ -193,9 +189,9 @@ jobs:
               for (const file of files) {
                 if (file.endsWith('.rdjson')) {
                   const content = fs.readFileSync(path.join(reportDir, file), 'utf8');
-                  if (!content) continue; // Skip empty files
+                  if (!content) continue;
                   const report = JSON.parse(content);
-                  if (!report.diagnostics) continue; // Skip files with no diagnostics
+                  if (!report.diagnostics) continue;
                   for (const diag of report.diagnostics) {
                     if (diag.location) {
                       comments.push({
@@ -219,7 +215,6 @@ jobs:
             let event = 'APPROVE';
             let is_perfect = false;
 
-            // Check if there are any failures. Note that codeqlJobResult is 'skipped' if not on a PR.
             if (lintJobResult === 'failure' || (codeqlJobResult === 'failure' && needs.codeql.result !== 'skipped')) {
                 const outcomes = {
                   flake8: { conclusion: `${{ needs.lint-and-test.outputs.flake8_outcome }}`, isBlocker: false, title: `🎨 Linting Issues (\`flake8\`)` },
@@ -231,7 +226,6 @@ jobs:
                   codeql: { conclusion: `${{ needs.codeql.outputs.analyze_outcome }}`, isBlocker: true, title: `🚨 Advanced Security (\`CodeQL\`)` }
                 };
                 
-                // Updated fix guides to reflect inline comments.
                 const fix_guides = {
                     flake8: `I have posted inline comments with the details. Please address them. You can also try running \`/format\` to fix some issues.`,
                     black: `I have posted inline comments with the details. Running \`/format\` will fix this.`,
@@ -270,8 +264,6 @@ jobs:
             }
 
             // Part 3: Post the single review with summary body and all inline comments.
-            // Only post if there are inline comments, if changes are requested, or if it's a perfect run.
-            // This prevents posting an empty "Approve" review when the real review is pending (from reviewdog).
             if (comments.length > 0 || event === 'REQUEST_CHANGES' || is_perfect) {
               await github.rest.pulls.createReview({
                 owner: context.repo.owner,
