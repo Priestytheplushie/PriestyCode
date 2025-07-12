@@ -63,6 +63,32 @@ def parse_hunk_header(hunk_line):
         return old_start, old_count, new_start, new_count
     return None, None, None, None
 
+def would_suggestion_change_content(current_conflicted_content, suggested_resolution):
+    """
+    Check if applying a suggestion would actually change the file content.
+    This helps detect no-op suggestions where the resolved content is identical
+    to what's already there (minus conflict markers).
+    """
+    # Remove conflict markers from current content to see what the "clean" version would be
+    lines = current_conflicted_content.split('\n')
+    clean_lines = []
+    in_conflict = False
+    
+    for line in lines:
+        if line.startswith('<<<<<<<'):
+            in_conflict = True
+            continue
+        elif line.startswith('======='):
+            continue
+        elif line.startswith('>>>>>>>'):
+            in_conflict = False
+            continue
+        elif not in_conflict:
+            clean_lines.append(line)
+    
+    current_clean = '\n'.join(clean_lines)
+    return current_clean.strip() != suggested_resolution.strip()
+
 def parse_conflicts_with_context(file_path, patch_content):
     """
     Parses conflict markers and maps them to patch positions more reliably.
@@ -166,11 +192,22 @@ def main():
         pr_file_patches = {f.filename: f.patch for f in pr_files if f.patch}
         
         all_parsed_conflicts = []
+        file_lines_cache = {}  # Cache file contents for no-op detection
+        
         for file_path in conflicted_files_list:
             patch_content = pr_file_patches.get(file_path)
             if not patch_content:
                 print(f"Warning: Could not find patch content for '{file_path}'.")
                 continue
+            
+            # Cache file lines for later use
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    file_lines_cache[file_path] = [line.rstrip('\n') for line in f.readlines()]
+            except Exception as e:
+                print(f"Could not read file {file_path}: {e}")
+                continue
+                
             parsed_for_file = parse_conflicts_with_context(file_path, patch_content)
             all_parsed_conflicts.extend({'file': file_path, **p} for p in parsed_for_file)
 
@@ -222,6 +259,20 @@ def main():
             if not ours_body.strip() and not theirs_body.strip():
                 continue
 
+            # Get the full conflicted content for this section for no-op detection
+            file_lines = file_lines_cache.get(conflict['file'], [])
+            if file_lines:
+                # Calculate the end line of the conflict (start + ours + theirs + 3 markers)
+                conflict_end_line = conflict['start_line'] + len(conflict['ours']) + len(conflict['theirs']) + 3
+                conflict_end_line = min(conflict_end_line, len(file_lines))
+                conflicted_content = '\n'.join(file_lines[conflict['start_line']:conflict_end_line])
+            else:
+                conflicted_content = ""
+
+            # Check if suggestions would actually change anything
+            option1_would_change = would_suggestion_change_content(conflicted_content, ours_body) if ours_body.strip() else False
+            option2_would_change = would_suggestion_change_content(conflicted_content, theirs_body) if theirs_body.strip() else False
+
             # This is the actual raw conflict content that should be in the diff block
             raw_conflict_markers_content = textwrap.dedent(f"""
                 <<<<<<< HEAD (Your changes from `{HEAD_BRANCH}`)
@@ -270,25 +321,47 @@ This is how the conflict is marked in the file. Git needs you to choose one vers
                 **Recommendation:** Consider "Option 1: Keep Your Changes" if your version introduces a new feature or fix that should be integrated. Choose "Option 2: Use Incoming Changes" if the base branch's update is more critical or resolves a conflict you don't need to address in your branch. You also have "Option 3: Manual Intervention" if you prefer to resolve the conflict yourself using the GitHub web editor or command line.
             """).strip())
 
-            # Add Option 1
+            # Add Option 1 (with no-op detection)
             if ours_body.strip():
-                comment_body_parts.append(textwrap.dedent(f"""
-                    ### 🔵 Option 1: Keep Your Changes (from `{HEAD_BRANCH}`)
-                    Select this option if your changes are the correct version to resolve this conflict.
-                    ```suggestion
-                    {ours_body}
-                    ```
-                """).strip())
+                if option1_would_change:
+                    comment_body_parts.append(textwrap.dedent(f"""
+                        ### 🔵 Option 1: Keep Your Changes (from `{HEAD_BRANCH}`)
+                        Select this option if your changes are the correct version to resolve this conflict.
+                        ```suggestion
+                        {ours_body}
+                        ```
+                    """).strip())
+                else:
+                    comment_body_parts.append(textwrap.dedent(f"""
+                        ### 🔵 Option 1: Keep Your Changes (from `{HEAD_BRANCH}`) - Manual Resolution Required
+                        This option cannot be completed automatically because conflict markers would remain in the file or no changes would be made. Please use the web editor above or command line to manually resolve this conflict.
+                        
+                        **Your changes:**
+                        ```
+                        {ours_body}
+                        ```
+                    """).strip())
             
-            # Add Option 2
+            # Add Option 2 (with no-op detection, independent of Option 1's state)
             if theirs_body.strip():
-                comment_body_parts.append(textwrap.dedent(f"""
-                    ### 🟢 Option 2: Use Incoming Changes (from `{BASE_BRANCH}`)
-                    Select this option if the incoming changes from the base branch are what's needed here.
-                    ```suggestion
-                    {theirs_body}
-                    ```
-                """).strip())
+                if option2_would_change:
+                    comment_body_parts.append(textwrap.dedent(f"""
+                        ### 🟢 Option 2: Use Incoming Changes (from `{BASE_BRANCH}`)
+                        Select this option if the incoming changes from the base branch are what's needed here.
+                        ```suggestion
+                        {theirs_body}
+                        ```
+                    """).strip())
+                else:
+                    comment_body_parts.append(textwrap.dedent(f"""
+                        ### 🟢 Option 2: Use Incoming Changes (from `{BASE_BRANCH}`) - Manual Resolution Required
+                        This option cannot be completed automatically because conflict markers would remain in the file or no changes would be made. Please use the web editor above or command line to manually resolve this conflict.
+                        
+                        **Incoming changes:**
+                        ```
+                        {theirs_body}
+                        ```
+                    """).strip())
 
             # Add Option 3: Manual Intervention (new section, always visible)
             comment_body_parts.append(textwrap.dedent(f"""

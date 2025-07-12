@@ -1,4 +1,4 @@
-import tkinter as tk #type: ignore
+import tkinter as tk
 from tkinter import messagebox, scrolledtext, filedialog
 
 try:
