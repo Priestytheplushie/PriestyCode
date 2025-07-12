@@ -1,0 +1,1 @@
+echo "This is from main" > test.txt
