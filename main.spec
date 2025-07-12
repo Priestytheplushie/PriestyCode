@@ -1,11 +1,12 @@
 # main.spec
 a = Analysis(
-    ['src/main.py'],
-    pathex=[],
+    ['src/main.py'], # main.py is still in src/
+    pathex=[], # We need to add the root directory to pathex so PyInstaller can find 'assets'
     binaries=[],
-    # THE FIX for ASSETS: Tell PyInstaller to bundle the 'assets' folder.
-    # It copies 'src/assets' into a folder named 'assets' inside the .exe
-    datas=[('src/assets', 'assets','assets/icons')],
+    # Corrected DATAS path: 'assets' is in the root relative to where you run pyinstaller,
+    # so we just need 'assets' as the source.
+    # The destination within the exe can still be 'assets'.
+    datas=[('assets', 'assets')], # Corrected this line
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -38,6 +39,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # THE FIX for the ICON: Add the path to your .ico file here.
-    icon='src/assets/icon.ico',
+    # Corrected ICON path: 'icon.ico' is inside the 'assets' folder in the root.
+    icon='assets/icon.ico', # Corrected this line
 )
