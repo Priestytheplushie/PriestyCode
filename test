@@ -1,0 +1,5 @@
+echo "Line 1" > test.txt
+echo "Line 2" >> test.txt
+echo "Line 3" >> test.txt
+git add test.txt
+git commit -m "Initial commit"
