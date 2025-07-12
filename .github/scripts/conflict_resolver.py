@@ -2,7 +2,7 @@ import os
 import sys
 import subprocess
 import re
-from github import Github, GithubException #type: ignore
+from github import Github, GithubException
 import textwrap
 
 try:
@@ -12,9 +12,7 @@ try:
     BASE_BRANCH = os.environ["BASE_BRANCH"]
     HEAD_BRANCH = os.environ["HEAD_BRANCH"]
     BOT_USERNAME = os.environ.get("BOT_USERNAME", "PriestyBot")
-    # Retrieve the raw tag value. Using '[BOT_REVIEW_TAG]' as default for consistency
-    # with previous discussion regarding its use as a literal tag.
-    BOT_REVIEW_TAG_RAW = os.environ.get("BOT_REVIEW_TAG_RAW", "BOT_REVIEW_TAG") # Use .get for graceful handling with a default
+    BOT_REVIEW_TAG_RAW = os.environ.get("BOT_REVIEW_TAG_RAW", "BOT_REVIEW_TAG")
     BOT_REVIEW_HTML_COMMENT = f""
 except KeyError as e:
     print(f"Error: Missing required environment variable: {e}", file=sys.stderr)
@@ -32,7 +30,6 @@ def set_github_output(name, value):
         with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"{name}={value}\n")
     else:
-        # Fallback for local testing/debugging outside GitHub Actions, not for production
         print(f"Warning: GITHUB_OUTPUT not set. Simulating output: {name}={value}")
 
 def run_command(command):
@@ -49,12 +46,10 @@ def dismiss_stale_reviews():
     try:
         reviews = pr.get_reviews()
         for review in reviews:
-            # Check for bot's username and the specific HTML comment tag
             if review.user.login == BOT_USERNAME and review.state == "CHANGES_REQUESTED" and BOT_REVIEW_HTML_COMMENT in review.body:
                 print(f"Dismissing stale PriestyBot review {review.id}...")
                 review.dismiss("New conflict resolution in progress or conflicts resolved.")
     except GithubException as e:
-        # Log the error but don't stop the workflow, as this is a cleanup step.
         print(f"Warning: Could not dismiss reviews, continuing. Error: {e}")
 
 def get_hunk_info(patch_lines):
@@ -100,36 +95,37 @@ def parse_conflicts(file_path, patch_content):
     is_ours_section = True
     current_conflict = {}
     
-    for i, file_line in enumerate(file_lines):
-        # actual_file_line_num = i + 1 # 1-based index (not directly used for patch_position)
+    raw_conflict_lines_buffer = [] 
 
+    for i, file_line in enumerate(file_lines):
         if file_line.startswith('<<<<<<<'):
             in_conflict = True
             is_ours_section = True
-            current_conflict = {'ours': [], 'theirs': [], 'patch_position': -1, 'original_pr_lines': []}
+            current_conflict = {'ours': [], 'theirs': [], 'patch_position': -1, 'original_pr_lines': [], 'raw_conflict_block': []}
+            raw_conflict_lines_buffer = [file_line.rstrip('\n')]
         elif file_line.startswith('=======') and in_conflict:
             is_ours_section = False
+            raw_conflict_lines_buffer.append(file_line.rstrip('\n'))
         elif file_line.startswith('>>>>>>>') and in_conflict:
             in_conflict = False
+            raw_conflict_lines_buffer.append(file_line.rstrip('\n'))
+            current_conflict['raw_conflict_block'] = raw_conflict_lines_buffer
+
             current_conflict['ours'] = [l.rstrip('\n') for l in current_conflict['ours']]
             current_conflict['theirs'] = [l.rstrip('\n') for l in current_conflict['theirs']]
 
             found_position = False
-            if current_conflict['ours']: # Only proceed if 'ours' section has content
+            if current_conflict['ours']:
                 for hunk in hunks:
                     hunk_header_idx = hunk['hunk_header_idx']
-                    
-                    # Iterate through lines within this hunk, looking for '+' lines matching 'ours' content
-                    for k in range(1, len(patch_lines) - hunk_header_idx): # Start from 1 after hunk header
+                    for k in range(1, len(patch_lines) - hunk_header_idx):
                         patch_line_idx = hunk_header_idx + k
                         if patch_line_idx >= len(patch_lines):
                             break
 
                         patch_line_content = patch_lines[patch_line_idx]
                         if patch_line_content.startswith('+'):
-                            # Check if this '+' line matches the first line of our 'ours' conflict
                             if patch_line_content[1:].rstrip('\n') == current_conflict['ours'][0]:
-                                # We found a potential start. Now check if the whole 'ours' block follows.
                                 match_len = 0
                                 for ours_idx, ours_line in enumerate(current_conflict['ours']):
                                     if (patch_line_idx + ours_idx) < len(patch_lines) and \
@@ -137,31 +133,36 @@ def parse_conflicts(file_path, patch_content):
                                        patch_lines[patch_line_idx + ours_idx][1:].rstrip('\n') == ours_line:
                                         match_len += 1
                                     else:
-                                        break # Mismatch, this isn't the right sequence
+                                        break
                                 
                                 if match_len == len(current_conflict['ours']):
-                                    # Found the full 'ours' block in the patch!
-                                    current_conflict['patch_position'] = k # Position relative to hunk header
-                                    # The original PR lines should be the ones that were ADDED from YOUR branch.
-                                    current_conflict['original_pr_lines'] = [
-                                        patch_lines[hunk_header_idx + k + i][1:]
-                                        for i in range(len(current_conflict['ours']))
-                                    ]
+                                    current_conflict['patch_position'] = k
+                                    original_pr_lines_in_patch = []
+                                    for orig_idx in range(len(current_conflict['ours'])):
+                                        line_in_patch = patch_lines[hunk_header_idx + k + orig_idx]
+                                        if line_in_patch.startswith('+'):
+                                            original_pr_lines_in_patch.append(line_in_patch[1:].rstrip('\n'))
+                                        else:
+                                            print(f"Warning: Expected '+' line but got '{line_in_patch}' at patch_line_idx {hunk_header_idx + k + orig_idx}. Original PR lines extraction might be off.")
+                                            break
+                                    current_conflict['original_pr_lines'] = original_pr_lines_in_patch
+                                    
                                     found_position = True
-                                    break # Break from inner hunk iteration
+                                    break
                     if found_position:
-                        break # Break from outer hunks iteration
+                        break
 
             if not found_position:
                 print(f"Warning: Could not map conflict in {file_path} to patch lines. Skipping inline comment for this conflict.")
-                # This conflict won't get an inline suggestion, but will be included in the summary.
             
             conflicts.append(current_conflict)
+            raw_conflict_lines_buffer = []
         elif in_conflict:
             if is_ours_section:
                 current_conflict['ours'].append(file_line)
             else:
                 current_conflict['theirs'].append(file_line)
+            raw_conflict_lines_buffer.append(file_line.rstrip('\n'))
     
     return conflicts
 
@@ -174,7 +175,7 @@ def main():
         run_command("git fetch origin --prune")
         run_command(f"git checkout {BASE_BRANCH} && git pull origin {BASE_BRANCH}")
         run_command(f"git checkout {HEAD_BRANCH}")
-        dismiss_stale_reviews() # This will now look for BOT_REVIEW_HTML_COMMENT
+        dismiss_stale_reviews()
 
         print(f"Attempting merge of 'origin/{BASE_BRANCH}' into '{HEAD_BRANCH}'...")
         merge_stdout, merge_stderr, returncode = run_command(f"git merge origin/{BASE_BRANCH} --no-commit --no-ff")
@@ -205,7 +206,6 @@ def main():
 
         mappable_conflicts = [c for c in all_parsed_conflicts if c['patch_position'] != -1]
         
-        # --- ROBUST CONTROL FLOW ---
         if not mappable_conflicts:
             print("Could not map any conflicts to specific diff lines for inline comments. Posting a fallback comment.")
             fallback_body = textwrap.dedent(f"""
@@ -222,25 +222,45 @@ def main():
             set_github_output("status", "error_no_suggestions")
             return
 
-        # Comment generation logic...
         review_comments = []
         for conflict in mappable_conflicts:
             ours_body = '\n'.join(conflict['ours'])
             theirs_body = '\n'.join(conflict['theirs'])
             original_body_in_patch = '\n'.join(conflict['original_pr_lines'])
 
-            context_table = f"| Context | Details |\n| :--- | :--- |\n| **File** | `{conflict['file']}` |\n| **Your Branch** | `{HEAD_BRANCH}` |\n| **Base Branch** | `{BASE_BRANCH}` |"
+            context_table = textwrap.dedent(f"""
+                | Context | Details |
+                | :--- | :--- |
+                | **File** | `{conflict['file']}` |
+                | **Your Branch** | `{HEAD_BRANCH}` |
+                | **Base Branch** | `{BASE_BRANCH}` |
+            """)
+
+            # Use ```diff for the raw conflict block
+            raw_conflict_block_markdown = textwrap.dedent(f"""
+                <details>
+                <summary style="color: #0366d6;">👉 **Show conflict**</summary>
+
+                ```diff
+                {chr(10).join(conflict['raw_conflict_block'])}
+                ```
+                </details>
+            """)
+
+            preamble = textwrap.dedent(f"""
+                #### **Heads up! We have a merge conflict here.**
+                It looks like this spot was changed in both your branch and in `{BASE_BRANCH}`. Let's decide which version to use!
+
+                {context_table}
+
+                ---
+                {raw_conflict_block_markdown}
+                ---
+            """)
 
             if ours_body.strip() == original_body_in_patch.strip():
-                # If what's in the 'ours' conflict marker is exactly what's in the PR's diff at this spot,
-                # then we can only suggest 'theirs'. 'ours' is already there.
                 comment_body = textwrap.dedent(f"""
-                    #### **Heads up! We have a merge conflict here.**
-                    It looks like this spot was changed in both your branch and in `{BASE_BRANCH}`. Let's decide which version to use!
-
-                    {context_table}
-
-                    ---
+                    {preamble}
                     #### 🔵 **Option 1: Keep Your Changes** (from `{HEAD_BRANCH}`)
                     If your version is the one we should keep, you'll need to resolve this manually. The easiest way is to use **GitHub's web editor** (click the "Resolve conflicts" button above).
                     * **Why no button from me?** My suggestions can only *propose a change*, but your code is already here!
@@ -261,12 +281,10 @@ def main():
                     "body": comment_body
                 })
             else:
-                # If 'ours' content is different from `original_pr_lines` or you want two explicit suggestions.
-                # Suggestion to use "ours" (your branch's content)
                 comment_body_ours = textwrap.dedent(f"""
+                    {preamble}
                     #### 🔵 **Option 1: Keep Your Changes** (from `{HEAD_BRANCH}`)
                     If your version is the right one, click below and I'll use it to resolve the conflict with `{BASE_BRANCH}`.
-                    {context_table}
                     ```suggestion
                     {ours_body}
                     ```
@@ -277,11 +295,10 @@ def main():
                     "body": comment_body_ours
                 })
 
-                # Suggestion to use "theirs" (base branch's content)
                 comment_body_theirs = textwrap.dedent(f"""
+                    {preamble}
                     #### 🟢 **Option 2: Use the Version from `{BASE_BRANCH}`**
                     If we should use the version from `{BASE_BRANCH}` instead, just click here. I'll apply it for you.
-                    {context_table}
                     ```suggestion
                     {theirs_body}
                     ```
@@ -292,7 +309,26 @@ def main():
                     "body": comment_body_theirs
                 })
 
-        # Summary comment generation...
+        new_user_explanation_html = textwrap.dedent(f"""
+            <details>
+            <summary style="color: #6a737d;">✨ **New to Merge Conflicts? Learn More Here!**</summary>
+
+            Hey there! 👋 It looks like you've encountered a **merge conflict**. Don't worry, this is a normal part of working on code with others!
+
+            **What happened?**
+            A merge conflict occurs when changes made in your branch (`{HEAD_BRANCH}`) overlap with changes made in the `main` branch (or `{BASE_BRANCH}`), and Git isn't sure which version to keep. Think of it like two people editing the same sentence in a document at the same time – Git needs your help to decide the final version!
+
+            **How to resolve it?**
+            I've left "suggestions" directly on the lines where conflicts occurred in the "Files changed" tab of this Pull Request. You'll see green or blue buttons there:
+            * **🔵 Blue Button (Option 1):** Use *your* changes from `{HEAD_BRANCH}`.
+            * **🟢 Green Button (Option 2):** Use the changes from the `{BASE_BRANCH}` branch.
+
+            For more complex conflicts, or if you prefer to fix them locally, you can follow the command line steps below.
+
+            Feel free to ask if you have any questions! We're here to help.
+            </details>
+        """)
+
         summary_body = textwrap.dedent(f"""
             {BOT_REVIEW_HTML_COMMENT}
             Hey team! 👋 {BOT_USERNAME} here to help.
@@ -300,6 +336,9 @@ def main():
             No worries, this is a normal part of collaborating. Here are a few ways we can get this sorted:
             1.  **Use My Suggestions (Easiest):** For most conflicts, you can simply head to the **[Files changed tab]({pr.html_url}/files)** and click the suggestion button on the comments I've left.
             2.  **Use the GitHub Web Editor:** If a conflict needs a custom fix, the **[Resolve conflicts button]({pr.html_url}/conflicts)** is your best friend.
+
+            {new_user_explanation_html}
+
             <details>
             <summary>👉 For a full list of files or to use the command line</summary>
 
@@ -334,7 +373,9 @@ def main():
             error_comment = textwrap.dedent(f"""
                 {BOT_REVIEW_HTML_COMMENT}
                 ### ❌ Oops! {BOT_USERNAME} ran into a problem interacting with GitHub.
-                Hey team, my apologies! I encountered an error while trying to post the conflict resolution review. This often means there was an issue with how I tried to suggest changes (e.g., trying to comment on a line that no longer exists in the PR's current diff).
+                Hey team, my apologies! I encountered an error while trying to post the conflict resolution review. This often means there
+                was an issue with how I tried to suggest changes (e.g., trying to comment on a line that no longer exists in the PR's
+                current diff).
                 You'll need to resolve any conflicts manually for now. The **[Resolve conflicts button]({pr.html_url}/conflicts)** above is a great place to start.
                 <details>
                 <summary><strong>Error Details (for debugging)</strong></summary>
@@ -369,4 +410,4 @@ def main():
             print(f"Failed to post final error comment to PR: {comment_e}", file=sys.stderr)
 
 if __name__ == "__main__":
-    main()
+    main() # new conflict yay
