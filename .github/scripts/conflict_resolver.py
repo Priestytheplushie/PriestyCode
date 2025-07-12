@@ -52,18 +52,20 @@ def dismiss_stale_reviews():
     except GithubException as e:
         print(f"Warning: Could not dismiss reviews, continuing. Error: {e}")
 
-def get_hunk_info(patch_lines):
-    hunks = []
-    for i, line in enumerate(patch_lines):
-        if line.startswith('@@'):
-            hunks.append({'hunk_header_idx': i})
-    return hunks
+def parse_hunk_header(hunk_line):
+    """Parse a hunk header line like '@@ -1,4 +1,6 @@' to extract line numbers."""
+    match = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hunk_line)
+    if match:
+        old_start = int(match.group(1))
+        old_count = int(match.group(2)) if match.group(2) else 1
+        new_start = int(match.group(3))
+        new_count = int(match.group(4)) if match.group(4) else 1
+        return old_start, old_count, new_start, new_count
+    return None, None, None, None
 
-# --- NEW, MORE ROBUST PARSER ---
 def parse_conflicts_with_context(file_path, patch_content):
     """
-    Parses conflict markers using context lines to robustly map the conflict
-    to the correct position in the PR's diff.
+    Parses conflict markers and maps them to patch positions more reliably.
     """
     conflicts = []
     try:
@@ -73,65 +75,97 @@ def parse_conflicts_with_context(file_path, patch_content):
         print(f"Could not read file {file_path}: {e}")
         return []
 
-    patch_lines = patch_content.splitlines() if patch_content else []
-    hunks = get_hunk_info(patch_lines)
+    if not patch_content:
+        return []
+
+    patch_lines = patch_content.splitlines()
     
+    # Build a mapping of file lines to patch positions
+    file_line_to_patch_pos = {}
+    current_file_line = 0
+    
+    for patch_idx, patch_line in enumerate(patch_lines):
+        if patch_line.startswith('@@'):
+            # Parse hunk header to get starting line number
+            _, _, new_start, _ = parse_hunk_header(patch_line)
+            if new_start is not None:
+                current_file_line = new_start - 1  # Convert to 0-based
+        elif patch_line.startswith(' '):
+            # Context line - exists in both old and new file
+            file_line_to_patch_pos[current_file_line] = patch_idx
+            current_file_line += 1
+        elif patch_line.startswith('+'):
+            # Addition - exists in new file
+            file_line_to_patch_pos[current_file_line] = patch_idx
+            current_file_line += 1
+        elif patch_line.startswith('-'):
+            # Deletion - doesn't advance file line counter
+            pass
+    
+    # Parse conflicts from file
     in_conflict = False
     is_ours_section = True
     current_conflict = {}
-    CONTEXT_LINES = 2 # Number of stable lines to use as an anchor
-
-    for i, file_line in enumerate(file_lines):
+    conflict_start_line = 0
+    
+    for file_line_idx, file_line in enumerate(file_lines):
         if file_line.startswith('<<<<<<<'):
             in_conflict = True
             is_ours_section = True
-            context = [line for line in file_lines[max(0, i - CONTEXT_LINES):i]]
-            current_conflict = {'ours': [], 'theirs': [], 'context': context, 'patch_position': -1}
+            conflict_start_line = file_line_idx
+            current_conflict = {
+                'ours': [],
+                'theirs': [],
+                'start_line': file_line_idx,
+                'patch_position': -1
+            }
         elif file_line.startswith('=======') and in_conflict:
             is_ours_section = False
         elif file_line.startswith('>>>>>>>') and in_conflict:
             in_conflict = False
             
-            # Find the position in the patch
+            # Try to find a patch position for this conflict
+            # Look for the first line of "ours" section in the patch mapping
+            ours_start_line = current_conflict['start_line'] + 1  # Skip the <<<<<<< line
+            
+            # Try different strategies to find the patch position
             found_position = False
-            if current_conflict['context']:
-                 for hunk in hunks:
-                    hunk_start_idx = hunk['hunk_header_idx']
-                    # Search within the lines of this specific hunk
-                    for patch_idx in range(hunk_start_idx + 1, len(patch_lines)):
-                        # Look for the context anchor
-                        is_context_match = True
-                        for ctx_idx, ctx_line in enumerate(current_conflict['context']):
-                            current_patch_line_idx = patch_idx + ctx_idx
-                            if not (current_patch_line_idx < len(patch_lines) and \
-                                    patch_lines[current_patch_line_idx].startswith(' ') and \
-                                    patch_lines[current_patch_line_idx][1:] == ctx_line):
-                                is_context_match = False
-                                break
-                        
-                        if is_context_match:
-                            # Context found, now check if the 'ours' lines follow
-                            ours_start_in_patch = patch_idx + len(current_conflict['context'])
-                            is_ours_match = True
-                            for ours_idx, ours_line in enumerate(current_conflict['ours']):
-                                current_patch_line_idx = ours_start_in_patch + ours_idx
-                                if not (current_patch_line_idx < len(patch_lines) and \
-                                        patch_lines[current_patch_line_idx].startswith('+') and \
-                                        patch_lines[current_patch_line_idx][1:] == ours_line):
-                                    is_ours_match = False
-                                    break
-                            
-                            if is_ours_match:
-                                # Position is relative to the hunk header!
-                                current_conflict['patch_position'] = ours_start_in_patch - hunk_start_idx
-                                found_position = True
-                                break
-                    if found_position:
-                        break
-
+            
+            # Strategy 1: Look for the exact start of the ours section
+            if ours_start_line in file_line_to_patch_pos:
+                current_conflict['patch_position'] = file_line_to_patch_pos[ours_start_line]
+                found_position = True
+            
+            # Strategy 2: Look for nearby lines (within a few lines)
             if not found_position:
-                 print(f"Warning: Could not map conflict in {file_path} to patch lines using context. Skipping inline comment.")
-
+                for offset in range(-3, 4):  # Check 3 lines before and after
+                    check_line = ours_start_line + offset
+                    if check_line in file_line_to_patch_pos:
+                        current_conflict['patch_position'] = file_line_to_patch_pos[check_line]
+                        found_position = True
+                        break
+            
+            # Strategy 3: For add/add conflicts, try to find any addition in the vicinity
+            if not found_position:
+                for patch_idx, patch_line in enumerate(patch_lines):
+                    if patch_line.startswith('+'):
+                        # Check if this addition contains any of our conflict lines
+                        patch_content_line = patch_line[1:]  # Remove the '+'
+                        if any(patch_content_line.strip() == ours_line.strip() 
+                               for ours_line in current_conflict['ours'] if ours_line.strip()):
+                            current_conflict['patch_position'] = patch_idx
+                            found_position = True
+                            break
+                        if any(patch_content_line.strip() == theirs_line.strip() 
+                               for theirs_line in current_conflict['theirs'] if theirs_line.strip()):
+                            current_conflict['patch_position'] = patch_idx
+                            found_position = True
+                            break
+            
+            if not found_position:
+                print(f"Warning: Could not map conflict at line {conflict_start_line} in {file_path} to patch position")
+                current_conflict['patch_position'] = -1
+            
             conflicts.append(current_conflict)
         elif in_conflict:
             if is_ours_section:
@@ -174,7 +208,6 @@ def main():
             if not patch_content:
                 print(f"Warning: Could not find patch content for '{file_path}'.")
                 continue
-            # Use the new robust parser
             parsed_for_file = parse_conflicts_with_context(file_path, patch_content)
             all_parsed_conflicts.extend({'file': file_path, **p} for p in parsed_for_file)
 
@@ -226,60 +259,97 @@ def main():
             if not ours_body.strip() and not theirs_body.strip():
                 continue
 
-            conflict_details_block = textwrap.dedent(f"""
-                <details>
-                <summary>👉 Click to view the conflict and resolution options</summary>
-
-                #### Merge Conflict Details
-                * **File:** `{conflict['file']}`
-                * **Your Branch (`{HEAD_BRANCH}`):** The changes you're trying to merge.
-                * **Base Branch (`{BASE_BRANCH}`):** The branch you are merging into.
-
-                #### Raw Conflict Block
-                This is how the conflict is marked in the file. Git needs you to choose one version.
-
-                ```diff
+            # This is the actual raw conflict content that should be in the diff block
+            raw_conflict_markers_content = textwrap.dedent(f"""
                 <<<<<<< HEAD (Your changes from `{HEAD_BRANCH}`)
                 {ours_body}
                 =======
                 {theirs_body}
                 >>>>>>> {BASE_BRANCH} (Incoming changes from `{BASE_BRANCH}`)
-                ```
-                </details>
             """).strip()
+
+            # Now, wrap ONLY this content in a markdown diff code block
+            formatted_raw_diff_block = f"```diff\n{raw_conflict_markers_content}\n```"
+
+            # Create conflict details as plain text (NOT in code blocks)
+            conflict_details_text = textwrap.dedent(f"""
+                **File:** `{conflict['file']}`
+                **Your Branch (`{HEAD_BRANCH}`):** Changes you're trying to merge.
+                **Base Branch (`{BASE_BRANCH}`):** Branch you are merging into.
+            """).strip()
+
+            # Construct the full conflict details block within <details>
+            conflict_details_block = f"""<details>
+<summary>👉 Click to review conflict details</summary>
+
+### Merge Conflict Details
+{conflict_details_text}
+
+### Raw Conflict Block
+This is how the conflict is marked in the file. Git needs you to choose one version.
+
+**Legend:**
+- `<<<<<<< HEAD` - Start of your changes (from `{HEAD_BRANCH}`)
+- `=======` - Separator between conflicting versions
+- `>>>>>>> {BASE_BRANCH}` - End marker with incoming changes
+
+{formatted_raw_diff_block}
+</details>"""
             
-            # Option 1: Always offer 'ours' as a suggestion now that mapping is reliable
-            option_1_text = ""
+            # Construct the comment body with sections in the desired order
+            comment_body_parts = []
+            
+            comment_body_parts.append(textwrap.dedent(f"""
+                ### ✨ Heads up! A merge conflict was detected here.
+
+                It looks like this spot was changed in both your branch (`{HEAD_BRANCH}`) and the base branch (`{BASE_BRANCH}`). Please choose which version to keep.
+
+                **Recommendation:** Consider "Option 1: Keep Your Changes" if your version introduces a new feature or fix that should be integrated. Choose "Option 2: Use Incoming Changes" if the base branch's update is more critical or resolves a conflict you don't need to address in your branch. You also have "Option 3: Manual Intervention" if you prefer to resolve the conflict yourself using the GitHub web editor or command line.
+            """).strip())
+
+            # Add Option 1
             if ours_body.strip():
-                option_1_text = textwrap.dedent(f"""
-                    ---
-                    #### 🔵 Option 1: Keep Your Changes (from `{HEAD_BRANCH}`)
-                    If your version is the correct one to resolve the conflict, click the button below.
+                comment_body_parts.append(textwrap.dedent(f"""
+                    ### 🔵 Option 1: Keep Your Changes (from `{HEAD_BRANCH}`)
+                    Select this option if your changes are the correct version to resolve this conflict.
                     ```suggestion
                     {ours_body}
                     ```
-                """).strip()
+                """).strip())
             
-            # Option 2: 'theirs'
-            option_2_text = ""
+            # Add Option 2
             if theirs_body.strip():
-                option_2_text = textwrap.dedent(f"""
-                    ---
-                    #### 🟢 Option 2: Use Incoming Changes (from `{BASE_BRANCH}`)
-                    If the code from the base branch is what we need, click the button below. I'll apply the change for you.
+                comment_body_parts.append(textwrap.dedent(f"""
+                    ### 🟢 Option 2: Use Incoming Changes (from `{BASE_BRANCH}`)
+                    Select this option if the incoming changes from the base branch are what's needed here.
                     ```suggestion
                     {theirs_body}
                     ```
-                """).strip()
+                """).strip())
 
-            comment_body = textwrap.dedent(f"""
-                #### ✨ Heads up! A merge conflict was detected here.
-                It looks like this spot was changed in both your branch (`{HEAD_BRANCH}`) and the base branch (`{BASE_BRANCH}`). Please choose which version to keep.
+            # Add Option 3: Manual Intervention (new section, always visible)
+            comment_body_parts.append(textwrap.dedent(f"""
+                ### 🟠 Option 3: Manual Intervention
+                If neither of the above options fully resolves the conflict, or if you prefer to handle it yourself, you can use these methods:
+                * **GitHub Web Editor:** Click the **[Resolve conflicts button]({pr.html_url}/conflicts)** in the GitHub web interface for a guided visual editor.
+                * **Command Line:** Resolve locally by pulling changes and editing the files in your preferred code editor.
+                    ```bash
+                    git fetch origin
+                    git checkout {HEAD_BRANCH}
+                    git merge origin/{BASE_BRANCH}
+                    # After merging, your files will contain conflict markers (<<<<<<<, =======, >>>>>>>).
+                    # Open the conflicted files in your code editor, manually resolve the differences,
+                    # and remove the conflict markers.
+                    git add .
+                    git commit -m "Resolve merge conflicts"
+                    git push
+                    ```
+            """).strip())
 
-                {conflict_details_block}
-                {option_1_text}
-                {option_2_text}
-            """).strip()
+            # Add the conflict details block last, but still within the main comment body
+            comment_body_parts.append(conflict_details_block)
+
+            comment_body = "\n\n".join(comment_body_parts) # Join with double newlines for separation
             
             review_comments.append({
                 "path": conflict['file'],
@@ -292,8 +362,9 @@ def main():
             set_github_output("status", "no_actionable_conflicts")
             return
 
-        # Create the review summary
-        summary_body = textwrap.dedent(f"""
+        # Create the review summary (this part remains largely the same)
+        summary_body_parts = []
+        summary_body_parts.append(textwrap.dedent(f"""
             {BOT_REVIEW_HTML_COMMENT}
             
             Hey team! 👋 {BOT_USERNAME} here to help.
@@ -301,12 +372,58 @@ def main():
             I was getting this branch ready to merge and ran into **{len(mappable_conflicts)} merge conflict(s)** between your branch (`{HEAD_BRANCH}`) and `{BASE_BRANCH}`.
 
             No worries, this is a normal part of collaborating. Here are a few ways we can get this sorted:
-            1. **Use My Suggestions (Easiest):** For most conflicts, you can simply head to the **[Files changed tab]({pr.html_url}/files)** and click the suggestion button on the comments I've left.
+            1. **Use My Suggestions (Easiest):** For most conflicts, you can simply head to the **[Files changed tab]({pr.html_url}/files)** and click the **"Commit suggestion"** button on the comments I've left. This will automatically apply the suggested change to your branch and create a new commit.
             2. **Use the GitHub Web Editor:** If a conflict needs a custom fix, the **[Resolve conflicts button]({pr.html_url}/conflicts)** is your best friend.
+        """).strip())
+
+        # New to Merge Conflicts section (moved to top)
+        summary_body_parts.append(textwrap.dedent(f"""
+            <details>
+            <summary>🤔 New to Merge Conflicts? Learn More Here!</summary>
             
-            ---
+            Merge conflicts happen when the same lines of code are changed in different ways on different branches. They're a normal part of collaborative development and nothing to worry about!
+            
+            **What causes merge conflicts?**
+            - Two people edit the same line of code differently
+            - One person edits a line while another person deletes it
+            - Complex changes that Git can't automatically merge
+            
+            **How to resolve them:**
+            1. **Use the suggestions above** - I've analyzed the conflicts and provided quick-fix buttons (which use "Commit suggestion" to apply changes).
+            2. **Use GitHub's web editor** - Click the "Resolve conflicts" button for a visual editor
+            3. **Use your local editor** - Pull the changes locally and edit the files manually
+            </details>
+        """).strip())
+
+        # Command Line section (now collapsible and not shown by default)
+        summary_body_parts.append(textwrap.dedent(f"""
+            <details>
+            <summary>🚀 Command Line Instructions</summary>
+            
+            ### Conflicted Files
+            ```
+            {chr(10).join([f"- {c['file']}" for c in mappable_conflicts])}
+            ```
+            
+            ### Resolve with the Command Line (Full Control)
+            For advanced users who prefer local resolution:
+            ```bash
+            git fetch origin
+            git checkout {HEAD_BRANCH}
+            git merge origin/{BASE_BRANCH}
+            # After merging, your files will contain conflict markers (<<<<<<<, =======, >>>>>>>).
+            # Open the conflicted files in your code editor, manually resolve the differences,
+            # and remove the conflict markers.
+            git add .
+            git commit -m "Resolve merge conflicts"
+            git push
+            ```
+            </details>
+            
             Let me know if you get stuck. Let's get this PR merged! 🚀
-        """).strip()
+        """).strip())
+
+        summary_body = "\n\n".join(summary_body_parts) # Join with double newlines for separation
         
         print(f"Submitting 'Changes Requested' review with {len(review_comments)} comments...")
         pr.create_review(body=summary_body, event="REQUEST_CHANGES", comments=review_comments)
