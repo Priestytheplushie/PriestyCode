@@ -1,26 +1,35 @@
 # .github/workflows/priestybot-commands.yml
-# A complete rewrite of the PriestyBot command handler for better maintainability and robustness.
+# Refactored for better modularity and maintainability.
 
 name: PriestyBot Commands
 
 on:
   issue_comment:
     types: [created]
+  pull_request:
+    types: [synchronize] # When new commits are pushed to the PR branch
+  pull_request_review_comment:
+    types: [created] # When a suggestion is committed via a review comment
 
 permissions:
-  # Required for checking out code, creating reviews, commenting, and merging.
   contents: write
   pull-requests: write
 
 jobs:
-  command-handler:
-    # Only run this workflow for comments on active Pull Requests and if the commenter is not the bot itself.
-    if: github.event.issue.pull_request && github.actor != 'PriestyBot'
+  # Job 1: Parse the incoming command from the issue comment
+  parse-command:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && github.actor != 'PriestyBot'
     runs-on: ubuntu-latest
-
+    outputs:
+      command: ${{ steps.parser.outputs.command }}
+      message: ${{ steps.parser.outputs.message }}
+      pr_number: ${{ steps.pr_info.outputs.pr_number }}
+      commenter: ${{ steps.pr_info.outputs.commenter }}
+      base_branch: ${{ steps.pr_info.outputs.base_branch }}
+      head_branch: ${{ steps.pr_info.outputs.head_branch }}
+      repo_name: ${{ steps.pr_info.outputs.repo_name }}
+      is_admin: ${{ steps.check_admin.outputs.is_admin }}
     steps:
-      # STEP 1: PARSE THE COMMAND FROM THE COMMENT
-      # This step identifies the command and arguments, making subsequent steps much cleaner.
       - name: Parse Command
         id: parser
         uses: actions/github-script@v7
@@ -29,15 +38,15 @@ jobs:
             const body = context.payload.comment.body.trim();
             if (!body.startsWith('/')) {
               console.log("Comment is not a command.");
+              core.setOutput('command', 'no_command');
               return;
             }
             const args = body.split(/\s+/);
             const command = args[0].substring(1);
             const message = args.slice(1).join(' ');
 
-            # Add 'resolve' to the list of valid commands
             const validCommands = ['help', 'approve', 'request-changes', 'comment', 'format', 'lint', 'merge', 'squash', 'rebase', 'resolve'];
-            
+
             if (!validCommands.includes(command)) {
               console.log(`Unknown command: ${command}`);
               core.setOutput('command', 'unknown');
@@ -48,18 +57,36 @@ jobs:
             core.setOutput('message', message);
             console.log(`Command: ${command}, Message: ${message}`);
 
-      # STEP 2: CHECK ADMIN STATUS (if needed for certain commands, like merge/squash/rebase)
-      - name: Check Admin Status
-        id: check_admin
-        if: steps.parser.outputs.command != 'unknown' && contains('merge squash rebase', steps.parser.outputs.command)
+      - name: Get PR Info and Commenter
+        id: pr_info
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const { data: repo } = await github.rest.repos.get({
+            const pr_number = context.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const { data: pull_request } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
+              pull_number: pr_number,
             });
+
+            core.setOutput('pr_number', pr_number);
+            core.setOutput('commenter', commenter);
+            core.setOutput('base_branch', pull_request.base.ref);
+            core.setOutput('head_branch', pull_request.head.ref);
+            core.setOutput('repo_name', context.repo.owner + '/' + context.repo.repo);
+            core.exportVariable('BOT_USERNAME', 'PriestyBot');
+            // Changed: Export a simple tag, the HTML comment is constructed where used
+            core.exportVariable('BOT_REVIEW_TAG_RAW', 'BOT_REVIEW_TAG');
+
+      - name: Check Admin Status
+        id: check_admin
+        if: contains('merge squash rebase', steps.parser.outputs.command)
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
             const { data: permissions } = await github.rest.repos.getCollaboratorPermissionLevel({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -69,236 +96,735 @@ jobs:
             core.setOutput('is_admin', isAdmin ? 'true' : 'false');
             console.log(`User ${context.payload.comment.user.login} is admin: ${isAdmin}`);
 
-      # STEP 3: EXECUTE COMMANDS
-      # --- COMMAND: /resolve ---
-      - name: Handle /resolve Command (Prepare Environment)
-        id: handle_resolve_env
-        if: steps.parser.outputs.command == 'resolve'
+  # Job 2: Acknowledge the command (runs for any valid command)
+  acknowledge-command:
+    needs: parse-command
+    if: needs.parse-command.outputs.command != 'unknown' && needs.parse-command.outputs.command != 'no_command'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Acknowledge Command
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }} # Use APPROVER_TOKEN for permissions
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const pr_number = context.issue.number;
-            const { data: pull_request } = await github.rest.pulls.get({
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const command = JSON.stringify("${{ needs.parse-command.outputs.command }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            let acknowledgmentMessage = ``;
+            switch (JSON.parse(command)) {
+              case 'resolve':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, received your \`/resolve\` command! I'm now checking for merge conflicts and will provide an update shortly.`;
+                break;
+              case 'approve':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, got it! I'm processing your \`/approve\` request now.`;
+                break;
+              case 'request-changes':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, understood! I'm marking this PR for changes based on your \`/request-changes\` command.`;
+                break;
+              case 'comment':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, thanks for the note! I'm adding your comment now.`;
+                break;
+              case 'format':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, starting the code formatting process with \`/format\`! I'll let you know when it's done.`;
+                break;
+              case 'lint':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, running the linting checks as requested with \`/lint\`! I'll post a summary here soon.`;
+                break;
+              case 'merge':
+              case 'squash':
+              case 'rebase':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, I'm initiating the \`/${JSON.parse(command)}\` operation. I'll confirm once it's complete, or let you know if there are any issues.`;
+                break;
+              case 'help':
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, I'm preparing the help message for you now!`;
+                break;
+              default:
+                acknowledgmentMessage = `@${JSON.parse(commenter)}, processing your command...`;
+                break;
+            }
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: pr_number,
+              issue_number: JSON.parse(pr_number),
+              body: acknowledgmentMessage
             });
 
-            # Set environment variables for the next step (running the Python script)
-            core.exportVariable('PR_NUMBER', pr_number);
-            core.exportVariable('BASE_BRANCH', pull_request.base.ref);
-            core.exportVariable('HEAD_BRANCH', pull_request.head.ref);
-            core.exportVariable('REPO_NAME', context.repo.owner + '/' + context.repo.repo);
-            core.exportVariable('BOT_USERNAME', 'PriestyBot'); # Ensure this matches your bot's username
-            core.exportVariable('BOT_REVIEW_TAG', '<!-- PriestyBotMergeConflictBot -->');
-            core.exportVariable('GH_TOKEN', process.env.APPROVER_TOKEN); # Pass the PAT
-
-      - name: Checkout Code (for /resolve command)
-        if: steps.parser.outputs.command == 'resolve'
-        uses: actions/checkout@v4 # Checkout to get the script
+  # Job 3: Handle /resolve command
+  handle-resolve:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'resolve'
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.run_resolver_script.outputs.status }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0 # Needed for git operations in the script
-          token: ${{ secrets.APPROVER_TOKEN }} # Use APPROVER_TOKEN for checkout
+          ref: ${{ needs.parse-command.outputs.head_branch }}
+          fetch-depth: 0
+          token: '${{ secrets.APPROVER_TOKEN }}'
 
-      - name: Setup Python (for /resolve command)
-        if: steps.parser.outputs.command == 'resolve'
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install Dependencies (for /resolve command)
-        if: steps.parser.outputs.command == 'resolve'
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-python-3.11-pip-PyGithub-${{ hashFiles('.github/scripts/conflict_resolver.py') }}
+          restore-keys: |
+            ${{ runner.os }}-python-3.11-pip-PyGithub-
+            ${{ runner.os }}-python-3.11-pip-
+
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install PyGithub
 
       - name: Execute Conflict Resolver Script
-        id: run_resolver_script # Add an ID to capture output
-        if: steps.parser.outputs.command == 'resolve'
-        # IMPORTANT: Your Python script needs to output a status like this:
-        # print(f"::set-output name=status::no_conflicts") or
-        # print(f"::set-output name=status::conflicts_posted") or
-        # print(f"::set-output name=status::error")
-        # For this YAML to correctly post human-like messages.
+        id: run_resolver_script
+        env:
+          PR_NUMBER: ${{ needs.parse-command.outputs.pr_number }}
+          BASE_BRANCH: ${{ needs.parse-command.outputs.base_branch }}
+          HEAD_BRANCH: ${{ needs.parse-command.outputs.head_branch }}
+          REPO_NAME: ${{ needs.parse-command.outputs.repo_name }}
+          BOT_USERNAME: PriestyBot
+          # Changed: Pass the RAW tag. The script constructs the HTML comment
+          BOT_REVIEW_TAG_RAW: BOT_REVIEW_TAG
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
         run: |
           python ${{ github.workspace }}/.github/scripts/conflict_resolver.py
-          # If the python script completes without error, assume success by default
-          # This default output will be overridden if the python script explicitly sets 'status'
-          echo "::set-output name=status::success" 
-        continue-on-error: true # Allow subsequent steps to run even if script fails
+        continue-on-error: true
 
       - name: Post Success Message for /resolve (Conflicts Handled)
-        if: steps.parser.outputs.command == 'resolve' && steps.run_resolver_script.outcome == 'success' && steps.run_resolver_script.outputs.status == 'conflicts_posted'
+        if: steps.run_resolver_script.outcome == 'success' && steps.run_resolver_script.outputs.status == 'conflicts_posted'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const commenter = context.payload.comment.user.login;
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `@${commenter} ✅ PriestyBot has posted a new review with merge conflict suggestions. Please check the 'Files changed' tab!`
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} Hey! I've posted a new review with merge conflict suggestions for you to check out in the 'Files changed' tab. Let me know if you need a hand!`
             });
 
       - name: Post Message for /resolve (No Conflicts Found)
-        if: steps.parser.outputs.command == 'resolve' && steps.run_resolver_script.outcome == 'success' && steps.run_resolver_script.outputs.status == 'no_conflicts'
+        if: steps.run_resolver_script.outcome == 'success' && steps.run_resolver_script.outputs.status == 'no_conflicts'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const commenter = context.payload.comment.user.login;
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `@${commenter} ✨ Good news! PriestyBot checked, and there are currently no merge conflicts detected on this Pull Request. You're all clear!`
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} ✨ Good news! I've checked, and there are currently no merge conflicts detected on this Pull Request. You're all clear to proceed!`
             });
 
       - name: Post Error Message for /resolve Command Failure
-        if: steps.parser.outputs.command == 'resolve' && steps.run_resolver_script.outcome == 'failure' || (steps.parser.outputs.command == 'resolve' && steps.run_resolver_script.outputs.status == 'error')
+        if: steps.run_resolver_script.outcome == 'failure' || steps.run_resolver_script.outputs.status == 'error'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const commenter = context.payload.comment.user.login;
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `@${commenter} ❌ Oops! PriestyBot encountered an issue while trying to resolve merge conflicts. Please check the workflow run logs for details, or try resolving manually. My apologies!`
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} ❌ Oops! I encountered an issue while trying to process merge conflicts for this PR. My apologies! Please check the workflow run logs for details, or try resolving manually.`
             });
 
-      # --- Other Commands (example) ---
+  # Job 4: Handle /approve command
+  handle-approve:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'approve'
+    runs-on: ubuntu-latest
+    steps:
       - name: Handle /approve Command
-        if: steps.parser.outputs.command == 'approve'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
+            const message = JSON.stringify("${{ needs.parse-command.outputs.message }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const body = JSON.parse(message) ? JSON.parse(message) : undefined;
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number,
+              pull_number: JSON.parse(pr_number),
               event: 'APPROVE',
-              body: 'PriestyBot approves this PR! ✅'
+              body: body
             });
-
-      - name: Handle /request-changes Command
-        if: steps.parser.outputs.command == 'request-changes'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              event: 'REQUEST_CHANGES',
-              body: 'PriestyBot requests changes on this PR. Please address my concerns. 📝'
-            });
-
-      - name: Handle /comment Command
-        if: steps.parser.outputs.command == 'comment'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          script: |
-            const message = `${{ steps.parser.outputs.message }}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `PriestyBot says: ${message}`
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} ✅ Approved this Pull Request! Looking good!`
             });
 
-      - name: Handle /help Command
-        if: steps.parser.outputs.command == 'help'
+  # Job 5: Handle /request-changes command
+  handle-request-changes:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'request-changes'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /request-changes Command
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const commenter = context.payload.comment.user.login;
+            const message = JSON.stringify("${{ needs.parse-command.outputs.message }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const body = JSON.parse(message) ? JSON.parse(message) : undefined;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: JSON.parse(pr_number),
+              event: 'REQUEST_CHANGES',
+              body: body
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} 📝 Changes requested on this Pull Request. Please take a look!`
+            });
+
+  # Job 6: Handle /comment command
+  handle-comment:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'comment'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /comment Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const message = JSON.stringify("${{ needs.parse-command.outputs.message }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            if (!JSON.parse(message)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ⚠️ To use the \`/comment\` command, please provide a message. Example: \`/comment This is my message.\``
+              });
+              core.setFailed('Comment command requires a message.');
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: JSON.parse(pr_number),
+              body: `@${JSON.parse(commenter)} Your comment has been added: "${JSON.parse(message)}"`
+            });
+
+  # Job 7: Handle /help command
+  handle-help:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'help'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /help Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
             const helpMessage = `
-            @${commenter} 🤖 Here are the commands you can use with PriestyBot:
+            @${JSON.parse(commenter)} Hey there! I'm PriestyBot, your automated teammate here to help streamline our development workflow! Here are the commands you can use with me:
 
-            * \` /help \`: Displays this help message.
-            * \` /approve \`: Approves the Pull Request.
-            * \` /request-changes \`: Requests changes on the Pull Request.
-            * \` /comment <your message> \`: Leaves a general comment on the Pull Request.
-            * \` /format \`: (If configured) Runs code formatting tools.
-            * \` /lint \`: (If configured) Runs code linting tools.
-            * \` /resolve \`: **(NEW!)** Triggers PriestyBot to check for and suggest resolutions for merge conflicts on this PR.
-            * \` /merge \`: (Admin only) Merges the Pull Request (fast-forward).
-            * \` /squash \`: (Admin only) Squashes and merges the Pull Request.
-            * \` /rebase \`: (Admin only) Rebases and merges the Pull Request.
+            My main purpose is to automate common tasks and provide quick feedback directly on your PRs, making our CI/CD process smoother and more efficient.
 
-            Please ensure you have the necessary permissions for each command.
+            ---
+
+            ### Commands I Understand:
+
+            <details>
+            <summary>✨ Click to expand / collapse command descriptions ✨</summary>
+
+            #### \`/help\`
+            * **Purpose:** Displays this comprehensive help message, listing all available commands and explaining my role.
+            * **Usage:** \`/help\`
+
+            #### \`/approve [message]\`
+            * **Purpose:** Approves the Pull Request. This is useful for quickly signaling that the changes look good to you.
+            * **Usage:** \`/approve\` or \`/approve Looks great, ready to merge!\`
+            * **Note:** This acts as a formal GitHub review.
+
+            #### \`/request-changes [message]\`
+            * **Purpose:** Requests changes on the Pull Request. Use this to indicate that the PR needs modifications before it can be merged.
+            * **Usage:** \`/request-changes\` or \`/request-changes Please address the linting issues.\`
+            * **Note:** This also acts as a formal GitHub review and will block the PR from merging until the requested changes are resolved.
+
+            #### \`/comment <message>\`
+            * **Purpose:** Leaves a general comment on the Pull Request. Great for quick notes or discussions that don't require a formal review.
+            * **Usage:** \`/comment Let's discuss this approach in our stand-up.\`
+            * **Important:** This command requires you to provide a message!
+
+            #### \`/format [message]\`
+            * **Purpose:** Automatically formats the code in your Pull Request using \`black\` and \`isort\`. If changes are applied, I'll commit them directly to your branch.
+            * **Usage:** \`/format\` (for default commit message) or \`/format Applied formatting for new feature\` (for custom commit message).
+            * **Benefit:** Helps maintain consistent code style across the repository.
+
+            #### \`/lint\`
+            * **Purpose:** Runs various linting checks (\`mypy\`, \`isort\`, \`black\` in check mode, \`flake8\`) on your code. I'll post a summary comment with collapsible details for each linter's output.
+            * **Usage:** \`/lint\`
+            * **Benefit:** Provides quick, actionable feedback on potential code quality, style, and type issues without blocking your PR. These are suggestions, not formal review requests.
+
+            #### \`/resolve\`
+            * **Purpose:** Triggers me to check for and suggest resolutions for merge conflicts on this PR. If conflicts are found, I'll post a "Changes Requested" review with inline suggestions to guide you through fixing them. I'll also automatically re-check and dismiss my review once conflicts are resolved.
+            * **Usage:** \`/resolve\`
+            * **Benefit:** Helps you quickly identify and fix merge conflicts, unblocking your PR for further checks and merging.
+
+            #### \`/merge\` (Admin Only)
+            * **Purpose:** Merges the Pull Request into the base branch using a standard merge commit.
+            * **Usage:** \`/merge\`
+            * **Restriction:** Only users with admin/maintainer permissions can use this command. I'll let you know if the PR isn't mergeable (e.g., due to conflicts or pending checks).
+
+            #### \`/squash\` (Admin Only)
+            * **Purpose:** Squashes all commits in the Pull Request into a single commit and then merges it into the base branch.
+            * **Usage:** \`/squash\`
+            * **Restriction:** Only users with admin/maintainer permissions can use this command. I'll let you know if the PR isn't mergeable.
+
+            #### \`/rebase\` (Admin Only)
+            * **Purpose:** Rebases your Pull Request's commits onto the base branch and then merges it.
+            * **Usage:** \`/rebase\`
+            * **Restriction:** Only users with admin/maintainer permissions can use this command. I'll let you know if the PR isn't mergeable.
+
+            </details>
+
+            ---
+
+            ### About PriestyBot and CI/CD:
+
+            I'm here to complement our Continuous Integration (CI) process. Sometimes, CI checks might not even start if your Pull Request has merge conflicts. That's where I come in!
+
+            * **Automated Code Review (My Role):** I can perform quick, automated checks like formatting (\`/format\`) and linting (\`/lint\`). These are designed to give you immediate, actionable feedback via inline comments, helping you catch issues early. Think of these as helpful suggestions from an automated teammate, not formal blocking reviews.
+            * **Conflict Resolution:** My \`/resolve\` command helps you quickly address conflicts, which then allows our regular CI checks (like tests and builds) to run smoothly.
+            * **Pre-Checks:** Commands like \`/format\` and \`/lint\` allow you to proactively check and fix common issues before they're caught by the main CI pipeline, saving time and resources.
+            * **Streamlined Merging:** For admins, I can help with the final merge steps, ensuring the PR is ready for integration.
+
+            **Automated Formal Reviews (Triggered by GitHub's "Request Reviewers"):**
+            I also have a separate workflow (\`auto-review.yml\`) that runs a more comprehensive, formal review. This is triggered when you use GitHub's built-in "Request Reviewers" feature and select **PriestyBot** as a reviewer. When I perform this review, I'll:
+            * Run a full suite of linting checks (mypy, flake8, black, isort).
+            * Execute critical application tests.
+            * Post a detailed review summary directly on your PR, which might include requesting changes if critical issues are found, or approving if everything looks good.
+
+            **Important Note on Human Reviews:**
+            While I can help with quick approvals and change requests, and even provide an automated formal review, for a comprehensive, human-driven review, please use GitHub's built-in "Request Reviewers" feature and select your human teammates. This ensures your code gets the thorough human attention it deserves!
+
+            ---
+            Let me know if you have any other questions or if there's anything else I can assist with! Happy coding!
             `;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: JSON.parse(pr_number),
               body: helpMessage
             });
 
-      # --- Other commands like /format, /lint, /merge, /squash, /rebase would go here ---
-      # CONCEPTUAL: Example of a merge/squash command that might fail due to conflicts
-      - name: Handle /merge or /squash Command (Conceptual)
-        id: merge_squash_attempt
-        if: contains(fromJSON('["merge", "squash"]'), steps.parser.outputs.command) && steps.check_admin.outputs.is_admin == 'true'
+  # Job 8: Handle /format command
+  handle-format:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'format'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code for Format
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.parse-command.outputs.head_branch }}
+          token: '${{ secrets.APPROVER_TOKEN }}'
+      - name: Setup Python for Format
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install Formatters (Black, isort)
+        run: pip install black isort
+      - name: Run Formatters
+        id: run_formatters
         run: |
-          echo "Attempting conceptual merge/squash..."
-          # In a real scenario, this would involve Git commands like:
-          # git checkout ${{ github.base_ref }}
-          # git pull origin ${{ github.base_ref }}
-          # git merge --squash ${{ github.event.pull_request.head.ref }} # for squash
-          # git merge ${{ github.event.pull_request.head.ref }} # for merge
-          # Then check for conflicts or success/failure
-          # For now, we'll simulate a failure for testing the error message.
-          # To simulate success, change 'exit 1' to 'exit 0'
-          exit 1 # Simulate failure for demonstration
-        continue-on-error: true # Allow subsequent steps to run
+          isort .
+          black .
+          # Check if any changes were made by either formatter
+          if git diff --exit-code; then
+            echo "changes_made=false" >> $GITHUB_OUTPUT
+          else
+            echo "changes_made=true" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true # Allow subsequent steps to run even if formatters make changes
+      - name: Commit and Push Formatted Changes
+        if: steps.run_formatters.outputs.changes_made == 'true'
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "PriestyBot@users.noreply.github.com"
+          git add .
 
-      - name: Recommend /resolve if Merge/Squash Failed
-        if: contains(fromJSON('["merge", "squash"]'), steps.parser.outputs.command) && steps.merge_squash_attempt.outcome == 'failure'
+          # Determine commit message
+          FORMAT_MESSAGE="${{ needs.parse-command.outputs.message }}"
+          if [ -z "$FORMAT_MESSAGE" ]; then
+            COMMIT_MESSAGE="chore: Apply code formatting by PriestyBot"
+          else
+            COMMIT_MESSAGE="chore: Format code - $FORMAT_MESSAGE"
+          fi
+          git commit -m "$COMMIT_MESSAGE"
+          git push origin HEAD:${{ needs.parse-command.outputs.head_branch }}
+      - name: Post Format Status
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const commenter = context.payload.comment.user.login;
-            const command = "${{ steps.parser.outputs.command }}";
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const changesMade = JSON.stringify("${{ steps.run_formatters.outputs.changes_made }}");
+            let message;
+            if (JSON.parse(changesMade) === 'true') {
+              message = `@${JSON.parse(commenter)} ✅ Code formatting applied and pushed to PR #${JSON.parse(pr_number)}. You should see the changes reflected shortly!`;
+            } else {
+              message = `@${JSON.parse(commenter)} ℹ️ Great news! Your code is already well-formatted. No changes were needed for PR #${JSON.parse(pr_number)}.`;
+            }
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `@${commenter} ⚠️ The \`/${command}\` command failed, likely due to merge conflicts. Please use the \`/resolve\` command to get suggestions for fixing the conflicts, or resolve them manually.`
+              issue_number: JSON.parse(pr_number),
+              body: message
             });
 
-      # --- POST-EXECUTION AND ERROR HANDLERS ---
-      - name: Post Command Status
-        if: always() && steps.parser.outputs.command && steps.parser.outputs.command != 'unknown'
+  # Job 9: Handle /lint command
+  handle-lint:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'lint'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code for Lint
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.parse-command.outputs.head_branch }}
+          token: '${{ secrets.APPROVER_TOKEN }}'
+      - name: Setup Python for Lint
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install Linters
+        run: pip install black flake8 isort mypy
+      - name: Run Linters
+        id: run_linters
+        run: |
+          LINT_STATUS="PASSED" # Overall linting status
+
+          echo "--- Running flake8 ---"
+          if ! flake8_output=$(flake8 . 2>&1); then
+            echo "$flake8_output" > flake8_report.txt
+            echo "flake8_failed=true" >> $GITHUB_OUTPUT
+            LINT_STATUS="FAILED"
+          else
+            echo "flake8_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "--- Running black (check mode) ---"
+          if ! black_output=$(black --check --diff . 2>&1); then
+            echo "$black_output" > black_report.txt
+            echo "black_failed=true" >> $GITHUB_OUTPUT
+            LINT_STATUS="FAILED"
+          else
+            echo "black_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "--- Running isort (check mode) ---"
+          if ! isort_output=$(isort --check --diff . 2>&1); then
+            echo "$isort_output" > isort_report.txt
+            echo "isort_failed=true" >> $GITHUB_OUTPUT
+            LINT_STATUS="FAILED"
+          else
+            echo "isort_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "--- Running mypy ---"
+          if ! mypy_output=$(mypy . 2>&1); then
+            echo "$mypy_output" > mypy_report.txt
+            echo "mypy_failed=true" >> $GITHUB_OUTPUT
+            LINT_STATUS="FAILED"
+          else
+            echo "mypy_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "overall_lint_status=$LINT_STATUS" >> $GITHUB_OUTPUT
+        continue-on-error: true # Allow subsequent steps to run even if linting issues are found
+
+      - name: Post Lint Status
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.APPROVER_TOKEN }}
-          # Pass job_status as an explicit input
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
           script: |
-            const command = "${{ steps.parser.outputs.command }}";
-            # Safely get the job status from the GitHub Actions context
-            const conclusion = process.env.JOB_STATUS; # Access via environment variable
-            const emoji = conclusion === 'success' ? '✅' : '❌';
-            const commenter = context.payload.comment.user.login;
-            const body = `@${commenter} ${emoji} Command \`/${command}\` finished with status: **${conclusion}**.`;
-            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
-        env:
-          JOB_STATUS: ${{ job.status }} # Set job.status as an environment variable
+            const fs = require('fs');
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const overallLintStatus = "${{ steps.run_linters.outputs.overall_lint_status }}"; // Directly get the string value
+            // Construct the full HTML comment tag from the raw exported variable
+            const botReviewTagRaw = process.env.BOT_REVIEW_TAG_RAW;
+            const botReviewTag = ``;
 
-      - name: Deny Admin Command
-        if: steps.parser.outputs.command && contains('merge squash rebase', steps.parser.outputs.command) && steps.check_admin.outputs.is_admin != 'true'
-        run: echo "⛔ User is not an admin and cannot run merge commands." && exit 1
+            // These are now correctly evaluated boolean flags from the run_linters step's outputs
+            const flake8Failed = ${{ steps.run_linters.outputs.flake8_failed }} === 'true';
+            const blackFailed = ${{ steps.run_linters.outputs.black_failed }} === 'true';
+            const isortFailed = ${{ steps.run_linters.outputs.isort_failed }} === 'true';
+            const mypyFailed = ${{ steps.run_linters.outputs.mypy_failed }} === 'true';
 
+            function getReport(name) {
+              const filePath = `${name}_report.txt`;
+              if (fs.existsSync(filePath)) {
+                let content = fs.readFileSync(filePath, 'utf8').trim();
+                // Remove diff header lines for black and isort reports if present
+                if (name === 'black' || name === 'isort') {
+                    content = content.split('\n').filter(line =>
+                        !line.startsWith('--- ') &&
+                        !line.startsWith('+++ ') &&
+                        !line.startsWith('@@ ') &&
+                        !line.startsWith('diff ')
+                    ).join('\n').trim();
+                }
+                // Return actual output or a message indicating no issues if the report is empty
+                return content || `_No issues found for ${name}._`;
+              }
+              return `_No report file found for ${name}._`; // Fallback if file doesn't exist
+            }
+
+            let message = `${botReviewTag}\n`; // Add the invisible tag at the top
+            message += `@${JSON.parse(commenter)} Here's the linting report for PR #${JSON.parse(pr_number)}:\n\n`;
+
+            if (overallLintStatus === 'PASSED') { // Use overallLintStatus directly
+              message += '🎉 **All linting checks passed!** Your code looks super clean. Great job!\n\n';
+            } else {
+              message += '⚠️ **Linting found some areas for improvement.** Please check the details below for each linter. You\'ll find specific issues highlighted in the collapsible sections.\n\n';
+            }
+
+            message += `### Linting Report Summary:\n\n`;
+
+            // Use the boolean variables to control the summary text
+            message += `<details>\n<summary>📝 **flake8:** ${flake8Failed ? '❌ Issues Found' : '✅ Looks Good!' }</summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n\n`;
+            message += `<details>\n<summary>✨ **Black (Formatting):** ${blackFailed ? '❌ Needs Formatting' : '✅ Well Formatted!' }</summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n\n`;
+            message += `<details>\n<summary>➡️ **isort (Imports):** ${isortFailed ? '❌ Imports Need Sorting' : '✅ Imports Sorted!' }</summary>\n\n\`\`\`diff\n${getReport('isort')}\n\`\`\`\n\n</details>\n\n`;
+            message += `<details>\n<summary>🧐 **mypy (Type Checking):** ${mypyFailed ? '❌ Type Errors Detected' : '✅ No Type Errors!' }</summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n\n`;
+
+            message += `---\n\n`; // Consistent separator
+
+            message += `💡 **Want me to help fix some of these automatically?**\n`;
+            message += `* For formatting (Black and isort), try using the \`/format\` command!\n`;
+            message += `* If you'd like me to provide **inline comments** directly on the lines with issues (like a human reviewer would!), please use GitHub's "Request Reviewers" feature and select **PriestyBot** as a reviewer. This will trigger my comprehensive automated formal review workflow (\`auto-review.yml\`).\n\n`;
+            message += `Let me know if you have any questions or need a hand!`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: JSON.parse(pr_number),
+              body: message
+            });
+
+  # Job 10: Handle /merge command
+  handle-merge:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'merge' && needs.parse-command.outputs.is_admin == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /merge Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const head_branch = JSON.stringify("${{ needs.parse-command.outputs.head_branch }}");
+            const { data: pull_request } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: JSON.parse(pr_number),
+            });
+
+            if (!pull_request.mergeable) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ⚠️ This PR cannot be merged automatically right now (it's not mergeable, likely due to conflicts or pending checks). Please use \`/resolve\` or address other blocking issues first.`
+              });
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: JSON.parse(pr_number),
+                merge_method: 'merge', # Fast-forward merge if possible, otherwise a merge commit
+                commit_title: `Merge pull request #${JSON.parse(pr_number)} from ${JSON.parse(head_branch)}`,
+                commit_message: `Merged by @${JSON.parse(commenter)} via PriestyBot.`
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ✅ PR #${JSON.parse(pr_number)} merged successfully! Great work team!`
+            });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ❌ Failed to merge PR #${JSON.parse(pr_number)}. Error: ${error.message}`
+              });
+              core.setFailed(`Failed to merge PR: ${error.message}`);
+            }
+
+  # Job 11: Handle /squash command
+  handle-squash:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'squash' && needs.parse-command.outputs.is_admin == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /squash Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const head_branch = JSON.stringify("${{ needs.parse-command.outputs.head_branch }}");
+            const { data: pull_request } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: JSON.parse(pr_number),
+            });
+
+            if (!pull_request.mergeable) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ⚠️ This PR cannot be squashed automatically right now (it's not mergeable, likely due to conflicts or pending checks). Please use \`/resolve\` or address other blocking issues first.`
+              });
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: JSON.parse(pr_number),
+                merge_method: 'squash',
+                commit_title: `Squash merge of pull request #${JSON.parse(pr_number)} from ${JSON.parse(head_branch)}`,
+                commit_message: `Squashed by @${JSON.parse(commenter)} via PriestyBot.\n\n${pull_request.title}\n\n${pull_request.body}`
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ✅ PR #${JSON.parse(pr_number)} squashed and merged successfully! Awesome!`
+              });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ❌ Failed to squash merge PR #${JSON.parse(pr_number)}. Error: ${error.message}`
+              });
+              core.setFailed(`Failed to squash merge PR: ${error.message}`);
+            }
+
+  # Job 12: Handle /rebase command
+  handle-rebase:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'rebase' && needs.parse-command.outputs.is_admin == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle /rebase Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const { data: pull_request } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: JSON.parse(pr_number),
+            });
+
+            if (!pull_request.mergeable) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ⚠️ This PR cannot be rebased automatically right now (it's not mergeable, likely due to conflicts or pending checks). Please use \`/resolve\` or address other blocking issues first.`
+              });
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: JSON.parse(pr_number),
+                merge_method: 'rebase'
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ✅ PR #${JSON.parse(pr_number)} rebased and merged successfully! Fantastic!`
+              });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: JSON.parse(pr_number),
+                body: `@${JSON.parse(commenter)} ❌ Failed to rebase merge PR #${JSON.parse(pr_number)}. Error: ${error.message}`
+              });
+              core.setFailed(`Failed to rebase merge PR: ${error.message}`);
+            }
+
+  # Job 13: Handle unknown command
+  handle-unknown-command:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'unknown'
+    runs-on: ubuntu-latest
+    steps:
       - name: Handle Unknown Command
-        if: steps.parser.outputs.command == 'unknown'
-        run: echo "🤔 Unknown command. Please use /help for a list of available commands." && exit 0
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const body = `@${JSON.parse(commenter)} 🤔 I don't recognize that command. Please use \`/help\` for a list of available commands.`
+            await github.rest.issues.createComment({ ...context.repo, issue_number: JSON.parse(pr_number), body });
+
+  # Job 14: Deny Admin Command (if user is not admin)
+  deny-admin-command:
+    needs: parse-command
+    if: needs.parse-command.outputs.command && contains('merge squash rebase', needs.parse-command.outputs.command) && needs.parse-command.outputs.is_admin != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deny Admin Command
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
+            const command = JSON.stringify("${{ needs.parse-command.outputs.command }}");
+            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
+            const body = `⛔ @${JSON.parse(commenter)}, you do not have permission to run the \`/${JSON.parse(command)}\` command. This command is restricted to administrators.`
+            await github.rest.issues.createComment({ ...context.repo, issue_number: JSON.parse(pr_number), body });
