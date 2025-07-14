@@ -1733,18 +1733,18 @@ class CodeEditor(tk.Frame):
         return "break"
 
     def _on_tab(self, event):
-        if self.autocomplete_manager.is_visible():
-            self.autocomplete_manager.confirm_selection(event)
-            return "break"
+            if self.autocomplete_manager.is_visible():
+                self.autocomplete_manager.confirm_selection(event)
+                return "break"
 
-        if self.active_snippet_session:
-            self._jump_to_next_placeholder()
-            return "break"
+            if self.active_snippet_session:
+                self._jump_to_next_placeholder(confirm_first=False)
+                return "break"
 
-        self.autocomplete_dismissed_word = None
-        self.text_area.edit_separator()
-        self.text_area.insert(tk.INSERT, "    ")
-        return "break"
+            self.autocomplete_dismissed_word = None
+            self.text_area.edit_separator()
+            self.text_area.insert(tk.INSERT, "    ")
+            return "break"
 
     def _on_return_key(self, event):
         if self.autocomplete_manager.is_visible():

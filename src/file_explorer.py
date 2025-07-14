@@ -26,6 +26,8 @@ class FileExplorer(tk.Frame):
         self.parent = parent  # The main PriestyCode instance
         self.project_root = project_root
         self.open_file_callback = open_file_callback
+        # ADD THIS
+        self.git_statuses = {} 
 
         self.folder_icon = folder_icon
         self.python_icon = python_icon
@@ -74,10 +76,23 @@ class FileExplorer(tk.Frame):
             foreground="white",
             font=("Segoe UI", 9, "bold"),
         )
+        # ADD GIT STATUS COLORS
+        self.style.configure("git_modified.Treeview", foreground="#6CB2F1") # Blue
+        self.style.configure("git_untracked.Treeview", foreground="#7BC672") # Green
+        self.style.configure("git_deleted.Treeview", foreground="#F14C4C") # Red
+        self.style.configure("git_renamed.Treeview", foreground="#DDB96B") # Yellow
         self.style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+
+    # ADD THIS METHOD
+    def update_git_status(self, statuses: dict):
+        """Receives git statuses and refreshes the tree."""
+        self.git_statuses = statuses
+        self.populate_tree()
 
     def set_project_root(self, path):
         self.project_root = path
+        # MODIFIED: Clear old statuses when root changes
+        self.git_statuses = {}
         self.populate_tree()
 
     def populate_tree(self):
@@ -112,6 +127,9 @@ class FileExplorer(tk.Frame):
             )
             for item in items:
                 full_path = os.path.join(path, item)
+                # MODIFIED: Get relative path for git status lookup
+                relative_path = os.path.relpath(full_path, self.project_root).replace("\\", "/")
+
                 if os.path.isdir(full_path):
                     insert_kwargs = {
                         "parent": parent_node,
@@ -144,12 +162,26 @@ class FileExplorer(tk.Frame):
                     ]:
                         icon = self.git_icon
 
+                    # MODIFIED: Determine tags based on git status
+                    tags = ["file_item"]
+                    git_status = self.git_statuses.get(relative_path)
+                    if git_status:
+                        if 'M' in git_status:
+                            tags.append("git_modified")
+                        elif '?' in git_status:
+                             tags.append("git_untracked")
+                        elif 'D' in git_status:
+                             tags.append("git_deleted")
+                        elif 'R' in git_status:
+                             tags.append("git_renamed")
+                    
                     insert_kwargs = {
                         "parent": parent_node,
                         "index": "end",
                         "iid": full_path,
                         "text": item,
-                        "tags": ("file_item",),
+                        # MODIFIED: Use the new tags list
+                        "tags": tuple(tags),
                     }
                     if icon:
                         insert_kwargs["image"] = icon
@@ -157,6 +189,7 @@ class FileExplorer(tk.Frame):
         except Exception as e:
             print(f"Error reading directory {path}: {e}")
 
+    # MODIFIED: Add Git commands to context menu
     def _show_context_menu(self, event):
         item_id = self.tree.identify_row(event.y)
         if item_id:
@@ -166,6 +199,31 @@ class FileExplorer(tk.Frame):
 
         is_file = item_id and os.path.isfile(item_id)
         is_dir = item_id and os.path.isdir(item_id)
+        
+        # --- GIT CONTEXT MENU ---
+        if self.parent.source_control_ui.git_logic.is_git_repo() and is_file:
+            relative_path = os.path.relpath(item_id, self.project_root).replace("\\", "/")
+            git_status = self.git_statuses.get(relative_path)
+            
+            git_menu = tk.Menu(
+                self.context_menu,
+                tearoff=0,
+                bg="#3C3C3C",
+                fg="white"
+            )
+
+            # If status exists, it's a changed file
+            if git_status:
+                is_staged = not (git_status.isspace() or '?' in git_status)
+                if is_staged:
+                     git_menu.add_command(label="Unstage", command=lambda: self.parent.source_control_ui._unstage_file(relative_path))
+                else:
+                     git_menu.add_command(label="Stage", command=lambda: self.parent.source_control_ui._stage_file(relative_path))
+                git_menu.add_command(label="Discard Changes", command=lambda: self.parent.source_control_ui._discard_changes(relative_path))
+                
+                self.context_menu.add_cascade(label="Git", menu=git_menu)
+                self.context_menu.add_separator()
+        # --- END GIT CONTEXT MENU ---
 
         if is_file and item_id.endswith(".py"):
             self.context_menu.add_command(
