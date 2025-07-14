@@ -21,11 +21,16 @@ try:
     from console_ui import ConsoleUi
     from terminal import Terminal
     from file_explorer import FileExplorer
+    # ADD THIS IMPORT
+    from source_control_ui import SourceControlUI
 except Exception:
     from src.code_editor import CodeEditor
     from src.console_ui import ConsoleUi
     from src.terminal import Terminal
     from src.file_explorer import FileExplorer
+    # ADD THIS IMPORT
+    from src.source_control_ui import SourceControlUI
+
 
 # --- Core Application Paths ---
 current_dir = os.path.dirname(__file__)
@@ -81,7 +86,8 @@ class PriestyCode(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PriestyCode v1.0.0")
-        self.geometry("1300x850")
+        # MODIFIED: Increase default width for new panel
+        self.geometry("1450x850") 
         self.config(bg="#2B2B2B")
 
         self.icon_size = 16
@@ -109,6 +115,8 @@ class PriestyCode(tk.Tk):
         self.file_name_label: tk.Label
         self.error_console: ConsoleUi
         self.file_explorer: FileExplorer
+        # ADDED: Initialize source_control_ui to None
+        self.source_control_ui: SourceControlUI | None = None
 
         # --- Terminal Management ---
         self.terminals: list[Terminal] = []
@@ -128,15 +136,19 @@ class PriestyCode(tk.Tk):
         self._configure_styles()
         self._setup_layout()
         self._create_top_toolbar()
-        self._create_menu_bar()
+        self._create_menu_bar() # Menu bar created BEFORE source_control_ui is initialized
         self._create_main_content_area()
+        # ADD THIS
+        self._create_status_bar()
         self._bind_shortcuts()
-
+        
         self.after(1, self._apply_font_size)
         self.after(50, self._process_output_queue)
         self.after(200, self._check_virtual_env)
+        # MODIFIED: Update Git info after checking venv
+        self.after(300, self.update_git_info)
         self.after(500, self._open_sandbox_if_empty)
-
+    
     def _initialize_settings_vars(self):
         """Initializes all tk.Vars for settings with default values."""
         self.autocomplete_enabled = tk.BooleanVar(value=True)
@@ -266,10 +278,12 @@ class PriestyCode(tk.Tk):
             relief="flat",
         )
         self.style.map("Treeview.Heading", background=[("active", "#555555")])
-
+    
     def _setup_layout(self):
         """Sets up the main grid layout for the IDE window."""
+        # MODIFIED: Add row for status bar
         self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=0) # Status bar row
         self.grid_columnconfigure(0, weight=1)
 
     def _create_top_toolbar(self):
@@ -454,6 +468,19 @@ class PriestyCode(tk.Tk):
         workspace_menu.add_command(
             label="Install Requirements", command=self._install_requirements
         )
+        
+        # --- ADD NEW SOURCE CONTROL MENU ---
+        source_control_menu = tk.Menu(menubar, **menu_kwargs)
+        menubar.add_cascade(label="Source Control", menu=source_control_menu)
+        # MODIFIED: Call wrapper methods that check for source_control_ui's existence
+        source_control_menu.add_command(label="Refresh", command=self._sc_refresh)
+        source_control_menu.add_command(label="Commit...", command=self._sc_commit_action)
+        source_control_menu.add_command(label="Push", command=self._sc_push_action)
+        source_control_menu.add_command(label="Pull", command=self._sc_pull_action)
+        source_control_menu.add_separator()
+        source_control_menu.add_command(label="Initialize Repository", command=self._sc_init_repo)
+        source_control_menu.add_command(label="Clone Repository...", command=self._clone_repo)
+
 
         settings_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -519,10 +546,13 @@ class PriestyCode(tk.Tk):
         self.main_paned_window = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_paned_window.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 
-        left_pane = ttk.Frame(self.main_paned_window)
-        self.main_paned_window.add(left_pane, weight=1)
+        left_notebook = ttk.Notebook(self.main_paned_window)
+        self.main_paned_window.add(left_notebook, weight=1)
+
+        # --- File Explorer Tab ---
+        explorer_frame = tk.Frame(left_notebook, bg="#2B2B2B")
         self.file_explorer = FileExplorer(
-            left_pane,
+            explorer_frame,
             self,
             self.workspace_root_dir,
             self._open_file_from_path,
@@ -534,10 +564,21 @@ class PriestyCode(tk.Tk):
             md_icon=self.md_icon,
         )
         self.file_explorer.pack(fill="both", expand=True)
+        left_notebook.add(explorer_frame, text="Explorer")
+
+        # --- Source Control Tab ---
+        sc_frame = tk.Frame(left_notebook, bg="#2B2B2B")
+        self.source_control_ui = SourceControlUI(
+            sc_frame,
+            self, # parent_app
+            self._open_file_from_path, # open_file_callback
+            self.workspace_root_dir # workspace_root_dir
+        )
+        self.source_control_ui.pack(fill="both", expand=True)
 
         self.right_pane = ttk.PanedWindow(self.main_paned_window, orient=tk.VERTICAL)
         self.main_paned_window.add(self.right_pane, weight=4)
-
+        
         editor_area_frame = tk.Frame(self.right_pane, bg="#2B2B2B")
         self.right_pane.add(editor_area_frame, weight=3)
         editor_area_frame.grid_rowconfigure(1, weight=1)
@@ -575,6 +616,81 @@ class PriestyCode(tk.Tk):
         self.output_notebook.add(error_page, text="PROBLEMS")
 
         self._create_new_terminal()  # Create the first terminal
+
+    # --- ADD NEW STATUS BAR METHODS ---
+    def _create_status_bar(self):
+        """Creates the bottom status bar."""
+        self.status_bar = tk.Frame(self, bg="#3C3C3C", height=22)
+        self.status_bar.grid(row=2, column=0, sticky="ew")
+        self.status_bar.grid_propagate(False)
+        
+        self.git_status_label = tk.Label(self.status_bar, text="Git status...", bg="#3C3C3C", fg="white", font=("Segoe UI", 8))
+        self.git_status_label.pack(side="left", padx=10)
+
+    def update_git_status_bar(self, text: str):
+        """Updates the text in the Git status bar label."""
+        self.git_status_label.config(text=text)
+        
+    def update_git_info(self):
+        """Refreshes all Git-related UI components."""
+        # Check if source_control_ui is initialized before calling refresh
+        if self.source_control_ui:
+            self.source_control_ui.refresh()
+
+    # --- ADD NEW GIT-RELATED MENU COMMAND WRAPPERS ---
+    def _sc_refresh(self):
+        if self.source_control_ui:
+            self.source_control_ui.refresh()
+
+    def _sc_commit_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._commit_action()
+
+    def _sc_push_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._push_action()
+
+    def _sc_pull_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._pull_action()
+
+    def _sc_init_repo(self):
+        if self.source_control_ui:
+            self.source_control_ui._init_repo()
+
+    def _clone_repo(self):
+        repo_url = simpledialog.askstring("Clone Repository", "Enter repository URL:", parent=self)
+        if not repo_url:
+            return
+            
+        target_dir = filedialog.askdirectory(title="Select folder to clone into", initialdir=os.path.dirname(self.workspace_root_dir))
+        if not target_dir:
+            return
+            
+        messagebox.showinfo("Cloning...", f"Cloning '{repo_url}' into '{target_dir}'. This may take a moment.")
+        
+        def run_clone():
+            # We can't use the instance's git_logic because it's tied to a project root.
+            # So we run a one-off command.
+            try:
+                process = subprocess.Popen(
+                    ["git", "clone", repo_url, target_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                stdout, stderr = process.communicate()
+                if process.returncode == 0:
+                    if messagebox.askyesno("Clone Successful", "Repository cloned successfully. Open the new folder?"):
+                        # This needs to run on the main thread
+                        self.after(0, self._open_folder, target_dir)
+                else:
+                    messagebox.showerror("Clone Failed", stderr)
+            except Exception as e:
+                messagebox.showerror("Clone Error", str(e))
+                
+        threading.Thread(target=run_clone, daemon=True).start()
 
     def _jump_to_error_location(self, file_path, line):
         self._open_file_from_path(file_path)
@@ -847,12 +963,14 @@ class PriestyCode(tk.Tk):
         if file_path:
             self._open_file_from_path(file_path)
 
-    def _open_folder(self):
-        new_path = filedialog.askdirectory(
-            title="Select Workspace Folder", initialdir=self.workspace_root_dir
-        )
+    def _open_folder(self, new_path=None):
+        if not new_path:
+            new_path = filedialog.askdirectory(
+                title="Select Workspace Folder", initialdir=self.workspace_root_dir
+            )
         if not new_path or not os.path.isdir(new_path):
             return
+            
         while self.open_files:
             if not self._close_tab(0, force_ask=True):
                 return
@@ -860,6 +978,8 @@ class PriestyCode(tk.Tk):
         self.file_explorer.set_project_root(new_path)
         [term.set_cwd(new_path) for term in self.terminals]
         self._check_virtual_env()
+        # ADD THIS
+        self.update_git_info()
         self.title(f"PriestyCode - {os.path.basename(new_path)}")
 
     def _open_file_from_path(self, file_path):
