@@ -1,10 +1,10 @@
-import tkinter as tk #hello
-from tkinter import messagebox, scrolledtext, filedialog
+#main.py
+from priesty_ide import PriestyCode
 
-try:
-    from priesty_ide import PriestyCode
-except Exception:
-    from src.priesty_ide import PriestyCode
+def main():
+    """Main function to run the application."""
+    app = PriestyCode()
+    app.run()
 
-ide = PriestyCode()
-ide.run()
+if __name__ == "__main__":
+    main()
