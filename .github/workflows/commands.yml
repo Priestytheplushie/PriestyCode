@@ -45,7 +45,7 @@ jobs:
             const command = args[0].substring(1);
             const message = args.slice(1).join(' ');
 
-            const validCommands = ['help', 'approve', 'request-changes', 'comment', 'format', 'lint', 'merge', 'squash', 'rebase', 'resolve'];
+            const validCommands = ['help', 'approve', 'request-changes', 'comment', 'format', 'lint', 'merge', 'squash', 'rebase', 'resolve','release','tag'];
 
             if (!validCommands.includes(command)) {
               console.log(`Unknown command: ${command}`);
@@ -77,7 +77,7 @@ jobs:
             core.setOutput('head_branch', pull_request.head.ref);
             core.setOutput('repo_name', context.repo.owner + '/' + context.repo.repo);
             core.exportVariable('BOT_USERNAME', 'PriestyBot');
-            // Changed: Export a simple tag, the HTML comment is constructed where used
+            # Changed: Export a simple tag, the HTML comment is constructed where used
             core.exportVariable('BOT_REVIEW_TAG_RAW', 'BOT_REVIEW_TAG');
 
       - name: Check Admin Status
@@ -406,6 +406,12 @@ jobs:
             * **Usage:** \`/rebase\`
             * **Restriction:** Only users with admin/maintainer permissions can use this command. I'll let you know if the PR isn't mergeable.
 
+            #### \`/release <patch|minor|major>\` (Develop Branch Only)
+            * **Purpose:** Creates a new pre-release tag on the \`develop\` branch with a semantic version bump and a \`-beta.N\` suffix. Use this to mark your PR for pre-release testing before merging.
+            * **Usage:** \`/release patch\`, \`/release minor\`, or \`/release major\`
+            * **Behavior:** Automatically calculates and creates the next pre-release tag (e.g. \`v0.2.1-beta.3\`) and pushes it to GitHub. You'll get a confirmation comment with the tag name to use for deployment.
+            * **Note:** Only works on PRs targeting the \`develop\` branch. Use at the end of your PR lifecycle to prepare a testable pre-release.
+
             </details>
 
             ---
@@ -437,6 +443,7 @@ jobs:
               issue_number: JSON.parse(pr_number),
               body: helpMessage
             });
+
 
   # Job 8: Handle /format command
   handle-format:
@@ -567,46 +574,47 @@ jobs:
 
       - name: Post Lint Status
         uses: actions/github-script@v7
+        env:
+          FLAKE8_FAILED: ${{ steps.run_linters.outputs.flake8_failed }}
+          BLACK_FAILED: ${{ steps.run_linters.outputs.black_failed }}
+          ISORT_FAILED: ${{ steps.run_linters.outputs.isort_failed }}
+          MYPY_FAILED: ${{ steps.run_linters.outputs.mypy_failed }}
+          COMMENTER: ${{ needs.parse-command.outputs.commenter }}
+          PR_NUMBER: ${{ needs.parse-command.outputs.pr_number }}
         with:
-          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          github-token: ${{ secrets.APPROVER_TOKEN }}
           script: |
             const fs = require('fs');
-            const commenter = JSON.stringify("${{ needs.parse-command.outputs.commenter }}");
-            const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
-            const overallLintStatus = "${{ steps.run_linters.outputs.overall_lint_status }}"; // Directly get the string value
-            // Construct the full HTML comment tag from the raw exported variable
-            const botReviewTagRaw = process.env.BOT_REVIEW_TAG_RAW;
-            const botReviewTag = ``;
+            const commenter = process.env.COMMENTER;
+            const pr_number = parseInt(process.env.PR_NUMBER, 10);
 
-            // These are now correctly evaluated boolean flags from the run_linters step's outputs
-            const flake8Failed = ${{ steps.run_linters.outputs.flake8_failed }} === 'true';
-            const blackFailed = ${{ steps.run_linters.outputs.black_failed }} === 'true';
-            const isortFailed = ${{ steps.run_linters.outputs.isort_failed }} === 'true';
-            const mypyFailed = ${{ steps.run_linters.outputs.mypy_failed }} === 'true';
+            const flake8Failed = process.env.FLAKE8_FAILED === 'true';
+            const blackFailed = process.env.BLACK_FAILED === 'true';
+            const isortFailed = process.env.ISORT_FAILED === 'true';
+            const mypyFailed = process.env.MYPY_FAILED === 'true';
 
             function getReport(name) {
               const filePath = `${name}_report.txt`;
               if (fs.existsSync(filePath)) {
                 let content = fs.readFileSync(filePath, 'utf8').trim();
-                // Remove diff header lines for black and isort reports if present
                 if (name === 'black' || name === 'isort') {
-                    content = content.split('\n').filter(line =>
-                        !line.startsWith('--- ') &&
-                        !line.startsWith('+++ ') &&
-                        !line.startsWith('@@ ') &&
-                        !line.startsWith('diff ')
-                    ).join('\n').trim();
+                  content = content.split('\n').filter(line =>
+                    !line.startsWith('--- ') &&
+                    !line.startsWith('+++ ') &&
+                    !line.startsWith('@@ ') &&
+                    !line.startsWith('diff ')
+                  ).join('\n').trim();
                 }
-                // Return actual output or a message indicating no issues if the report is empty
                 return content || `_No issues found for ${name}._`;
               }
-              return `_No report file found for ${name}._`; // Fallback if file doesn't exist
+              return `_No report file found for ${name}._`;
             }
 
-            let message = `${botReviewTag}\n`; // Add the invisible tag at the top
-            message += `@${JSON.parse(commenter)} Here's the linting report for PR #${JSON.parse(pr_number)}:\n\n`;
+            let message = `@${commenter} Here's the linting report for PR #${pr_number}:\n\n`;
 
-            if (overallLintStatus === 'PASSED') { // Use overallLintStatus directly
+            const anyFailed = flake8Failed || blackFailed || isortFailed || mypyFailed;
+
+            if (!anyFailed) {
               message += '🎉 **All linting checks passed!** Your code looks super clean. Great job!\n\n';
             } else {
               message += '⚠️ **Linting found some areas for improvement.** Please check the details below for each linter. You\'ll find specific issues highlighted in the collapsible sections.\n\n';
@@ -614,25 +622,25 @@ jobs:
 
             message += `### Linting Report Summary:\n\n`;
 
-            // Use the boolean variables to control the summary text
             message += `<details>\n<summary>📝 **flake8:** ${flake8Failed ? '❌ Issues Found' : '✅ Looks Good!' }</summary>\n\n\`\`\`\n${getReport('flake8')}\n\`\`\`\n\n</details>\n\n`;
             message += `<details>\n<summary>✨ **Black (Formatting):** ${blackFailed ? '❌ Needs Formatting' : '✅ Well Formatted!' }</summary>\n\n\`\`\`diff\n${getReport('black')}\n\`\`\`\n\n</details>\n\n`;
             message += `<details>\n<summary>➡️ **isort (Imports):** ${isortFailed ? '❌ Imports Need Sorting' : '✅ Imports Sorted!' }</summary>\n\n\`\`\`diff\n${getReport('isort')}\n\`\`\`\n\n</details>\n\n`;
             message += `<details>\n<summary>🧐 **mypy (Type Checking):** ${mypyFailed ? '❌ Type Errors Detected' : '✅ No Type Errors!' }</summary>\n\n\`\`\`\n${getReport('mypy')}\n\`\`\`\n\n</details>\n\n`;
 
-            message += `---\n\n`; // Consistent separator
+            message += `---\n\n`;
 
             message += `💡 **Want me to help fix some of these automatically?**\n`;
             message += `* For formatting (Black and isort), try using the \`/format\` command!\n`;
-            message += `* If you'd like me to provide **inline comments** directly on the lines with issues (like a human reviewer would!), please use GitHub's "Request Reviewers" feature and select **PriestyBot** as a reviewer. This will trigger my comprehensive automated formal review workflow (\`auto-review.yml\`).\n\n`;
+            message += `* If you'd like me to provide **inline comments** directly on the lines with issues, please use GitHub's "Request Reviewers" feature and select **PriestyBot** as a reviewer. This will trigger my automated formal review workflow.\n\n`;
             message += `Let me know if you have any questions or need a hand!`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: JSON.parse(pr_number),
+              issue_number: pr_number,
               body: message
             });
+
 
   # Job 10: Handle /merge command
   handle-merge:
@@ -828,3 +836,322 @@ jobs:
             const pr_number = JSON.stringify("${{ needs.parse-command.outputs.pr_number }}");
             const body = `⛔ @${JSON.parse(commenter)}, you do not have permission to run the \`/${JSON.parse(command)}\` command. This command is restricted to administrators.`
             await github.rest.issues.createComment({ ...context.repo, issue_number: JSON.parse(pr_number), body });
+
+  # Job: Handle /release command
+  handle-release:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.comment_result.outputs.success }}
+    steps:
+      - name: Validate /release argument and base branch
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            try {
+              const validArgs = ['patch', 'minor', 'major'];
+              const message = "${{ needs.parse-command.outputs.message }}".trim();
+              const baseBranch = "${{ needs.parse-command.outputs.base_branch }}";
+              const commenter = "${{ needs.parse-command.outputs.commenter }}";
+              const prNumber = parseInt("${{ needs.parse-command.outputs.pr_number }}", 10);
+
+              if (baseBranch !== 'develop') {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `@${commenter} ⚠️ The \`/release\` command only works on PRs targeting the \`develop\` branch. This PR targets \`${baseBranch}\`.`
+                });
+                return { valid: false };
+              }
+              if (!validArgs.includes(message)) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `@${commenter} ⚠️ Invalid release type \`${message}\`. Please use one of: \`patch\`, \`minor\`, or \`major\`.`
+                });
+                return { valid: false };
+              }
+              return { valid: true, releaseType: message };
+            } catch (error) {
+              console.error(error);
+              return { valid: false, error: error.message };
+            }
+
+      - name: Abort if validation failed
+        if: steps.validate.outputs.valid != 'true'
+        run: echo "Validation failed, skipping release steps."
+
+      - name: Checkout develop branch
+        if: steps.validate.outputs.valid == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          token: '${{ secrets.APPROVER_TOKEN }}'
+
+      - name: Fetch all tags
+        if: steps.validate.outputs.valid == 'true'
+        run: git fetch --tags
+
+      - name: Calculate next version tag
+        if: steps.validate.outputs.valid == 'true'
+        id: version
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            try {
+              function parseTag(tag) {
+                const regex = /^v(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?$/;
+                const m = regex.exec(tag);
+                if (!m) return null;
+                return {
+                  major: parseInt(m[1], 10),
+                  minor: parseInt(m[2], 10),
+                  patch: parseInt(m[3], 10),
+                  beta: m[4] ? parseInt(m[4], 10) : null,
+                  original: tag
+                };
+              }
+
+              let page = 1;
+              let tags = [];
+              while (true) {
+                const { data } = await github.rest.git.listMatchingRefs({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: 'tags',
+                  per_page: 100,
+                  page
+                });
+                if (data.length === 0) break;
+                tags = tags.concat(data.map(t => t.ref.replace('refs/tags/', '')));
+                page++;
+              }
+
+              const semverTags = tags.map(parseTag).filter(x => x !== null);
+
+              const stableTags = semverTags.filter(t => t.beta === null);
+              stableTags.sort((a,b) =>
+                a.major !== b.major ? b.major - a.major :
+                a.minor !== b.minor ? b.minor - a.minor :
+                b.patch - a.patch
+              );
+              const latestStable = stableTags[0] || {major:0,minor:0,patch:0};
+
+              const betaTagsForLatest = semverTags.filter(t =>
+                t.major === latestStable.major &&
+                t.minor === latestStable.minor &&
+                t.patch === latestStable.patch &&
+                t.beta !== null
+              );
+
+              betaTagsForLatest.sort((a,b) => b.beta - a.beta);
+              const latestBeta = betaTagsForLatest[0];
+
+              const releaseType = "${{ steps.validate.outputs.releaseType }}";
+
+              let newMajor = latestStable.major;
+              let newMinor = latestStable.minor;
+              let newPatch = latestStable.patch;
+
+              if (releaseType === 'major') {
+                newMajor++;
+                newMinor = 0;
+                newPatch = 0;
+              } else if (releaseType === 'minor') {
+                newMinor++;
+                newPatch = 0;
+              } else if (releaseType === 'patch') {
+                newPatch++;
+              }
+
+              let newBetaNumber = 1;
+              if (latestBeta &&
+                latestBeta.major === newMajor &&
+                latestBeta.minor === newMinor &&
+                latestBeta.patch === newPatch) {
+                newBetaNumber = latestBeta.beta + 1;
+              }
+
+              const newTag = `v${newMajor}.${newMinor}.${newPatch}-beta.${newBetaNumber}`;
+
+              return { newTag };
+            } catch (error) {
+              console.error(error);
+              return { newTag: null, error: error.message };
+            }
+
+      - name: Fail if version calculation failed
+        if: steps.version.outputs.newTag == 'null' || steps.version.outputs.newTag == ''
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            const commenter = "${{ needs.parse-command.outputs.commenter }}";
+            const prNumber = parseInt("${{ needs.parse-command.outputs.pr_number }}", 10);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `@${commenter} ❌ Oops! I couldn't calculate the next version tag due to an internal error. Please check the workflow logs or try again later.`
+            });
+        continue-on-error: true
+
+      - name: Create and push new tag
+        if: steps.validate.outputs.valid == 'true' && steps.version.outputs.newTag != '' && steps.version.outputs.newTag != 'null'
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "priestybot@example.com"
+          git tag ${{ steps.version.outputs.newTag }}
+          git push origin ${{ steps.version.outputs.newTag }}
+        shell: bash
+        continue-on-error: false
+
+      - name: Comment new pre-release tag with deploy instructions
+        id: comment_result
+        if: steps.validate.outputs.valid == 'true' && steps.version.outputs.newTag != '' && steps.version.outputs.newTag != 'null'
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            try {
+              const commenter = "${{ needs.parse-command.outputs.commenter }}";
+              const prNumber = parseInt("${{ needs.parse-command.outputs.pr_number }}", 10);
+              const newTag = "${{ steps.version.outputs.newTag }}";
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${commenter} 🚀 Your beta pre-release tag **${newTag}** has been created and pushed to the \`develop\` branch.\n\n` +
+                      `You can deploy this pre-release build to the Beta environment using the \`deploy-beta\` workflow, selecting the **Beta** environment and specifying this tag as the release tag.\n\n` +
+                      `**Note:** This is a pre-release build for testing on Beta only. It is not intended for Production.\n\n` +
+                      `Happy testing! 🎉`
+              });
+              return { success: 'true' };
+            } catch (error) {
+              console.error(error);
+              return { success: 'false' };
+            }
+  # Job: Handle /tag command for production releases (create & push tag)
+  handle-tag:
+    needs: parse-command
+    if: needs.parse-command.outputs.command == 'tag'
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.comment_result.outputs.success }}
+    steps:
+      - name: Validate /tag argument and base branch
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            try {
+              const tag = "${{ needs.parse-command.outputs.message }}".trim();
+              const baseBranch = "${{ needs.parse-command.outputs.base_branch }}";
+              const commenter = "${{ needs.parse-command.outputs.commenter }}";
+              const prNumber = parseInt("${{ needs.parse-command.outputs.pr_number }}", 10);
+
+              # Check branch is main
+              if (baseBranch !== 'main') {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `@${commenter} ⚠️ The \`/tag\` command only works on PRs targeting the \`main\` branch. This PR targets \`${baseBranch}\`.`
+                });
+                return { valid: false };
+              }
+
+              # Simple semver tag validation: vX.Y.Z
+              const semverRegex = /^v\d+\.\d+\.\d+$/;
+              if (!semverRegex.test(tag)) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `@${commenter} ⚠️ Invalid tag format \`${tag}\`. Please provide a semantic version tag like \`v1.2.3\`.`
+                });
+                return { valid: false };
+              }
+
+              # Check if tag already exists
+              try {
+                await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${tag}`
+                });
+                # If above does not throw, tag exists
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `@${commenter} ⚠️ Tag \`${tag}\` already exists on the repository. Please choose a new version number.`
+                });
+                return { valid: false };
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error; # unexpected error
+                }
+                # Tag does not exist, all good
+              }
+
+              return { valid: true, tag };
+            } catch (error) {
+              console.error(error);
+              return { valid: false, error: error.message };
+            }
+
+      - name: Abort if validation failed
+        if: steps.validate.outputs.valid != 'true'
+        run: echo "Validation failed, skipping tag creation."
+
+      - name: Checkout main branch
+        if: steps.validate.outputs.valid == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: '${{ secrets.APPROVER_TOKEN }}'
+
+      - name: Create and push new production tag
+        if: steps.validate.outputs.valid == 'true'
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "priestybot@example.com"
+          git tag ${{ steps.validate.outputs.tag }}
+          git push origin ${{ steps.validate.outputs.tag }}
+        shell: bash
+
+      - name: Comment tag creation success with instructions
+        id: comment_result
+        if: steps.validate.outputs.valid == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: '${{ secrets.APPROVER_TOKEN }}'
+          script: |
+            try {
+              const commenter = "${{ needs.parse-command.outputs.commenter }}";
+              const prNumber = parseInt("${{ needs.parse-command.outputs.pr_number }}", 10);
+              const tag = "${{ steps.validate.outputs.tag }}";
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: `@${commenter} 🚀 Production release tag **${tag}** has been created and pushed to the \`main\` branch.\n\n` +
+                      `This will trigger the production build and deployment workflows.\n\n` +
+                      `Please monitor the workflow runs to confirm deployment success.\n\n` +
+                      `Thank you for releasing! 🎉`
+              });
+              return { success: 'true' };
+            } catch (error) {
+              console.error(error);
+              return { success: 'false' };
+            }
