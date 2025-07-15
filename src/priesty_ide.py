@@ -575,6 +575,7 @@ class PriestyCode(tk.Tk):
             self.workspace_root_dir # workspace_root_dir
         )
         self.source_control_ui.pack(fill="both", expand=True)
+        left_notebook.add(sc_frame, text="Source Control")
 
         self.right_pane = ttk.PanedWindow(self.main_paned_window, orient=tk.VERTICAL)
         self.main_paned_window.add(self.right_pane, weight=4)

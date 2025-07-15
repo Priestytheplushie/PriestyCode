@@ -5,7 +5,7 @@ import subprocess
 import threading
 from typing import List, Tuple, Dict, Callable, Optional, Any
 import re
-import shlex # FIX: Import shlex for robust command parsing
+import shlex
 
 # ======================================================================================
 # 1. STYLING AND THEME
@@ -37,7 +37,6 @@ class StyleManager:
 
     def configure_styles(self):
         """Applies the theme to all ttk widgets."""
-        # --- General ---
         self.style.configure('.',
                              background=self.COLOR_BG,
                              foreground=self.COLOR_FG,
@@ -45,7 +44,6 @@ class StyleManager:
                              borderwidth=0,
                              relief="flat")
         
-        # --- Treeview ---
         self.style.configure("Treeview",
                              background=self.COLOR_BG_DARK,
                              foreground=self.COLOR_FG,
@@ -60,11 +58,9 @@ class StyleManager:
         self.style.map("Treeview.Heading",
                        background=[('active', self.COLOR_BORDER)])
 
-        # --- PanedWindow ---
         self.style.configure("TPanedwindow", background=self.COLOR_BG)
         self.style.configure("TPanedwindow.Sash", background=self.COLOR_BG_LIGHT, sashthickness=6)
 
-        # --- Scrollbar ---
         self.style.configure("TScrollbar",
                              gripcount=0,
                              background=self.COLOR_BG_LIGHT,
@@ -75,11 +71,9 @@ class StyleManager:
                              arrowcolor=self.COLOR_FG)
         self.style.map('TScrollbar', background=[('active', self.COLOR_BORDER)])
 
-        # --- Frame ---
         self.style.configure("TFrame", background=self.COLOR_BG)
         self.style.configure("Header.TFrame", background=self.COLOR_BG_LIGHT)
         
-        # --- Notebook ---
         self.style.configure("TNotebook", background=self.COLOR_BG, borderwidth=0)
         self.style.configure("TNotebook.Tab",
                              background=self.COLOR_BG_LIGHT,
@@ -206,7 +200,6 @@ class GitLogic:
 
     def run_arbitrary_command(self, command_str: str) -> Tuple[bool, str]:
         """Runs a raw git command string."""
-        # CRITICAL FIX: Use shlex.split to correctly handle arguments with spaces
         try:
             command_parts = shlex.split(command_str)
         except ValueError as e:
@@ -334,7 +327,7 @@ class TreeViewFrame(ttk.Frame):
         tree = event.widget
         item_id = tree.identify_row(event.y)
         if item_id:
-            filepath = tree.item(item_id, 'id') # Get the full path from the iid
+            filepath = tree.item(item_id, 'id')
             full_path = os.path.join(self.workspace_root_dir, filepath)
             if os.path.isfile(full_path):
                 self.open_file_callback(full_path)
@@ -358,7 +351,6 @@ class SourceControlUI(ttk.Frame):
         else:
             print("Warning: SourceControlUI master is None, cannot schedule refresh.")
 
-
     def _configure_styles(self):
         self.sm.style.configure("Accent.TButton", font=(self.sm.FONT_UI[0], self.sm.FONT_UI[1], 'bold'), background=self.sm.COLOR_ACCENT, foreground="white")
         self.sm.style.map("Accent.TButton", background=[('active', self.sm.COLOR_ACCENT_LIGHT)])
@@ -371,11 +363,22 @@ class SourceControlUI(ttk.Frame):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # --- Top resizable pane for Changes and Diff ---
-        top_pane = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        # --- Container for the 'Initialize Repository' view ---
+        self.init_view_frame = ttk.Frame(self)
+        self.init_view_frame.grid_rowconfigure(0, weight=1)
+        self.init_view_frame.grid_columnconfigure(0, weight=1)
+        init_button = ttk.Button(self.init_view_frame, text="Initialize Repository", style="Accent.TButton", command=self._init_repo)
+        init_button.grid(row=0, column=0, sticky="")
+
+        # --- Container for the main Git UI view ---
+        self.main_view_frame = ttk.Frame(self)
+        self.main_view_frame.grid_rowconfigure(0, weight=1)
+        self.main_view_frame.grid_columnconfigure(0, weight=1)
+
+        # --- Top resizable pane for Changes and Diff (inside main_view_frame) ---
+        top_pane = ttk.PanedWindow(self.main_view_frame, orient=tk.VERTICAL)
         top_pane.grid(row=0, column=0, sticky="nsew")
 
-        # --- Changes & Staging Pane (inside top_pane) ---
         changes_pane = ttk.Frame(top_pane, padding=5)
         top_pane.add(changes_pane, weight=3)
         changes_pane.grid_rowconfigure(1, weight=1); changes_pane.grid_rowconfigure(3, weight=1); changes_pane.grid_columnconfigure(0, weight=1)
@@ -396,7 +399,6 @@ class SourceControlUI(ttk.Frame):
         self.changes_tree.bind("<Button-3>", lambda e: self._show_context_menu(e, self.changes_tree, is_staged=False))
         self.changes_tree.bind("<<TreeviewSelect>>", lambda e: self._show_diff_for_selection(e, is_staged=False))
 
-        # --- Diff Pane (inside top_pane) ---
         diff_pane = ttk.Frame(top_pane)
         top_pane.add(diff_pane, weight=2)
         diff_pane.grid_rowconfigure(0, weight=1); diff_pane.grid_columnconfigure(0, weight=1)
@@ -405,8 +407,8 @@ class SourceControlUI(ttk.Frame):
         self.diff_viewer.tag_config("addition", foreground=self.sm.COLOR_GREEN); self.diff_viewer.tag_config("deletion", foreground=self.sm.COLOR_RED); self.diff_viewer.tag_config("header", foreground=self.sm.COLOR_BLUE, font=(self.sm.FONT_CODE[0], self.sm.FONT_CODE[1], "bold"))
         self.diff_viewer.config(state="disabled")
 
-        # --- Bottom fixed-size pane for Commit and Actions ---
-        commit_pane = ttk.Frame(self, padding=10)
+        # --- Bottom fixed-size pane for Commit and Actions (inside main_view_frame) ---
+        commit_pane = ttk.Frame(self.main_view_frame, padding=10)
         commit_pane.grid(row=1, column=0, sticky="ew")
         commit_pane.grid_columnconfigure(0, weight=1)
 
@@ -447,7 +449,6 @@ class SourceControlUI(ttk.Frame):
         self.command_entry.bind("<Return>", self._run_command_from_palette)
         self.autocomplete_manager = GitCommandAutocompleteManager(self.command_entry, self)
 
-        self.init_button = ttk.Button(self, text="Initialize Repository", style="Accent.TButton", command=self._init_repo)
 
     def _create_toolbar_button(self, parent, text, command, tooltip_text):
         btn = ttk.Button(parent, text=text, command=command, style="Toolbar.TButton")
@@ -463,23 +464,16 @@ class SourceControlUI(ttk.Frame):
     def refresh(self, event=None):
         """Asynchronously refreshes the Git status to keep the UI responsive."""
         is_repo = self.git_logic.is_git_repo()
-        
-        for child in self.winfo_children():
-            if child is not self.init_button and isinstance(child, (ttk.Frame, ttk.PanedWindow)):
-                 if child.winfo_manager() == 'grid':
-                    child.grid_remove()
 
         if not is_repo:
-            self.init_button.grid(row=0, column=0, padx=20, pady=20, sticky="")
+            self.main_view_frame.grid_remove()
+            self.init_view_frame.grid(row=0, column=0, sticky="nsew")
             if hasattr(self.parent_app, 'update_git_status_bar'):
                 self.parent_app.update_git_status_bar("Not a git repository")
             return
 
-        self.init_button.grid_remove()
-        for child in self.winfo_children():
-            if child is not self.init_button and isinstance(child, (ttk.Frame, ttk.PanedWindow)):
-                if child.winfo_manager() == 'grid':
-                    child.grid()
+        self.init_view_frame.grid_remove()
+        self.main_view_frame.grid(row=0, column=0, sticky="nsew")
         
         self.staged_label.config(text="STAGED CHANGES (loading...)")
         self.changes_label.config(text="CHANGES (loading...)")
@@ -550,9 +544,6 @@ class SourceControlUI(ttk.Frame):
         if menu.index('end') is not None:
             menu.tk_popup(event.x_root, event.y_root)
 
-    # CHANGE: Removed unused _on_double_click method. The event is now handled
-    # entirely within the TreeViewFrame class.
-    
     def _show_diff_for_selection(self, event, is_staged):
         tree = event.widget
         selection = tree.selection()
@@ -748,12 +739,10 @@ class ModernGitLogViewer(tk.Toplevel):
         self.grab_set()
 
     def _populate_log_worker(self):
-        """[Worker Thread] Fetches the git log data."""
         success, log_data = self.git_logic.get_log_for_graph()
         self.after(0, self._update_ui_after_log, success, log_data)
 
     def _update_ui_after_log(self, success: bool, log_data: str):
-        """[Main Thread] Populates the UI with the fetched log data."""
         self.commit_text.config(state="normal")
         self.commit_text.delete("1.0", tk.END)
         self.commit_text.config(state="disabled")
@@ -1008,8 +997,6 @@ class BranchManager(tk.Toplevel):
 
         branch_name_to_checkout = branch_name_full
         
-        # Modern Git can checkout a remote branch directly, creating a local tracking branch.
-        # This simplifies the logic. We'll just pass the remote name like 'origin/main'.
         if '/' in branch_name_to_checkout and messagebox.askyesno(
             "Checkout Remote Branch",
             f"This looks like a remote branch. Do you want to create a new local branch tracking '{branch_name_to_checkout}'?",
@@ -1067,7 +1054,6 @@ class BranchManager(tk.Toplevel):
 
 class GitCommandAutocompleteManager:
     """Manages the autocomplete popup for the Git command entry."""
-    # CHANGE: Moved commands to a class-level constant for cleanliness
     COMMANDS = [
         ("commit", "Record changes to the repository"), ("add", "Add file contents to the index"),
         ("push", "Update remote refs along with associated objects"), ("pull", "Fetch from and integrate with another repository"),
@@ -1118,7 +1104,6 @@ class GitCommandAutocompleteManager:
 
         current_text = self.entry.get().split(" ")[0]
         if not current_text: self.hide(); return
-        # CHANGE: Use class-level constant
         suggestions = [cmd for cmd in self.COMMANDS if cmd[0].startswith(current_text.lower())]
         if suggestions: self.show(suggestions)
         else: self.hide()
