@@ -1,0 +1,211 @@
+name: Security & Maintenance
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly Mondays at 2 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  security-events: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      alert_count: ${{ steps.count_alerts.outputs.alert_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: python
+
+      - name: Perform CodeQL Analysis
+        id: codeql
+        uses: github/codeql-action/analyze@v2
+
+      - name: Count CodeQL alerts
+        id: count_alerts
+        run: |
+          alert_count=$(gh api repos/${{ github.repository }}/code-scanning/alerts --jq '. | length')
+          echo "alert_count=$alert_count" >> $GITHUB_OUTPUT
+
+  bandit:
+    name: Bandit Scan & Upload SARIF
+    runs-on: ubuntu-latest
+    needs: codeql
+    outputs:
+      issues_found: ${{ steps.bandit_check.outputs.issues_found }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Bandit & jq
+        run: |
+          pip install bandit
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run Bandit scan on src/ and output SARIF
+        id: bandit_run
+        run: |
+          bandit -r ./src -f sarif -o bandit-report.sarif || true
+
+      - name: Upload Bandit SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: bandit-report.sarif
+
+      - name: Run Bandit scan JSON report
+        run: bandit -r ./src -f json -o bandit-report.json || true
+
+      - name: Parse Bandit JSON results
+        id: bandit_check
+        run: |
+          issues=$(jq '.results | length' bandit-report.json)
+          if [ "$issues" -gt 0 ]; then
+            echo "issues_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues_found=false" >> $GITHUB_OUTPUT
+          fi
+
+  python_dependency_scan:
+    name: Python Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: bandit
+    outputs:
+      vulnerabilities_found: ${{ steps.vuln_check.outputs.vulnerabilities_found }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install pip-audit and safety
+        run: pip install pip-audit safety
+
+      - name: Run pip-audit
+        run: pip-audit --json > pip-audit.json || true
+
+      - name: Run safety check
+        run: safety check -r requirements.txt --json > safety.json || true
+
+      - name: Analyze vulnerability reports
+        id: vuln_check
+        run: |
+          pip_vulns=$(jq '. | length' pip-audit.json)
+          safety_vulns=$(jq '.vulnerabilities | length' safety.json)
+          total=$((pip_vulns + safety_vulns))
+          if [ "$total" -gt 0 ]; then
+            echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "vulnerabilities_found=false" >> $GITHUB_OUTPUT
+          fi
+
+  open_security_issues:
+    name: Open Security Issues
+    runs-on: ubuntu-latest
+    needs: [codeql, bandit, python_dependency_scan]
+    steps:
+      - name: Check existing open security issues
+        id: existing_issues
+        run: |
+          open_codeql=$(gh issue list --label security --state open --search "CodeQL Security Alerts detected" --json number --jq 'length')
+          open_bandit=$(gh issue list --label security --state open --search "Bandit Security Warnings detected" --json number --jq 'length')
+          open_pydeps=$(gh issue list --label security --state open --search "Python Dependency Vulnerabilities detected" --json number --jq 'length')
+          echo "open_codeql=$open_codeql" >> $GITHUB_OUTPUT
+          echo "open_bandit=$open_bandit" >> $GITHUB_OUTPUT
+          echo "open_pydeps=$open_pydeps" >> $GITHUB_OUTPUT
+
+      - name: Open CodeQL issue if needed
+        if: needs.codeql.outputs.alert_count != '0' && steps.existing_issues.outputs.open_codeql == '0'
+        run: |
+          gh issue create \
+            --title "CodeQL Security Alerts detected" \
+            --body "There are ${{ needs.codeql.outputs.alert_count }} security alerts reported by CodeQL. Please investigate and fix as necessary." \
+            --label security \
+            --assignee @me
+
+      - name: Open Bandit issue if needed
+        if: needs.bandit.outputs.issues_found == 'true' && steps.existing_issues.outputs.open_bandit == '0'
+        run: |
+          gh issue create \
+            --title "Bandit Security Warnings detected" \
+            --body "Bandit static analysis detected potential security warnings in the `src/` directory. Please review the Bandit report and address any issues." \
+            --label security \
+            --assignee @me
+
+      - name: Open Python Dependency Vulnerability issue if needed
+        if: needs.python_dependency_scan.outputs.vulnerabilities_found == 'true' && steps.existing_issues.outputs.open_pydeps == '0'
+        run: |
+          gh issue create \
+            --title "Python Dependency Vulnerabilities detected" \
+            --body "pip-audit and/or safety detected vulnerabilities in your Python dependencies. Please review and update affected packages." \
+            --label security \
+            --assignee @me
+
+  update_dependencies:
+    name: Update Python Dependencies & Create PR
+    runs-on: ubuntu-latest
+    needs: python_dependency_scan
+    if: needs.python_dependency_scan.outputs.vulnerabilities_found == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install pip-review
+        run: pip install pip-review
+
+      - name: Upgrade all outdated dependencies
+        run: |
+          pip-review --auto
+
+      - name: Check if requirements.txt changed
+        id: check_changes
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "219954810+PriestyBot@users.noreply.github.com"
+          if git diff --quiet requirements.txt; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit & push changes if any
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git checkout -b dep-updates-${{ github.run_id }}
+          git add requirements.txt
+          git commit -m "chore(deps): bump Python dependencies to fix vulnerabilities"
+          git push --set-upstream origin dep-updates-${{ github.run_id }}
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.APPROVER_TOKEN }}
+          commit-message: chore(deps): bump Python dependencies to fix vulnerabilities
+          branch: dep-updates-${{ github.run_id }}
+          title: "Update Python dependencies to fix security vulnerabilities"
+          body: |
+            This PR updates Python dependencies to address security vulnerabilities found by pip-audit and safety.
+            Please review the changes and merge to keep your environment secure.
+          labels: security
+          assignees: Priestytheplushie
