@@ -1,0 +1,89 @@
+name: Sync main into develop (via PR)
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  GITHUB_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+  SYNC_BRANCH: sync/main-to-develop
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout develop branch
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Fetch main
+        run: git fetch origin main
+
+      - name: Set up PriestyBot identity
+        run: |
+          git config user.name "PriestyBot"
+          git config user.email "priestybot@users.noreply.github.com"
+
+      - name: Create sync branch from develop
+        run: git checkout -B $SYNC_BRANCH develop
+
+      - name: Merge main into sync branch
+        id: merge
+        run: |
+          set -e
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          if git merge --no-ff origin/main -m "Sync main into develop\n\nTimestamp: $TIMESTAMP"; then
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Show conflicting files
+        if: steps.merge.outputs.merge_status == 'conflict'
+        run: git diff --name-only --diff-filter=U
+
+      - name: Push sync branch if merge was successful
+        if: steps.merge.outputs.merge_status == 'success'
+        run: git push -u origin $SYNC_BRANCH --force
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Create or update PR
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_TOKEN }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          PR_TITLE="🔁 Sync main → develop ($TIMESTAMP)"
+          PR_BODY="Automated sync of \`main\` into \`develop\` branch.\n\n**Timestamp:** $TIMESTAMP"
+
+          EXISTING_PR=$(gh pr list --base develop --head $SYNC_BRANCH --json number --jq '.[0].number' || echo "")
+
+          if [ "${{ steps.merge.outputs.merge_status }}" = "conflict" ]; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            PR_BODY="$PR_BODY\n\n⚠️ **Merge conflicts detected in:**\n$CONFLICTS\n\nPlease resolve manually."
+          fi
+
+          if [ -z "$EXISTING_PR" ]; then
+            echo "Creating new PR..."
+            gh pr create --base develop --head $SYNC_BRANCH --title "$PR_TITLE" --body "$PR_BODY"
+          else
+            echo "Updating existing PR #$EXISTING_PR..."
+            gh pr comment "$EXISTING_PR" --body "🔁 Sync branch updated on $TIMESTAMP."
+            if [ "${{ steps.merge.outputs.merge_status }}" = "conflict" ]; then
+              gh pr comment "$EXISTING_PR" --body "⚠️ Merge conflicts detected:\n$CONFLICTS"
+            fi
+          fi
