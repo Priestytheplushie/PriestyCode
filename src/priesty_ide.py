@@ -1,7 +1,7 @@
 # priesty_ide.py
 
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk, simpledialog
+from tkinter import messagebox, filedialog, ttk, simpledialog, scrolledtext
 import os
 import subprocess
 import sys
@@ -10,7 +10,7 @@ from PIL import Image, ImageTk
 import threading
 import queue
 import time
-from typing import cast, Union
+from typing import cast, Union, Optional
 import re
 import shutil
 import json
@@ -21,11 +21,16 @@ try:
     from console_ui import ConsoleUi
     from terminal import Terminal
     from file_explorer import FileExplorer
-except Exception:
+    from source_control_ui import SourceControlUI
+    from merge_editor import MergeEditor
+except ImportError:
     from src.code_editor import CodeEditor
     from src.console_ui import ConsoleUi
     from src.terminal import Terminal
     from src.file_explorer import FileExplorer
+    from src.source_control_ui import SourceControlUI
+    from src.merge_editor import MergeEditor
+
 
 # --- Core Application Paths ---
 current_dir = os.path.dirname(__file__)
@@ -81,11 +86,11 @@ class PriestyCode(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PriestyCode v1.0.0")
-        self.geometry("1300x850")
+        self.geometry("1450x850") 
         self.config(bg="#2B2B2B")
 
         self.icon_size = 16
-        self.process: subprocess.Popen | None = None
+        self.process: Union[subprocess.Popen, None] = None
         self.output_queue: queue.Queue[tuple[str, Union[str, int, None]]] = (
             queue.Queue()
         )
@@ -99,9 +104,9 @@ class PriestyCode(tk.Tk):
         self.current_open_file: str | None = None
         self.active_editor: CodeEditor | None = None
         self.is_running = False
-        self.workspace_root_dir = initial_project_root_dir
+        self.workspace_root_dir = initial_project_root_dir # Default, will be overridden by settings
         self.python_executable = sys.executable
-        self.find_replace_dialog: "FindReplaceDialog" | None = None  # type: ignore
+        self.find_replace_dialog: FindReplaceDialog | None = None
         self.venv_warning_shown = False
         self.temp_run_file: str | None = None
 
@@ -109,8 +114,8 @@ class PriestyCode(tk.Tk):
         self.file_name_label: tk.Label
         self.error_console: ConsoleUi
         self.file_explorer: FileExplorer
+        self.source_control_ui: SourceControlUI | None = None
 
-        # --- Terminal Management ---
         self.terminals: list[Terminal] = []
         self.terminal_ui_map: dict[Terminal, tk.Frame] = {}
         self.active_terminal: Terminal | None = None
@@ -119,7 +124,6 @@ class PriestyCode(tk.Tk):
         self.add_terminal_button: tk.Button
         self.output_notebook: ttk.Notebook
 
-        # --- Settings Management ---
         self.autosave_timer: str | None = None
         self._initialize_settings_vars()
         self._load_settings()
@@ -128,15 +132,30 @@ class PriestyCode(tk.Tk):
         self._configure_styles()
         self._setup_layout()
         self._create_top_toolbar()
-        self._create_menu_bar()
+        self._create_menu_bar() 
         self._create_main_content_area()
+        self._create_status_bar()
         self._bind_shortcuts()
-
+        
         self.after(1, self._apply_font_size)
         self.after(50, self._process_output_queue)
         self.after(200, self._check_virtual_env)
-        self.after(500, self._open_sandbox_if_empty)
+        self.after(300, self.update_git_info)
+        
+        # Determine if it's a new window process
+        is_new_window_process = "--new-window" in sys.argv
 
+        # Conditional sandbox opening:
+        # 1. If it's a new window, always open a sandbox (as per "new IDE windows will start empty tho")
+        # 2. If it's the main window:
+        #    a. If no files were restored AND the workspace is still the default, open sandbox.
+        #    b. If no files were restored BUT a workspace was restored (non-default), do not open sandbox.
+        if is_new_window_process:
+            self.after(500, self._open_new_sandbox_tab)
+        elif not self.open_files and self.workspace_root_dir == initial_project_root_dir:
+            self.after(500, self._open_new_sandbox_tab)
+        # Else (main window, files were restored OR workspace was restored to non-default), do nothing (no sandbox)
+    
     def _initialize_settings_vars(self):
         """Initializes all tk.Vars for settings with default values."""
         self.autocomplete_enabled = tk.BooleanVar(value=True)
@@ -148,8 +167,14 @@ class PriestyCode(tk.Tk):
         self.tooltips_enabled = tk.BooleanVar(value=True)
         self.font_size = tk.IntVar(value=10)
 
+        # Session management variables
+        self.last_workspace_root_dir: Optional[str] = None
+        self.last_open_files: list[str] = []
+        self.last_active_file: Optional[str] = None
+
+
     def _load_settings(self):
-        """Loads settings from a JSON file."""
+        """Loads settings from a JSON file, including session state."""
         try:
             with open(SETTINGS_PATH, "r") as f:
                 settings = json.load(f)
@@ -165,11 +190,56 @@ class PriestyCode(tk.Tk):
             self.autoindent_enabled.set(settings.get("autoindent_enabled", True))
             self.tooltips_enabled.set(settings.get("tooltips_enabled", True))
             self.font_size.set(settings.get("font_size", 10))
+
+            # Load session state
+            self.last_workspace_root_dir = settings.get("last_workspace_root_dir")
+            self.last_open_files = settings.get("last_open_files", [])
+            self.last_active_file = settings.get("last_active_file")
+
+            # Restore session if data exists
+            if self.last_workspace_root_dir and os.path.isdir(self.last_workspace_root_dir):
+                self.workspace_root_dir = self.last_workspace_root_dir
+                self.title(f"PriestyCode - {os.path.basename(self.workspace_root_dir)}")
+            
+            # Open files from the last session
+            restored_files_count = 0
+            for file_path in self.last_open_files:
+                if os.path.exists(file_path):
+                    try:
+                        # Use _add_new_tab directly, as _open_file_from_path might handle
+                        # existing tabs, which we want to avoid during initial load.
+                        # Also, ensure content is read here to populate the editor.
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        self._add_new_tab(file_path=file_path, content=content)
+                        restored_files_count += 1
+                    except Exception as e:
+                        print(f"Failed to restore file {file_path}: {e}")
+                else:
+                    print(f"Skipping non-existent file from last session: {file_path}")
+
+            # Switch to the last active file
+            if self.last_active_file and self.last_active_file in self.open_files:
+                self._switch_to_tab(self.open_files.index(self.last_active_file))
+            elif self.open_files: # If no specific active file, but some files opened, select the first
+                self._switch_to_tab(0)
+
         except (FileNotFoundError, json.JSONDecodeError):
+            # If settings file doesn't exist or is corrupt, save default settings
             self._save_settings()
+        
+        # After loading settings, update file explorer and terminals
+        # This needs to happen after self.workspace_root_dir is set.
+        if hasattr(self, 'file_explorer') and self.file_explorer:
+            self.file_explorer.set_project_root(self.workspace_root_dir)
+        if hasattr(self, 'terminals') and self.terminals:
+            [term.set_cwd(self.workspace_root_dir) for term in self.terminals]
+        if hasattr(self, 'source_control_ui') and self.source_control_ui:
+            self.source_control_ui.update_workspace(self.workspace_root_dir)
+
 
     def _save_settings(self, event=None):
-        """Saves current settings to a JSON file."""
+        """Saves current settings and session state to a JSON file."""
         settings = {
             "autocomplete_enabled": self.autocomplete_enabled.get(),
             "proactive_errors_enabled": self.proactive_errors_enabled.get(),
@@ -178,6 +248,10 @@ class PriestyCode(tk.Tk):
             "autoindent_enabled": self.autoindent_enabled.get(),
             "tooltips_enabled": self.tooltips_enabled.get(),
             "font_size": self.font_size.get(),
+            # Save session state
+            "last_workspace_root_dir": self.workspace_root_dir,
+            "last_open_files": self.open_files,
+            "last_active_file": self.current_open_file,
         }
         try:
             with open(SETTINGS_PATH, "w") as f:
@@ -213,7 +287,6 @@ class PriestyCode(tk.Tk):
         self.add_icon = self._load_and_resize_icon("add_icon.png", size=16)
         self.terminal_icon = self._load_and_resize_icon("terminal_icon.png", size=16)
 
-        # Icons for autocomplete manager
         self.snippet_icon = self._load_and_resize_icon("snippet_icon.png")
         self.keyword_icon = self._load_and_resize_icon("keyword_icon.png")
         self.function_icon = self._load_and_resize_icon("function_icon.png")
@@ -266,10 +339,11 @@ class PriestyCode(tk.Tk):
             relief="flat",
         )
         self.style.map("Treeview.Heading", background=[("active", "#555555")])
-
+    
     def _setup_layout(self):
         """Sets up the main grid layout for the IDE window."""
         self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=0) # Status bar row
         self.grid_columnconfigure(0, weight=1)
 
     def _create_top_toolbar(self):
@@ -365,10 +439,12 @@ class PriestyCode(tk.Tk):
         edit_menu.add_separator()
 
         def event_gen(event_name):
-            try:
-                self.focus_get().event_generate(event_name)  # type: ignore
-            except (AttributeError, tk.TclError):
-                pass
+            widget = self.focus_get()
+            if widget:
+                try:
+                    widget.event_generate(event_name)
+                except tk.TclError:
+                    pass
 
         edit_menu.add_command(
             label="Cut", command=lambda: event_gen("<<Cut>>"), accelerator="Ctrl+X"
@@ -412,7 +488,7 @@ class PriestyCode(tk.Tk):
         )
         terminal_menu.add_separator()
         terminal_menu.add_command(
-            label="Clear Active Terminal/Console",
+            label="Clear Active Output/Console",
             command=self._clear_active_output_view,
         )
         terminal_menu.add_command(
@@ -434,6 +510,7 @@ class PriestyCode(tk.Tk):
         )
         window_menu.add_separator()
         window_menu.add_command(label="Reset Layout", command=self._reset_layout)
+        window_menu.add_command(label="Reset Session State", command=self._reset_session_state) # New option
         window_menu.add_separator()
         window_menu.add_command(
             label="Open External Terminal", command=self._open_external_terminal
@@ -454,6 +531,17 @@ class PriestyCode(tk.Tk):
         workspace_menu.add_command(
             label="Install Requirements", command=self._install_requirements
         )
+        
+        source_control_menu = tk.Menu(menubar, **menu_kwargs)
+        menubar.add_cascade(label="Source Control", menu=source_control_menu)
+        source_control_menu.add_command(label="Refresh", command=self._sc_refresh)
+        source_control_menu.add_command(label="Commit...", command=self._sc_commit_action)
+        source_control_menu.add_command(label="Push", command=self._sc_push_action)
+        source_control_menu.add_command(label="Pull", command=self._sc_pull_action)
+        source_control_menu.add_separator()
+        source_control_menu.add_command(label="Initialize Repository", command=self._sc_init_repo)
+        source_control_menu.add_command(label="Clone Repository...", command=self._clone_repo)
+
 
         settings_menu = tk.Menu(menubar, **menu_kwargs)
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -519,12 +607,15 @@ class PriestyCode(tk.Tk):
         self.main_paned_window = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         self.main_paned_window.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 
-        left_pane = ttk.Frame(self.main_paned_window)
-        self.main_paned_window.add(left_pane, weight=1)
+        left_notebook = ttk.Notebook(self.main_paned_window)
+        self.main_paned_window.add(left_notebook, weight=1)
+
+        explorer_frame = tk.Frame(left_notebook, bg="#2B2B2B")
+        # Initialize FileExplorer here, but set its project root after loading settings
         self.file_explorer = FileExplorer(
-            left_pane,
+            explorer_frame,
             self,
-            self.workspace_root_dir,
+            self.workspace_root_dir, # Initial value, will be updated by _load_settings
             self._open_file_from_path,
             folder_icon=self.folder_icon,
             python_icon=self.python_logo_icon,
@@ -534,10 +625,22 @@ class PriestyCode(tk.Tk):
             md_icon=self.md_icon,
         )
         self.file_explorer.pack(fill="both", expand=True)
+        left_notebook.add(explorer_frame, text="Explorer")
+
+        sc_frame = tk.Frame(left_notebook, bg="#2B2B2B")
+        # Initialize SourceControlUI here, but update its workspace after loading settings
+        self.source_control_ui = SourceControlUI(
+            sc_frame,
+            self, 
+            self._open_file_from_path,
+            self.workspace_root_dir # Initial value, will be updated by _load_settings
+        )
+        self.source_control_ui.pack(fill="both", expand=True)
+        left_notebook.add(sc_frame, text="Source Control")
 
         self.right_pane = ttk.PanedWindow(self.main_paned_window, orient=tk.VERTICAL)
         self.main_paned_window.add(self.right_pane, weight=4)
-
+        
         editor_area_frame = tk.Frame(self.right_pane, bg="#2B2B2B")
         self.right_pane.add(editor_area_frame, weight=3)
         editor_area_frame.grid_rowconfigure(1, weight=1)
@@ -562,7 +665,9 @@ class PriestyCode(tk.Tk):
         self.terminal_tabs_sidebar = tk.Frame(terminal_page, bg="#2B2B2B", width=150)
         self.terminal_tabs_sidebar.grid(row=0, column=1, sticky="ns")
         self.terminal_tabs_sidebar.pack_propagate(False)
-        self.add_terminal_button = tk.Button(self.terminal_tabs_sidebar, text=" New", command=self._create_new_terminal, bg="#3C3C3C", fg="white", bd=0, activebackground="#555555", font=("Segoe UI", 8), relief="flat", image=self.add_icon, compound="left", padx=5)  # type: ignore
+        self.add_terminal_button = tk.Button(self.terminal_tabs_sidebar, text=" New", command=self._create_new_terminal, bg="#3C3C3C", fg="white", bd=0, activebackground="#555555", font=("Segoe UI", 8), relief="flat")
+        if self.add_icon:
+            self.add_terminal_button.config(image=self.add_icon, compound="left", padx=5)
         self.add_terminal_button.pack(side="bottom", fill="x", pady=5, padx=5)
 
         error_page = tk.Frame(self.output_notebook, bg="#1E1E1E")
@@ -570,11 +675,81 @@ class PriestyCode(tk.Tk):
             error_page, jump_callback=self._jump_to_error_location
         )
         self.error_console.pack(fill="both", expand=True)
-
+        
         self.output_notebook.add(terminal_page, text="TERMINAL")
         self.output_notebook.add(error_page, text="PROBLEMS")
 
-        self._create_new_terminal()  # Create the first terminal
+        self._create_new_terminal()
+
+    def _create_status_bar(self):
+        """Creates the bottom status bar."""
+        self.status_bar = tk.Frame(self, bg="#3C3C3C", height=22)
+        self.status_bar.grid(row=2, column=0, sticky="ew")
+        self.status_bar.grid_propagate(False)
+        
+        self.git_status_label = tk.Label(self.status_bar, text="Git status...", bg="#3C3C3C", fg="white", font=("Segoe UI", 8))
+        self.git_status_label.pack(side="left", padx=10)
+
+    def update_git_status_bar(self, text: str):
+        """Updates the text in the Git status bar label."""
+        self.git_status_label.config(text=text)
+        
+    def update_git_info(self):
+        """Refreshes all Git-related UI components."""
+        if self.source_control_ui:
+            self.source_control_ui.refresh()
+
+    def _sc_refresh(self):
+        if self.source_control_ui:
+            self.source_control_ui.refresh()
+
+    def _sc_commit_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._commit_action()
+
+    def _sc_push_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._push_action()
+
+    def _sc_pull_action(self):
+        if self.source_control_ui:
+            self.source_control_ui._pull_action()
+
+    def _sc_init_repo(self):
+        if self.source_control_ui:
+            self.source_control_ui._init_repo()
+
+    def _clone_repo(self):
+        repo_url = simpledialog.askstring("Clone Repository", "Enter repository URL:", parent=self)
+        if not repo_url:
+            return
+            
+        target_dir = filedialog.askdirectory(title="Select folder to clone into", initialdir=os.path.dirname(self.workspace_root_dir))
+        if not target_dir:
+            return
+            
+        
+        def run_clone():
+            try:
+                process = subprocess.Popen(
+                    ["git", "clone", repo_url, target_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
+                stdout, stderr = process.communicate()
+                output = f"--- Clone Output ---\n{stdout}\n{stderr}".strip()
+
+                if process.returncode == 0:
+                    if messagebox.askyesno("Clone Successful", "Repository cloned successfully. Open the new folder?"):
+                        self.after(0, self._open_folder, target_dir)
+                else:
+                    messagebox.showerror("Clone Failed", stderr)
+            except Exception as e:
+                messagebox.showerror("Clone Error", str(e))
+                
+        threading.Thread(target=run_clone, daemon=True).start()
 
     def _jump_to_error_location(self, file_path, line):
         self._open_file_from_path(file_path)
@@ -611,7 +786,6 @@ class PriestyCode(tk.Tk):
             anchor="w",
         )
         name_label.pack(side="left", fill="x", expand=True)
-        new_terminal.display_name_widget = name_label
 
         close_button = tk.Button(
             tab_frame,
@@ -643,25 +817,27 @@ class PriestyCode(tk.Tk):
         self._apply_font_size()
         return new_terminal
 
-    def _switch_terminal(self, terminal_to_activate: Terminal):
+    def _switch_terminal(self, terminal_to_activate: Optional[Terminal]):
         if self.active_terminal == terminal_to_activate:
             return
 
         if self.active_terminal and self.active_terminal in self.terminal_ui_map:
             self.active_terminal.pack_forget()
-            self.terminal_ui_map[self.active_terminal].config(bg="#2B2B2B")
-            for child in self.terminal_ui_map[self.active_terminal].winfo_children():
-                child.config(bg="#2B2B2B")  # type: ignore
+            if self.terminal_ui_map[self.active_terminal].winfo_exists():
+                self.terminal_ui_map[self.active_terminal].config(bg="#2B2B2B")
+                for child in self.terminal_ui_map[self.active_terminal].winfo_children():
+                    child.config(bg="#2B2B2B") #type: ignore
 
         self.active_terminal = terminal_to_activate
         if self.active_terminal:
             self.active_terminal.pack(fill="both", expand=True)
             if self.active_terminal in self.terminal_ui_map:
-                self.terminal_ui_map[self.active_terminal].config(bg="#3C3C3C")
-                for child in self.terminal_ui_map[
-                    self.active_terminal
-                ].winfo_children():
-                    child.config(bg="#3C3C3C")  # type: ignore
+                if self.terminal_ui_map[self.active_terminal].winfo_exists():
+                    self.terminal_ui_map[self.active_terminal].config(bg="#3C3C3C")
+                    for child in self.terminal_ui_map[
+                        self.active_terminal
+                    ].winfo_children():
+                        child.config(bg="#3C3C3C") #type: ignore
             self.active_terminal.text.focus_set()
 
     def _close_terminal(self, terminal_to_close: Terminal):
@@ -681,7 +857,7 @@ class PriestyCode(tk.Tk):
         self.terminals.remove(terminal_to_close)
 
         if was_active:
-            self._switch_terminal(self.terminals[-1] if self.terminals else None)  # type: ignore
+            self._switch_terminal(self.terminals[-1] if self.terminals else None)
 
     def _show_terminal_context_menu(self, event, terminal: Terminal):
         context_menu = tk.Menu(
@@ -704,12 +880,16 @@ class PriestyCode(tk.Tk):
             context_menu.grab_release()
 
     def _rename_terminal(self, terminal: Terminal):
-        current_name = terminal.display_name_widget.cget("text")  # type: ignore
-        new_name = simpledialog.askstring(
-            "Rename Terminal", "Enter new name:", initialvalue=current_name, parent=self
-        )
-        if new_name and new_name.strip():
-            terminal.display_name_widget.config(text=new_name.strip())  # type: ignore
+        # FIX: Safely access the name label widget
+        tab_frame = self.terminal_ui_map.get(terminal)
+        if tab_frame and tab_frame.winfo_exists():
+            name_label = cast(tk.Label, tab_frame.winfo_children()[1]) # Assuming label is the 2nd child
+            current_name = name_label.cget("text")
+            new_name = simpledialog.askstring(
+                "Rename Terminal", "Enter new name:", initialvalue=current_name, parent=self
+            )
+            if new_name and new_name.strip():
+                name_label.config(text=new_name.strip())
 
     def _get_run_terminal(self) -> Terminal:
         if not self.active_terminal:
@@ -718,13 +898,16 @@ class PriestyCode(tk.Tk):
             )
         return self.active_terminal
 
-    def _open_sandbox_if_empty(self):
-        if not self.open_files:
-            self._open_new_sandbox_tab()
-
     def _open_new_sandbox_tab(self, event=None):
         content = '# PriestyCode Sandbox\n# This is a temporary file. Save it to keep your changes.\n\nprint("Hello, Sandbox!")\n'
-        self._add_new_tab(file_path="sandbox.py", content=content)
+        # Ensure a unique name for sandbox if multiple windows are opened
+        count = 1
+        sandbox_name = "sandbox.py"
+        while sandbox_name in [os.path.basename(f) for f in self.open_files]:
+            sandbox_name = f"sandbox_{count}.py"
+            count += 1
+        self._add_new_tab(file_path=sandbox_name, content=content, is_sandbox=True)
+
 
     def _check_virtual_env(self):
         found_venv = False
@@ -744,7 +927,9 @@ class PriestyCode(tk.Tk):
 
         if not found_venv:
             self.python_executable = sys.executable
-            if not self.venv_warning_shown:
+            # Only show warning if it hasn't been shown and it's the main window
+            # (i.e., not a new window opened via _open_new_window)
+            if not self.venv_warning_shown and len(sys.argv) == 1: 
                 self.venv_warning_shown = True
                 if messagebox.askyesno(
                     "Virtual Environment Recommended",
@@ -847,20 +1032,30 @@ class PriestyCode(tk.Tk):
         if file_path:
             self._open_file_from_path(file_path)
 
-    def _open_folder(self):
-        new_path = filedialog.askdirectory(
-            title="Select Workspace Folder", initialdir=self.workspace_root_dir
-        )
+    def _open_folder(self, new_path=None):
+        if not new_path:
+            new_path = filedialog.askdirectory(
+                title="Select Workspace Folder", initialdir=self.workspace_root_dir
+            )
         if not new_path or not os.path.isdir(new_path):
             return
+            
+        # Close all currently open files, asking to save if modified
         while self.open_files:
             if not self._close_tab(0, force_ask=True):
-                return
+                return # User cancelled closing a tab, so cancel folder change
+        
         self.workspace_root_dir, self.venv_warning_shown = new_path, False
+        
         self.file_explorer.set_project_root(new_path)
         [term.set_cwd(new_path) for term in self.terminals]
+        
+        if self.source_control_ui:
+            self.source_control_ui.update_workspace(new_path)
+        
         self._check_virtual_env()
         self.title(f"PriestyCode - {os.path.basename(new_path)}")
+        self._save_settings() # Save the new workspace root
 
     def _open_file_from_path(self, file_path):
         if not file_path or file_path == "N/A":
@@ -877,19 +1072,24 @@ class PriestyCode(tk.Tk):
                 f"The file '{os.path.basename(file_path)}' appears to be a binary file.",
             )
             return
-        if os.path.basename(file_path) == "sandbox.py":
+        
+        # Handle sandbox files opened by path (e.g., from session restore)
+        if os.path.basename(file_path).startswith("sandbox"):
             for open_path in self.open_files:
-                if os.path.basename(open_path) == "sandbox.py":
+                if os.path.basename(open_path) == os.path.basename(file_path):
                     self._switch_to_tab(self.open_files.index(open_path))
                     return
-            self._open_new_sandbox_tab()
+            # If it's a sandbox path but not currently open, create a new sandbox tab
+            self._add_new_tab(file_path=file_path, content='', is_sandbox=True)
             return
+
+
         if file_path in self.open_files:
             self._switch_to_tab(self.open_files.index(file_path))
         else:
             self._add_new_tab(file_path=file_path)
 
-    def _add_new_tab(self, file_path=None, content="", extension=".py"):
+    def _add_new_tab(self, file_path=None, content="", extension=".py", is_sandbox=False):
         editor_frame = tk.Frame(self.editor_content_frame, bg="#2B2B2B")
         editor = CodeEditor(
             editor_frame,
@@ -906,17 +1106,8 @@ class PriestyCode(tk.Tk):
         )
         editor.pack(fill="both", expand=True)
 
-        is_sandbox = file_path == "sandbox.py"
         is_untitled = False
-        if file_path and not is_sandbox and not file_path.startswith("Untitled-"):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to open file: {e}")
-                editor_frame.destroy()
-                return
-        elif not file_path or file_path.startswith("Untitled-"):
+        if not file_path or file_path.startswith("Untitled-"):
             is_untitled = True
             count = 1
             untitled_name = f"Untitled-{count}{extension}"
@@ -924,10 +1115,18 @@ class PriestyCode(tk.Tk):
                 count += 1
                 untitled_name = f"Untitled-{count}{extension}"
             file_path = untitled_name
+        elif not is_sandbox: # If it's a real file path and not a sandbox, load its content
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open file: {e}")
+                editor_frame.destroy()
+                return
 
         editor.set_file_path(file_path)
         editor.text_area.insert("1.0", content)
-        editor.text_area.edit_modified(is_sandbox or is_untitled)
+        editor.text_area.edit_modified(is_sandbox or is_untitled) # Sandbox and untitled files start as modified
         self.after(50, editor._on_content_changed)
         editor.text_area.bind("<<Change>>", self._schedule_autosave)
         self.after(1, lambda: editor.set_font_size(self.font_size.get()))
@@ -935,11 +1134,9 @@ class PriestyCode(tk.Tk):
         tab = tk.Frame(self.tab_bar_frame, bg="#3C3C3C")
         tab.pack(side="left", fill="y", padx=(0, 1))
         icon, new_index = self._get_icon_for_file(file_path), len(self.open_files)
-        icon_label = (
-            tk.Label(tab, image=icon, bg="#3C3C3C")
-            if icon
-            else tk.Label(tab, bg="#3C3C3C")
-        )
+        icon_label = tk.Label(tab, bg="#3C3C3C")
+        if icon:
+            icon_label.config(image=icon)
         icon_label.pack(side="left", padx=(5, 2), pady=2)
         text_label = tk.Label(
             tab,
@@ -971,6 +1168,8 @@ class PriestyCode(tk.Tk):
         self.editor_widgets.append(editor_frame)
         self.tab_widgets.append(tab)
         self._switch_to_tab(new_index)
+        self._save_settings() # Save session state after adding a new tab
+
 
     def _switch_to_tab(self, index: int):
         if not (0 <= index < len(self.tab_widgets)):
@@ -996,6 +1195,8 @@ class PriestyCode(tk.Tk):
         self._set_tab_appearance(self.tab_widgets[index], active=True)
         self.active_editor.text_area.focus_set()
         self._update_file_header(self.current_open_file)
+        self._save_settings() # Save session state after switching tabs
+
 
     def _set_tab_appearance(self, tab_widget, active):
         bg = "#2B2B2B" if active else "#3C3C3C"
@@ -1008,7 +1209,7 @@ class PriestyCode(tk.Tk):
         if not (0 <= index_to_close < len(self.open_files)):
             return False
         file_path_to_close = self.open_files[index_to_close]
-        is_sandbox = os.path.basename(file_path_to_close) == "sandbox.py"
+        is_sandbox = os.path.basename(file_path_to_close).startswith("sandbox") # Check for any sandbox file
         editor_to_close = cast(
             CodeEditor, self.editor_widgets[index_to_close].winfo_children()[0]
         )
@@ -1040,18 +1241,24 @@ class PriestyCode(tk.Tk):
         if not self.open_files:
             self.active_editor = None
             self.current_tab_index = -1
+            self.current_open_file = None # No file open
             self._update_file_header(None)
         else:
             self._switch_to_tab(max(0, min(index_to_close, len(self.open_files) - 1)))
+        
+        self._save_settings() # Save session state after closing a tab
         return True
 
-    def _update_file_header(self, file_path):
+    def _update_file_header(self, file_path: Optional[str]): # Added type hint for clarity
         icon = self._get_icon_for_file(file_path)
         if icon:
             self.file_type_icon_label.config(image=icon)
-        self.file_name_label.config(
-            text=os.path.basename(file_path) if file_path else "No File Open"
-        )
+        
+        display_name = "No File Open"
+        if file_path:
+            display_name = os.path.basename(file_path)
+        
+        self.file_name_label.config(text=display_name)
 
     def _get_icon_for_file(self, file_path):
         if not file_path:
@@ -1072,12 +1279,14 @@ class PriestyCode(tk.Tk):
         file_path, editor = self.open_files[idx], cast(
             CodeEditor, self.editor_widgets[idx].winfo_children()[0]
         )
-        if file_path.startswith("Untitled-") or file_path == "sandbox.py":
+        is_sandbox = os.path.basename(file_path).startswith("sandbox")
+        if file_path.startswith("Untitled-") or is_sandbox:
             return self._save_file_as(index=idx)
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(editor.text_area.get("1.0", "end-1c"))
             editor.text_area.edit_modified(False)
+            self._save_settings() # Save session state after saving a file
             return True
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save: {e}")
@@ -1088,8 +1297,9 @@ class PriestyCode(tk.Tk):
         if not (0 <= idx < len(self.open_files)):
             return False
         old_path = self.open_files[idx]
+        is_sandbox = os.path.basename(old_path).startswith("sandbox")
         initial_file = (
-            os.path.basename(old_path) if old_path != "sandbox.py" else "sandbox.py"
+            os.path.basename(old_path) if not is_sandbox else "sandbox.py"
         )
         new_path = filedialog.asksaveasfilename(
             initialdir=self.workspace_root_dir,
@@ -1106,12 +1316,11 @@ class PriestyCode(tk.Tk):
                         CodeEditor, self.editor_widgets[idx].winfo_children()[0]
                     ).text_area.get("1.0", "end-1c")
                 )
-            if not old_path.startswith("Untitled-"):
-                self.handle_file_rename(old_path, new_path)
-            else:
-                self.open_files[idx], editor = new_path, cast(
-                    CodeEditor, self.editor_widgets[idx].winfo_children()[0]
-                )
+            
+            # If it was an untitled file or sandbox, update the tab and internal lists
+            if old_path.startswith("Untitled-") or is_sandbox:
+                self.open_files[idx] = new_path
+                editor = cast(CodeEditor, self.editor_widgets[idx].winfo_children()[0])
                 editor.set_file_path(new_path)
                 editor.text_area.edit_modified(False)
                 cast(tk.Label, self.tab_widgets[idx].winfo_children()[1]).config(
@@ -1119,7 +1328,11 @@ class PriestyCode(tk.Tk):
                 )
                 if idx == self.current_tab_index:
                     self._update_file_header(new_path)
+            else: # It was an existing file being saved as a new one
+                self.handle_file_rename(old_path, new_path) # This will update open_files and tab
+            
             self.file_explorer.populate_tree()
+            self._save_settings() # Save session state after saving as
             return True
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save: {e}")
@@ -1142,7 +1355,7 @@ class PriestyCode(tk.Tk):
         if not self.active_editor or not self.current_open_file:
             messagebox.showerror("No File", "Please open a file to run.")
             return
-        is_sandbox = self.current_open_file == "sandbox.py"
+        is_sandbox = os.path.basename(self.current_open_file).startswith("sandbox")
         if not is_sandbox and (
             self.current_open_file.startswith("Untitled-")
             or self.active_editor.text_area.edit_modified()
@@ -1335,18 +1548,13 @@ class PriestyCode(tk.Tk):
 
     def _clear_active_output_view(self):
         try:
-            if (
-                self.output_notebook.tab(self.output_notebook.select(), "text")
-                == "TERMINAL"
-            ):
+            selected_tab_text = self.output_notebook.tab(self.output_notebook.select(), "text")
+            if selected_tab_text == "TERMINAL":
                 if self.active_terminal and hasattr(self.active_terminal, "clear"):
                     self.active_terminal.clear()
                 if self.active_terminal and not self.active_terminal.interactive_mode:
                     self.active_terminal.show_prompt()
-            elif (
-                self.output_notebook.tab(self.output_notebook.select(), "text")
-                == "PROBLEMS"
-            ):
+            elif selected_tab_text == "PROBLEMS":
                 if hasattr(self.error_console, "clear"):
                     self.error_console.clear()
         except tk.TclError:
@@ -1389,7 +1597,6 @@ class PriestyCode(tk.Tk):
                 if char == PROCESS_END_SIGNAL:
                     if isinstance(tag, int):
                         full_traceback = self.stderr_buffer + self.stdout_buffer
-                        # Improved check for runtime errors vs handled exceptions
                         if tag != 0 and (
                             "Error" in self.stderr_buffer
                             or "Exception" in self.stderr_buffer
@@ -1468,9 +1675,10 @@ class PriestyCode(tk.Tk):
             editor_to_highlight, error_file_path_for_panel = None, file_path
 
             if is_temp_file:
-                error_file_path_for_panel = "sandbox.py"  # For display
+                # Ensure self.current_open_file is not None before calling basename
+                error_file_path_for_panel = os.path.basename(self.current_open_file) if self.current_open_file else "sandbox.py"
                 for i, open_path in enumerate(self.open_files):
-                    if open_path == "sandbox.py":
+                    if os.path.basename(open_path).startswith("sandbox"): # Match any sandbox
                         editor_to_highlight = cast(
                             CodeEditor, self.editor_widgets[i].winfo_children()[0]
                         )
@@ -1550,12 +1758,16 @@ class PriestyCode(tk.Tk):
             )
             if idx == self.current_tab_index:
                 self._update_file_header(new_path)
+            self._save_settings() # Save session state after file rename
+
 
     def handle_file_delete(self, path: str):
         path_norm = os.path.normcase(path)
         for open_file in list(self.open_files):
             if os.path.normcase(open_file).startswith(path_norm):
                 self._close_tab(self.open_files.index(open_file), force_close=True)
+        self._save_settings() # Save session state after file delete
+
 
     def _move_active_file(self):
         if not self.current_open_file or not os.path.exists(self.current_open_file):
@@ -1594,6 +1806,7 @@ class PriestyCode(tk.Tk):
             shutil.copy(self.current_open_file, new_path)
             self.file_explorer.populate_tree()
             self._open_file_from_path(new_path)
+            self._save_settings() # Save session state after duplicating
         except Exception as e:
             messagebox.showerror("Duplicate Failed", f"Could not duplicate file: {e}")
 
@@ -1635,16 +1848,66 @@ class PriestyCode(tk.Tk):
         return "break"
 
     def _on_closing(self):
-        self._save_settings()
+        self._save_settings() # Save current state before closing
         if self.is_running:
             self._stop_code()
+        # Close all tabs, asking to save if modified
         while self.open_files:
             if not self._close_tab(0, force_ask=True):
+                # If user cancels closing a tab, stop the entire closing process
                 return
         self.destroy()
 
     def _open_new_window(self):
-        subprocess.Popen([sys.executable, sys.argv[0]])
+        # New windows will start with default settings (empty)
+        subprocess.Popen([sys.executable, sys.argv[0], "--new-window"])
+
+    def _reset_session_state(self):
+        """Resets the saved session state and clears the current IDE window."""
+        if messagebox.askyesno(
+            "Reset Session State",
+            "Are you sure you want to reset the IDE's saved session state?\n\n"
+            "This will close all open files (prompting to save unsaved changes) "
+            "and reset the workspace folder. The IDE will open in a fresh state next time.",
+            parent=self
+        ):
+            # Clear current open files and tabs
+            while self.open_files:
+                if not self._close_tab(0, force_ask=True):
+                    # If user cancels closing a tab, stop the reset process
+                    return
+            
+            # Reset workspace to initial default
+            self.workspace_root_dir = initial_project_root_dir
+            self.file_explorer.set_project_root(self.workspace_root_dir)
+            [term.set_cwd(self.workspace_root_dir) for term in self.terminals]
+            if self.source_control_ui:
+                self.source_control_ui.update_workspace(self.workspace_root_dir)
+            self.title("PriestyCode v1.0.0")
+
+            # Clear session-related settings in the settings file
+            settings = {
+                "autocomplete_enabled": self.autocomplete_enabled.get(),
+                "proactive_errors_enabled": self.proactive_errors_enabled.get(),
+                "highlight_handled_exceptions": self.highlight_handled_exceptions.get(),
+                "autosave_enabled": self.autosave_enabled.get(),
+                "autoindent_enabled": self.autoindent_enabled.get(),
+                "tooltips_enabled": self.tooltips_enabled.get(),
+                "font_size": self.font_size.get(),
+                "last_workspace_root_dir": None, # Explicitly clear these
+                "last_open_files": [],
+                "last_active_file": None,
+            }
+            try:
+                with open(SETTINGS_PATH, "w") as f:
+                    json.dump(settings, f, indent=4)
+            except Exception as e:
+                print(f"Error resetting settings: {e}")
+            
+            # Open a new sandbox after reset
+            self._open_new_sandbox_tab()
+            messagebox.showinfo("Session Reset", "IDE session state has been reset.", parent=self)
+
 
     def _toggle_fullscreen(self, event=None):
         self.attributes("-fullscreen", self.fullscreen_var.get())
@@ -1697,7 +1960,7 @@ class PriestyCode(tk.Tk):
             cast(CodeEditor, editor_frame.winfo_children()[0]).set_font_size(new_size)
         for term in self.terminals:
             term.text.config(font=("Consolas", new_size))
-        # Update the treeview font size in the console
+        
         self.style.configure("Treeview", rowheight=int(new_size * 2.2))
         self.style.configure("Treeview.Heading", font=("Segoe UI", new_size, "bold"))
         self.style.configure("Treeview", font=("Segoe UI", new_size))

@@ -1733,18 +1733,18 @@ class CodeEditor(tk.Frame):
         return "break"
 
     def _on_tab(self, event):
-        if self.autocomplete_manager.is_visible():
-            self.autocomplete_manager.confirm_selection(event)
-            return "break"
+            if self.autocomplete_manager.is_visible():
+                self.autocomplete_manager.confirm_selection(event)
+                return "break"
 
-        if self.active_snippet_session:
-            self._jump_to_next_placeholder()
-            return "break"
+            if self.active_snippet_session:
+                self._jump_to_next_placeholder(confirm_first=False)
+                return "break"
 
-        self.autocomplete_dismissed_word = None
-        self.text_area.edit_separator()
-        self.text_area.insert(tk.INSERT, "    ")
-        return "break"
+            self.autocomplete_dismissed_word = None
+            self.text_area.edit_separator()
+            self.text_area.insert(tk.INSERT, "    ")
+            return "break"
 
     def _on_return_key(self, event):
         if self.autocomplete_manager.is_visible():
@@ -2309,7 +2309,6 @@ class CodeEditor(tk.Frame):
         except tk.TclError:
             return False
 
-    # In class CodeEditor
     def _proactive_syntax_check(self):
         if not self.proactive_errors_active:
             if self.error_console:
@@ -2318,6 +2317,9 @@ class CodeEditor(tk.Frame):
             return
 
         code_to_check = self.text_area.get("1.0", tk.END)
+        if self.file_path and not self.file_path.endswith(('.py', '.pyw')):
+            return
+
         self.clear_error_highlight()
 
         if not code_to_check.strip():
@@ -2327,10 +2329,10 @@ class CodeEditor(tk.Frame):
 
         collected_errors = []
         temp_code = code_to_check
-        for _ in range(10):
+        for _ in range(10): # Fault-tolerant parsing loop
             try:
                 ast.parse(temp_code, feature_version=(3, 9))
-                break
+                break # Success!
             except SyntaxError as e:
                 try:
                     cursor_line = int(self.text_area.index(tk.INSERT).split(".")[0])
@@ -2341,11 +2343,7 @@ class CodeEditor(tk.Frame):
                 collected_errors.append(e)
                 lines = temp_code.splitlines()
                 if e.lineno and 0 < e.lineno <= len(lines):
-                    lines[e.lineno - 1] = (
-                        " "
-                        * (len(lines[e.lineno - 1]) - len(lines[e.lineno - 1].lstrip()))
-                        + "pass"
-                    )
+                    lines[e.lineno - 1] = " " * (len(lines[e.lineno - 1]) - len(lines[e.lineno - 1].lstrip())) + "pass"
                     temp_code = "\n".join(lines)
                 else:
                     break
@@ -2356,15 +2354,18 @@ class CodeEditor(tk.Frame):
         for error in collected_errors:
             self._apply_error_highlight(error)
 
+            offset = error.offset if error.offset is not None else 1
+            line = error.lineno if error.lineno is not None else 1
+            
             error_line_text = error.text.strip() if error.text else ""
-            details = f"File: {self.file_path or 'Unsaved File'}\nLine {error.lineno}, Column {error.offset}\n\n{error_line_text}\n{' ' * (max(0,error.offset-1))}^"
+            details = f"File: {self.file_path or 'Unsaved File'}\nLine {line}, Column {offset}\n\n{error_line_text}\n{' ' * (max(0,offset-1))}^"
             error_list_for_console.append(
                 {
                     "title": f"Syntax Error: {error.msg}",
                     "details": details,
                     "file_path": self.file_path,
-                    "line": error.lineno,
-                    "col": error.offset,
+                    "line": line,
+                    "col": offset,
                 }
             )
 
