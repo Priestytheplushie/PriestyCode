@@ -6,6 +6,8 @@ import threading
 from typing import List, Tuple, Dict, Callable, Optional, Any
 import re
 import shlex
+import math
+import time
 
 # ======================================================================================
 # 1. STYLING AND THEME
@@ -29,6 +31,10 @@ class StyleManager:
         self.COLOR_BORDER = "#555555"
         self.COLOR_ORANGE = "#D18616"
         self.COLOR_CONFLICT = "#E06C75" # Color for conflict section
+        self.COLOR_YELLOW = "#E6A23C"  # For search highlights
+        self.COLOR_SEARCH_BG = "#4a422a" # Background for search result text
+        self.COLOR_PLACEHOLDER = "#888888"
+        self.COLOR_CURRENT_BRANCH_HIGHLIGHT = "#FFD700" # Gold color for current branch
 
         # --- Fonts ---
         self.FONT_UI = ("Segoe UI", 10)
@@ -84,6 +90,13 @@ class StyleManager:
         self.style.map("TNotebook.Tab",
                        background=[("selected", self.COLOR_ACCENT_LIGHT),
                                    ("active", self.COLOR_BORDER)])
+        
+        self.style.configure("Console.TEntry",
+                             fieldbackground=self.COLOR_BG_DARK,
+                             foreground=self.COLOR_FG,
+                             insertcolor=self.COLOR_FG,
+                             borderwidth=0, relief="flat")
+
 
 # ======================================================================================
 # 2. HELPER DIALOGS AND WIDGETS
@@ -181,6 +194,147 @@ class RemoteDialog(simpledialog.Dialog):
         if selected_indices:
             self.result = self.listbox.get(selected_indices[0])
 
+class CompletionWindow(tk.Toplevel):
+    """A popup window for command completions."""
+    def __init__(self, parent, entry_widget):
+        super().__init__(parent)
+        self.entry_widget = entry_widget
+        self.sm = StyleManager()
+        self.overrideredirect(True)
+        
+        self.listbox = tk.Listbox(self, bg=self.sm.COLOR_BG_DARK, fg=self.sm.COLOR_FG,
+                                 selectbackground=self.sm.COLOR_ACCENT_LIGHT,
+                                 selectforeground=self.sm.COLOR_FG,
+                                 bd=1, relief="solid", highlightthickness=0,
+                                 exportselection=False, font=self.sm.FONT_CODE)
+        self.listbox.pack(fill="both", expand=True)
+        self.withdraw()
+
+    def show(self, completions: List[str]):
+        if not completions:
+            self.withdraw()
+            return
+
+        self.listbox.delete(0, tk.END)
+        for item in completions:
+            self.listbox.insert(tk.END, item)
+        
+        x = self.entry_widget.winfo_rootx()
+        y = self.entry_widget.winfo_rooty() + self.entry_widget.winfo_height()
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(0)
+
+    def hide(self):
+        self.withdraw()
+
+    def move_selection(self, direction: int):
+        if not self.winfo_viewable(): return
+        current_selection = self.listbox.curselection()
+        if not current_selection:
+            self.listbox.selection_set(0)
+            return
+        
+        next_idx = current_selection[0] + direction
+        if 0 <= next_idx < self.listbox.size():
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(next_idx)
+            self.listbox.see(next_idx)
+
+    def get_selected(self) -> Optional[str]:
+        if not self.winfo_viewable() or not self.listbox.curselection():
+            return None
+        return self.listbox.get(self.listbox.curselection()[0])
+
+class GitCommandAutocompleteManager:
+    """Manages context-aware autocompletion for Git commands."""
+    COMMANDS = [
+        "add", "am", "archive", "bisect", "branch", "bundle", "checkout", "cherry-pick",
+        "citool", "clean", "clone", "commit", "describe", "diff", "fetch", "format-patch",
+        "gc", "grep", "gui", "init", "log", "merge", "mv", "notes", "pull", "push", "range-diff",
+        "rebase", "reset", "revert", "rm", "shortlog", "show", "stash", "status", "submodule",
+        "switch", "tag", "worktree"
+    ]
+    FLAGS: Dict[str, List[str]] = {
+        "add": ["-A", "--all", "-u", "--update", "-n", "--dry-run", "-v", "--verbose", "--force", "-f", "--interactive", "-i", "--patch", "-p", "--no-edit", "--sparse", "--intent-to-add", "-N", "--refresh", "--ignore-errors", "--chmod", "--pathspec-from-file", "--pathspec-file-nul"],
+        "commit": ["-m", "-a", "--amend", "--no-edit", "-v", "--verbose", "-q", "--quiet", "--dry-run", "--allow-empty", "--allow-empty-message", "--author", "--date", "--cleanup", "--file", "-F", "--signoff", "-s", "--no-verify", "-n", "--only", "-o", "--pathspec-from-file", "--pathspec-file-nul", "--template", "-t", "--edit", "-e", "--status", "--no-status", "--untracked-files", "-u", "--no-untracked-files", "--post-rewrite", "--fixup", "--squash", "--reset-author", "--short", "--branch", "--porcelain", "--long", "--null", "--date-order", "--reverse", "--walk-reflogs", "--pretty", "--abbrev-commit", "--no-abbrev-commit", "--relative-date", "--date", "--max-count", "-n", "--skip", "--since", "--after", "--until", "--before", "--committer", "--author", "--grep-reflog", "--grep", "-E", "-F", "--all-match", "--invert-grep", "-v", "--basic-regexp", "-G", "--all-match", "--regexp-ignore-case", "-i", "--remove-empty", "--merges", "--no-merges", "--min-parents", "--max-parents", "--no-walk", "--do-walk", "--parents", "--children", "--left-right", "--cherry-mark", "--cherry-pick", "--left-only", "--right-only", "--graph", "--decorate", "--source", "--use-bitmap-index", "--no-use-bitmap-index", "--progress", "--no-walk-reflogs", "--bisect", "--simplify-by-decoration", "--full-history", "--not", "--all", "--branches", "--tags", "--remotes", "--glob", "--exclude", "--exclude-standard", "--sparse-tree", "--filter-branch-by-commit-filter", "--show-pulls", "--show-merges", "--show-rebasess", "--show-cherry-picks", "--show-reverts", "--show-squashes", "--show-fast-forwards", "--show-linear-history", "--show-boundary"],
+        "log": ["--oneline", "--graph", "--decorate", "--all", "-n", "-p", "--stat", "--author", "--grep", "--since", "--until", "--pretty", "--abbrev-commit", "--name-only", "--name-status", "--full-diff", "--follow", "--date-order", "--branches", "--tags", "--remotes"],
+        "reset": ["--soft", "--mixed", "--hard", "--merge", "--keep", "HEAD"],
+        "rebase": ["-i", "--continue", "--abort", "--skip", "--onto", "--keep-empty", "--fork-point", "--autosquash", "--autostash", "--committer-date-is-author-date", "--ignore-date", "--ignore-space-change", "--ignore-all-space", "--no-verify", "-n", "--quiet", "-q", "--verbose", "-v", "--stat", "--no-stat", "--apply", "--no-ff", "--ff-only", "--squash", "--fixup", "--reword", "--edit", "--drop", "--exec", "--root", "--merge", "--strategy", "--strategy-option", "--preserve-merges", "-p", "--rerere-autoupdate", "--no-rerere-autoupdate"],
+        "push": ["--force", "--force-with-lease", "--tags", "-u", "--all", "--mirror", "--delete", "--dry-run", "-n", "--porcelain", "--follow-tags", "--no-verify", "-n", "--recurse-submodules", "--no-recurse-submodules", "--atomic", "--push-option", "-o", "--set-upstream", "--receive-pack", "--exec", "--progress", "--no-progress", "--verbose", "-v", "--quiet", "-q", "--signed"],
+        "status": ["-s", "-b", "--long", "--porcelain", "--branch", "--show-stash"],
+        "checkout": ["-b", "--track", "--orphan", "--force", "-f", "--ours", "--theirs", "--conflict", "--patch", "-p", "--merge", "--no-overlay", "--quiet", "-q", "--progress", "--no-progress", "--ignore-skip-worktree-bits", "--pathspec-from-file", "--pathspec-file-nul", "--sparse", "--recurse-submodules", "--no-recurse-submodules", "--dry-run", "-n", "--guess", "--no-guess", "--overlay", "--no-overlay", "--detach", "--", "--no-track", "--set-upstream", "-u"],
+        "branch": ["-a", "-r", "-l", "--list", "-d", "-D", "-m", "-M", "-c", "-C", "--copy", "--move", "--force", "-f", "--create-reflog", "--no-create-reflog", "--color", "--no-color", "--column", "--no-column", "--contains", "--no-contains", "--merged", "--no-merged", "--remotes", "--all", "--ignore-case", "--sort", "--points-at", "--format", "--show-current", "--set-upstream-to", "-u", "--unset-upstream", "--edit-description", "--get-description", "--set-description", "--show-trackin", "--track", "--no-track", "--recurse-submodules", "--no-recurse-submodules", "--bare", "--mirror", "--single-branch", "--depth", "--shallow-since", "--shallow-exclude", "--dissociate", "--reference", "--separate-git-dir", "--template", "--upload-pack", "--recurse-submodules-default", "--jobs", "--tags", "--no-tags", "--no-checkout", "--no-hardlinks", "--local", "--no-local", "--shared", "--origin", "--reference-if-able", "--dissociate-refs", "--sparse", "--filter", "--initial-branch"],
+        "merge": ["--no-ff", "--ff-only", "--squash", "--no-squash", "--commit", "--no-commit", "--edit", "--no-edit", "--no-verify", "-n", "--abort", "--continue", "--allow-unrelated-histories", "--strategy", "-s", "--strategy-option", "-X", "--rerere-autoupdate", "--no-rerere-autoupdate", "--signoff", "-s", "--log", "--no-log", "--stat", "--no-stat", "--fast-forward", "--no-fast-forward", "--ff", "--no-ff", "--into-name", "--autostash", "--no-autostash", "--gpg-sign", "-S", "--quit", "--cleanup"],
+        "diff": ["--staged", "--cached", "--name-only", "--name-status", "--check", "--color", "--no-color", "--word-diff", "--unified", "-U", "--raw", "--patch", "-p", "--stat", "--summary", "--dirstat", "--numstat", "--shortstat", "--find-copies", "-C", "--find-renames", "-M", "--find-copies-harder", "--irreversible-delete", "--diff-filter", "--binary", "--text", "--exit-code", "--quiet", "--ext-diff", "--no-ext-diff", "--textconv", "--no-textconv", "--ignore-submodules", "--submodule", "--src-prefix", "--dst-prefix", "--no-prefix", "--line-prefix", "--ita-invisible-in-index", "--pickaxe-all", "-S", "--pickaxe-regex", "-G", "--diff-algorithm", "--indent-heuristic", "--minimal", "--patience", "--histogram", "--diff-merges", "--no-renames", "--relative", "-R", "--no-relative", "--patch-with-raw", "--full-index", "--cached", "--merge-base", "--dir-diff", "--no-dir-diff", "--compaction-heuristic", "--no-compaction-heuristic", "--color-words", "--no-color-words", "--color-moved", "--no-color-moved", "--abbrev", "--no-abbrev", "--break-rewrites", "--no-break-rewrites", "--dense-combined-diff", "--no-dense-combined-diff", "--ignore-cr-at-eol", "--ignore-space-at-eol", "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--ignore-matching-lines", "--ignore-trailing-space", "--no-indent-heuristic", "--no-textconv", "--no-word-diff", "--output", "--output-indicator-new", "--output-indicator-old", "--output-indicator-context", "--patch-with-stat", "--patch-with-summary", "--no-patch-with-raw", "--no-patch-with-stat", "--no-patch-with-summary", "--recursive", "--no-recursive", "--submodule-diff", "--no-submodule-diff", "--unified-diff", "--no-unified-diff", "--ws-error-highlight", "--no-ws-error-highlight", "--ws-error-highlight=all", "--ws-error-highlight=none", "--ws-error-highlight=new", "--ws-error-highlight=old", "--ws-error-highlight=context", "--ws-error-highlight=lines", "--ws-error-highlight=trailing-whitespace", "--ws-error-highlight=indent-with-tabs", "--ws-error-highlight=tab-in-indent", "--ws-error-highlight=cr-at-eol", "--ws-error-highlight=blank-at-eol", "--ws-error-highlight=space-before-tab"],
+        "fetch": ["--all", "--append", "--atomic", "--deepen", "--depth", "--dry-run", "-n", "--force", "--keep", "--multiple", "--no-tags", "--prune", "-p", "--recurse-submodules", "--no-recurse-submodules", "--set-upstream", "-u", "--tags", "--update-head-ok", "--upload-pack", "--verbose", "-v", "--quiet", "-q", "--progress", "--no-progress", "--jobs"],
+        "pull": ["--all", "--append", "--autostash", "--no-autostash", "--commit", "--no-commit", "--edit", "--no-edit", "--ff", "--no-ff", "--ff-only", "--gpg-sign", "-S", "--log", "--no-log", "--no-rebase", "--no-recurse-submodules", "--no-stat", "--no-tags", "--no-verify", "-n", "--progress", "--no-progress", "--prune", "-p", "--quiet", "-q", "--rebase", "--recurse-submodules", "--set-upstream", "-u", "--stat", "--tags", "--verbose", "-v", "--verify-signatures", "--strategy", "-s", "--strategy-option", "-X", "--allow-unrelated-histories", "--ff-only", "--no-ff-only", "--rebase-merges", "--no-rebase-merges", "--rebase-skip", "--rebase-continue", "--rebase-abort", "--rebase-update-refs", "--rebase-preserve-merges", "--rebase-fork-point", "--rebase-autosquash", "--rebase-autostash", "--rebase-committer-date-is-author-date", "--rebase-ignore-date", "--rebase-ignore-space-change", "--rebase-ignore-all-space", "--rebase-no-verify", "--rebase-quiet", "--rebase-verbose", "--rebase-stat", "--rebase-no-stat", "--rebase-apply", "--rebase-no-apply", "--rebase-force-rebase", "--rebase-no-force-rebase", "--rebase-strategy", "--rebase-strategy-option", "--rebase-preserve-merges", "--rebase-rerere-autoupdate", "--rebase-no-rerere-autoupdate", "--rebase-gpg-sign", "--rebase-cleanup"],
+        "clone": ["--bare", "--branch", "-b", "--depth", "--dissociate", "--filter", "--jobs", "--local", "-l", "--mirror", "--no-checkout", "--no-hardlinks", "--origin", "-o", "--progress", "--no-progress", "--recurse-submodules", "--no-recurse-submodules", "--reference", "--separate-git-dir", "--shared", "--single-branch", "--shallow-exclude", "--shallow-since", "--sparse", "--template", "--upload-pack", "--verbose", "-v", "--quiet", "-q", "--config", "-c", "--bundle-uri", "--no-remote-submodules", "--server-option", "--reject-shallow", "--sparse-checkout", "--no-sparse-checkout", "--filter=blob:none", "--filter=tree:0", "--filter=commit:0", "--filter=combined:0", "--filter=submodule:none", "--filter=sparse:oid", "--filter=sparse:path", "--filter=sparse:rev", "--filter=sparse:tree", "--filter=sparse:object"],
+        "init": ["--bare", "--template", "--separate-git-dir", "--shared", "--initial-branch", "-b", "--object-format"],
+        "rm": ["-f", "--force", "-n", "--dry-run", "-r", "--recursive", "--cached", "--ignore-unmatch", "--pathspec-from-file", "--pathspec-file-nul", "--"],
+        "mv": ["-f", "--force", "-n", "--dry-run", "--pathspec-from-file", "--pathspec-file-nul", "--"],
+        "stash": ["push", "save", "list", "show", "pop", "apply", "branch", "clear", "drop", "create", "store", "describ", "on", "--keep-index", "-k", "--include-untracked", "-u", "--all", "-a", "--patch", "-p", "--message", "-m", "--quiet", "-q", "--pathspec-from-file", "--pathspec-file-nul", "--"],
+        "show": ["--pretty", "--format", "--abbrev-commit", "--no-abbrev-commit", "--oneline", "--encoding", "--notes", "--no-notes", "--show-signature", "--no-show-signature", "--raw", "-s", "--patch", "-p", "--stat", "--numstat", "--shortstat", "--name-only", "--name-status", "--check", "--full-index", "--binary", "--text", "--diff-filter", "--find-copies", "-C", "--find-renames", "-M", "--find-copies-harder", "--irreversible-delete", "--diff-algorithm", "--indent-heuristic", "--minimal", "--patience", "--histogram", "--diff-merges", "--no-renames", "--relative", "-R", "--no-relative", "--patch-with-raw", "--full-index", "--cached", "--merge-base", "--dir-diff", "--no-dir-diff", "--compaction-heuristic", "--no-compaction-heuristic", "--color-words", "--no-color-words", "--color-moved", "--no-color-moved", "--abbrev", "--no-abbrev", "--break-rewrites", "--no-break-rewrites", "--dense-combined-diff", "--no-dense-combined-diff", "--ignore-cr-at-eol", "--ignore-space-at-eol", "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--ignore-matching-lines", "--ignore-trailing-space", "--no-indent-heuristic", "--no-textconv", "--no-word-diff", "--output", "--output-indicator-new", "--output-indicator-old", "--output-indicator-context", "--patch-with-stat", "--patch-with-summary", "--no-patch-with-raw", "--no-patch-with-stat", "--no-patch-with-summary", "--recursive", "--no-recursive", "--submodule-diff", "--no-submodule-diff", "--unified-diff", "--no-unified-diff", "--ws-error-highlight", "--no-ws-error-highlight", "--ws-error-highlight=all", "--ws-error-highlight=none", "--ws-error-highlight=new", "--ws-error-highlight=old", "--ws-error-highlight=context", "--ws-error-highlight=lines", "--ws-error-highlight=trailing-whitespace", "--ws-error-highlight=indent-with-tabs", "--ws-error-highlight=tab-in-indent", "--ws-error-highlight=cr-at-eol", "--ws-error-highlight=blank-at-eol", "--ws-error-highlight=space-before-tab", "--decorate", "--source", "--use-bitmap-index", "--no-use-bitmap-index", "--progress", "--no-walk-reflogs", "--bisect", "--simplify-by-decoration", "--full-history", "--not", "--all", "--branches", "--tags", "--remotes", "--glob", "--exclude", "--exclude-standard", "--sparse-tree", "--filter-branch-by-commit-filter", "--show-pulls", "--show-merges", "--show-rebasess", "--show-cherry-picks", "--show-reverts", "--show-squashes", "--show-fast-forwards", "--show-linear-history", "--show-boundary"]
+    }
+    
+    def __init__(self, git_logic: 'GitLogic'):
+        self.git_logic = git_logic
+        self.cached_files: List[str] = []
+        self.last_status_check_time = 0
+        self.status_cache_duration = 5 # seconds
+
+    def _get_tracked_files(self) -> List[str]:
+        """Fetches tracked files for autocompletion, with a simple cache."""
+        current_time = time.time()
+        if current_time - self.last_status_check_time < self.status_cache_duration and self.cached_files:
+            return self.cached_files
+        
+        rc, stdout, _ = self.git_logic._run_command(["ls-files"])
+        if rc == 0:
+            self.cached_files = stdout.splitlines()
+            self.last_status_check_time = current_time
+            return self.cached_files
+        return []
+
+    def get_completions(self, text_before_cursor: str) -> List[str]:
+        """Returns a list of potential completions based on the input text."""
+        parts = shlex.split(text_before_cursor) # Use shlex to handle quoted paths
+        
+        if not parts: return self.COMMANDS # Suggest commands if input is empty
+
+        command = parts[0]
+        current_word = parts[-1] if not text_before_cursor.endswith(' ') else ""
+
+        # Autocomplete for main commands
+        if len(parts) == 1 and not text_before_cursor.endswith(' '):
+            return [cmd for cmd in self.COMMANDS if cmd.startswith(current_word)]
+
+        # Autocomplete for flags
+        if command in self.FLAGS:
+            if current_word.startswith("-"):
+                return [f for f in self.FLAGS[command] if f.startswith(current_word)]
+            
+            # Autocomplete for branches/commits for specific commands
+            if command in ["checkout", "switch", "branch", "merge", "rebase", "reset"]:
+                _, branches, _ = self.git_logic.get_branches()
+                all_branch_names = [b.replace("* ", "").replace("remotes/", "") for b in branches]
+                # Also include commit hashes for rebase/reset/checkout
+                # For simplicity, we can fetch a few recent commit hashes
+                _, log_output, _ = self.git_logic._run_command(["log", "--oneline", "-n", "20"])
+                recent_hashes = [line.split(' ')[0] for line in log_output.splitlines() if line]
+                
+                all_suggestions = sorted(list(set(all_branch_names + recent_hashes)))
+                return [s for s in all_suggestions if s.startswith(current_word)]
+            
+            # Autocomplete for files for specific commands
+            if command in ["add", "rm", "diff", "checkout", "restore"]: # Add other file-related commands
+                all_files = self._get_tracked_files()
+                return [f for f in all_files if f.startswith(current_word)]
+
+        return []
+
 # ======================================================================================
 # 3. GIT BACKEND LOGIC
 # ======================================================================================
@@ -238,7 +392,10 @@ class GitLogic:
             return False, f"Error parsing command: {e}"
             
         rc, stdout, stderr = self._run_command(command_parts)
-        return rc == 0, (f"$ git {command_str}\n" + stdout + "\n" + stderr).strip()
+        # For arbitrary commands, combine stdout and stderr for a complete picture
+        output = (stdout + "\n" + stderr).strip()
+        return rc == 0, output
+
 
     def is_git_repo(self) -> bool:
         project_root = self.get_project_root()
@@ -277,9 +434,14 @@ class GitLogic:
         return rc == 0, stdout if rc == 0 else stderr
 
     def get_log_for_graph(self) -> Tuple[bool, str]:
-        log_format = "%H|%P|%an|%ar|%d|%s"
-        rc, stdout, stderr = self._run_command(["log", "--all", f"--pretty=format:{log_format}", "-n", "500", "--date-order", "--color=never", "--decorate=full"])
-        return rc == 0, stdout if rc == 0 else stderr
+        # Using a rare delimiter (\x01) to safely parse subject and body
+        log_format = "%H\x01%P\x01%an\x01%ar\x01%d\x01%s\x01%b"
+        # Removed commit limit for full log.
+        rc, stdout, stderr = self._run_command(["log", "--all", f"--pretty=format:{log_format}%n\x02", "--date-order", "--color=never", "--decorate=full"])
+        if rc == 0:
+            return True, stdout.strip('\n\x02').replace('\x02', '')
+        return False, stderr
+
 
     def get_branches(self) -> Tuple[bool, List[str], Optional[str]]:
         rc, stdout, stderr = self._run_command(["branch", "-a"])
@@ -321,7 +483,7 @@ class GitLogic:
         rc, stdout, _ = self._run_command(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
         return stdout if rc == 0 else None
 
-    def stage_files(self, filepaths: List[str]): return self._run_command(["add"] + filepaths)
+    def stage_files(self, filepaths: List[str]): return self._run_command(["add", "--"] + filepaths)
     def unstage_files(self, filepaths: List[str]): return self._run_command(["reset", "HEAD", "--"] + filepaths)
     def discard_changes(self, filepaths: List[str]): return self._run_command(["checkout", "--"] + filepaths)
 
@@ -395,8 +557,13 @@ class SourceControlUI(ttk.Frame):
         self.sm = StyleManager()
         self.git_logic = GitLogic(lambda: self.workspace_root_dir)
         self.history_view = None
-        self.conflicts_tree_frame: Optional[TreeViewFrame] = None # Will hold the TreeViewFrame for conflicts
+        self.conflicts_tree_frame: Optional[TreeViewFrame] = None
         self.conflicts_label: Optional[ttk.Label] = None
+        self.command_history: List[str] = []
+        self.command_history_index = -1
+        self.autocomplete_manager = GitCommandAutocompleteManager(self.git_logic)
+        self.git_prefix_warning_shown = False
+        self.completion_window: Optional[CompletionWindow] = None
 
         self._configure_styles()
         self._create_widgets()
@@ -434,34 +601,29 @@ class SourceControlUI(ttk.Frame):
         init_button = ttk.Button(self.init_view_frame, text="Initialize Repository", style="Accent.TButton", command=self._init_repo)
         init_button.grid(row=1, column=0, sticky="")
 
-        # --- Main View using PanedWindow for the new layout ---
-        self.main_view_pane = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        # --- Main View is now a Notebook ---
+        self.main_notebook = ttk.Notebook(self)
         
-        # Top Pane: Notebook for Changes/History
-        self.notebook = ttk.Notebook(self.main_view_pane)
-        self.main_view_pane.add(self.notebook, weight=1)
-
-        # Bottom Pane: Commit Area
-        commit_area_frame = ttk.Frame(self.main_view_pane, style="Header.TFrame", padding=(10,5,10,10))
-        self.main_view_pane.add(commit_area_frame, weight=0)
-
-        # --- Populate Notebook Tabs ---
         self._create_changes_tab()
-        # History tab will be created on demand
-
-        # --- Populate Commit Area ---
-        self._create_commit_area(commit_area_frame)
+        self._create_console_tab()
     
     def _create_changes_tab(self):
-        changes_tab = ttk.Frame(self.notebook, padding=5)
-        self.notebook.add(changes_tab, text="Changes")
-        
-        changes_pane = ttk.PanedWindow(changes_tab, orient=tk.VERTICAL)
-        changes_pane.pack(fill="both", expand=True)
+        changes_tab_frame = ttk.Frame(self.main_notebook, padding=5)
+        self.main_notebook.add(changes_tab_frame, text="Changes")
 
-        files_frame = ttk.Frame(changes_pane)
-        changes_pane.add(files_frame, weight=3)
-        # Configure grid with an extra section for conflicts
+        changes_tab_pane = ttk.PanedWindow(changes_tab_frame, orient=tk.VERTICAL)
+        changes_tab_pane.pack(fill="both", expand=True)
+        
+        files_frame_container = ttk.Frame(changes_tab_pane)
+        changes_tab_pane.add(files_frame_container, weight=3)
+        files_frame_container.grid_rowconfigure(0, weight=1)
+        files_frame_container.grid_columnconfigure(0, weight=1)
+
+        files_and_diff_pane = ttk.PanedWindow(files_frame_container, orient=tk.VERTICAL)
+        files_and_diff_pane.grid(row=0, column=0, sticky="nsew")
+
+        files_frame = ttk.Frame(files_and_diff_pane)
+        files_and_diff_pane.add(files_frame, weight=3)
         files_frame.grid_rowconfigure(1, weight=1); files_frame.grid_rowconfigure(3, weight=1); files_frame.grid_rowconfigure(5, weight=1)
         files_frame.grid_columnconfigure(0, weight=1)
 
@@ -471,7 +633,6 @@ class SourceControlUI(ttk.Frame):
         self.conflicts_tree_frame = TreeViewFrame(files_frame, self._on_conflict_double_click, self.workspace_root_dir)
         self.conflicts_tree_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.conflicts_tree = self.conflicts_tree_frame.tree
-        # Initially hide the conflict section
         self.conflicts_label.grid_remove()
         self.conflicts_tree_frame.grid_remove()
 
@@ -482,7 +643,7 @@ class SourceControlUI(ttk.Frame):
         staged_frame_widget.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
         self.staged_tree = staged_frame_widget.tree
         self.staged_tree.bind("<Button-3>", lambda e: self._show_context_menu(e, self.staged_tree, is_staged=True))
-        self.staged_tree.bind("<<TreeviewSelect>>", lambda e: self._show_diff_for_selection(e, is_staged=True))
+        self.staged_tree.bind("<<TreeviewSelect>>", lambda e: self._show_diff_for_selection(e, is_staged=False))
 
         # --- Unstaged Changes Section ---
         self.changes_label = ttk.Label(files_frame, text="CHANGES", font=(self.sm.FONT_UI[0], 9, 'bold'))
@@ -494,8 +655,8 @@ class SourceControlUI(ttk.Frame):
         self.changes_tree.bind("<<TreeviewSelect>>", lambda e: self._show_diff_for_selection(e, is_staged=False))
         
         # --- Diff Viewer ---
-        diff_pane = ttk.Frame(changes_pane)
-        changes_pane.add(diff_pane, weight=2)
+        diff_pane = ttk.Frame(files_and_diff_pane)
+        files_and_diff_pane.add(diff_pane, weight=2)
         diff_pane.grid_rowconfigure(0, weight=1); diff_pane.grid_columnconfigure(0, weight=1)
         self.diff_viewer = scrolledtext.ScrolledText(diff_pane, wrap="none", bg=self.sm.COLOR_BG_DARK, fg=self.sm.COLOR_FG, font=self.sm.FONT_CODE, relief="flat", bd=0)
         self.diff_viewer.grid(row=0, column=0, sticky="nsew")
@@ -503,6 +664,166 @@ class SourceControlUI(ttk.Frame):
         self.diff_viewer.tag_config("deletion", foreground=self.sm.COLOR_RED)
         self.diff_viewer.tag_config("header", foreground=self.sm.COLOR_BLUE, font=(self.sm.FONT_CODE[0], self.sm.FONT_CODE[1], "bold"))
         self.diff_viewer.config(state="disabled")
+
+        # --- Commit Area ---
+        commit_area_frame = ttk.Frame(changes_tab_pane, style="Header.TFrame", padding=(10,5,10,10))
+        changes_tab_pane.add(commit_area_frame, weight=0)
+        self._create_commit_area(commit_area_frame)
+        
+    def _create_console_tab(self):
+        console_frame = ttk.Frame(self.main_notebook, padding=5)
+        self.main_notebook.add(console_frame, text="Console")
+
+        console_frame.grid_rowconfigure(0, weight=1)
+        console_frame.grid_columnconfigure(0, weight=1)
+
+        self.console_output = scrolledtext.ScrolledText(console_frame, wrap="word", bg=self.sm.COLOR_BG_DARK, fg=self.sm.COLOR_FG, font=self.sm.FONT_CODE, relief="flat", bd=0)
+        self.console_output.grid(row=0, column=0, sticky="nsew")
+        self.console_output.tag_config("command", foreground=self.sm.COLOR_ACCENT)
+        self.console_output.tag_config("error", foreground=self.sm.COLOR_RED)
+        self.console_output.tag_config("info", foreground=self.sm.COLOR_ORANGE)
+        self.console_output.config(state="disabled")
+
+        self.console_input = ttk.Entry(console_frame, font=self.sm.FONT_CODE, style="Console.TEntry")
+        self.console_input.grid(row=1, column=0, sticky="ew", pady=(5,0))
+        
+        # Ensure completion_window is initialized here
+        self.completion_window = CompletionWindow(self, self.console_input)
+
+        # --- Bindings for Console ---
+        self.console_input.bind("<Return>", self._execute_console_command)
+        self.console_input.bind("<Up>", self._cycle_history_up)
+        self.console_input.bind("<Down>", self._cycle_history_down)
+        self.console_input.bind("<KeyRelease>", self._on_key_release)
+        self.console_input.bind("<Tab>", self._accept_completion)
+        if self.completion_window:
+            self.console_input.bind("<Escape>", lambda e: self.completion_window.hide()) #type: ignore
+
+        # Placeholder logic
+        self.placeholder = "Enter git command (e.g., status -s)"
+        self.console_input.insert(0, self.placeholder)
+        self.console_input.config(foreground=self.sm.COLOR_PLACEHOLDER)
+        self.console_input.bind("<FocusIn>", self._on_console_focus_in)
+        self.console_input.bind("<FocusOut>", self._on_console_focus_out)
+
+    def _on_console_focus_in(self, event=None):
+        if self.console_input.get() == self.placeholder:
+            self.console_input.delete(0, tk.END)
+            self.console_input.config(foreground=self.sm.COLOR_FG)
+
+    def _on_console_focus_out(self, event=None):
+        if not self.console_input.get():
+            self.console_input.insert(0, self.placeholder)
+            self.console_input.config(foreground=self.sm.COLOR_PLACEHOLDER)
+            if self.completion_window:
+                self.completion_window.hide()
+
+    def _execute_console_command(self, event=None):
+        if self.completion_window and self.completion_window.winfo_viewable():
+            return self._accept_completion(event)
+
+        command = self.console_input.get().strip()
+        if not command or command == self.placeholder: return
+        
+        original_command = command
+        if command.lower().strip() == 'git':
+            self._update_console_output("Please enter a git command after 'git'. (e.g., 'status', not 'git status')", is_error=True)
+            return
+
+        if command.lower().startswith("git "):
+            command = command[4:].strip()
+            if not self.git_prefix_warning_shown:
+                 self._update_console_output("(Note: The 'git' prefix is not needed and was automatically removed.)", is_info=True)
+                 self.git_prefix_warning_shown = True
+
+        if command:
+            self.command_history.append(original_command)
+            self.command_history_index = len(self.command_history)
+
+        self.console_output.config(state="normal")
+        self.console_output.insert(tk.END, f"$ git {command}\n", "command")
+        self.console_output.config(state="disabled")
+
+        self.console_input.delete(0, tk.END)
+        
+        threading.Thread(target=self._run_console_command_thread, args=(command,), daemon=True).start()
+        return "break"
+
+    def _run_console_command_thread(self, command):
+        success, output = self.git_logic.run_arbitrary_command(command)
+        self.after(0, self._update_console_output, output, not success)
+
+    def _update_console_output(self, output, is_error=False, is_info=False):
+        self.console_output.config(state="normal")
+        if is_error: tag = "error"
+        elif is_info: tag = "info"
+        else: tag = "output"
+        
+        self.console_output.insert(tk.END, output + "\n\n", tag)
+        self.console_output.see(tk.END)
+        self.console_output.config(state="disabled")
+        
+        if not is_info:
+            self.refresh()
+            if self.history_view and self.history_view.winfo_exists():
+                self.history_view.populate_log()
+
+    def _cycle_history_up(self, event=None):
+        if self.completion_window and self.completion_window.winfo_viewable():
+            self.completion_window.move_selection(-1)
+        elif self.command_history:
+            self.command_history_index = max(0, self.command_history_index - 1)
+            self._on_console_focus_in(None)
+            self.console_input.delete(0, tk.END)
+            self.console_input.insert(0, self.command_history[self.command_history_index])
+        return "break"
+
+    def _cycle_history_down(self, event=None):
+        if self.completion_window and self.completion_window.winfo_viewable():
+            self.completion_window.move_selection(1)
+        elif self.command_history:
+            self.command_history_index += 1
+            if self.command_history_index < len(self.command_history):
+                self._on_console_focus_in(None)
+                self.console_input.delete(0, tk.END)
+                self.console_input.insert(0, self.command_history[self.command_history_index])
+            else:
+                self.command_history_index = len(self.command_history)
+                self.console_input.delete(0, tk.END)
+        return "break"
+
+    def _on_key_release(self, event):
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
+            return
+
+        text = self.console_input.get()
+        completions = self.autocomplete_manager.get_completions(text)
+        if completions:
+            if self.completion_window:
+                self.completion_window.show(completions)
+        else:
+            if self.completion_window:
+                self.completion_window.hide()
+
+    def _accept_completion(self, event=None):
+        if self.completion_window:
+            selected = self.completion_window.get_selected()
+            if selected:
+                text = self.console_input.get()
+                parts = shlex.split(text)
+                
+                # If the current word is a partial flag or filename, replace it
+                if text.endswith(' ') or not parts: # If ends with space or no parts, just append
+                    new_text = text + selected + " "
+                else: # Replace the last part
+                    base = " ".join(parts[:-1])
+                    new_text = (base + " " if base else "") + selected + " "
+                
+                self.console_input.delete(0, tk.END)
+                self.console_input.insert(0, new_text)
+                self.console_input.icursor(tk.END)
+                self.completion_window.hide()
+        return "break"
 
     def _on_file_double_click(self, event):
         """Callback for regular (non-conflict) files."""
@@ -585,14 +906,14 @@ class SourceControlUI(ttk.Frame):
         is_repo = self.git_logic.is_git_repo()
 
         if not is_repo:
-            self.main_view_pane.grid_remove()
+            self.main_notebook.grid_remove()
             self.init_view_frame.grid(row=0, column=0, sticky="nsew")
             if hasattr(self.parent_app, 'update_git_status_bar'):
                 self.parent_app.update_git_status_bar("Not a git repository")
             return
 
         self.init_view_frame.grid_remove()
-        self.main_view_pane.grid(row=0, column=0, sticky="nsew")
+        self.main_notebook.grid(row=0, column=0, sticky="nsew")
         
         self.staged_label.config(text="STAGED CHANGES (loading...)")
         self.changes_label.config(text="CHANGES (loading...)")
@@ -625,24 +946,24 @@ class SourceControlUI(ttk.Frame):
                 conflict_count += 1
                 symbol = status_map.get('U', '❗')
                 self.conflicts_tree.insert("", "end", iid=normalized_path, text=f" {symbol}  {normalized_path}")
+                # TODO: "INCOMING bug" - Displaying the specific incoming branch name for merge conflicts
+                # requires more advanced Git plumbing commands (e.g., git merge-tree, git ls-files -u)
+                # to determine the conflicting branches. The current `git status --porcelain` output
+                # does not directly provide this information. This is a complex enhancement for future phases.
                 continue
 
             staged_char, unstaged_char = status[0], status[1]
             
-            # A file can be in both staged and unstaged (e.g., status 'MM'), so we process them independently.
             if staged_char != ' ' and staged_char != '?':
                 staged_count += 1
                 symbol = status_map.get(staged_char, staged_char)
                 self.staged_tree.insert("", "end", iid=normalized_path, text=f" {symbol}  {normalized_path}")
             
-            # FIX: This block handles all unstaged changes, including untracked ('??').
-            # The previous extra `if` for '??' was redundant and caused the duplicate item error.
             if unstaged_char != ' ':
                 unstaged_count += 1
                 symbol = status_map.get(unstaged_char, unstaged_char)
                 self.changes_tree.insert("", "end", iid=normalized_path, text=f" {symbol}  {normalized_path}")
 
-        # Update labels
         self.staged_label.config(text=f"STAGED CHANGES ({staged_count})")
         self.changes_label.config(text=f"CHANGES ({unstaged_count})")
         
@@ -753,6 +1074,10 @@ class SourceControlUI(ttk.Frame):
         self._on_commit_message_change()
 
     def _commit_action(self):
+        # Focus the 'Changes' tab before committing
+        self.main_notebook.select(0)
+        self.update_idletasks()
+
         message = self.commit_message_text.get("1.0", "end-1c").strip()
         if not message or message == "Commit message...":
             self.show_detailed_error("Commit Error", "Please enter a commit message.")
@@ -823,22 +1148,22 @@ class SourceControlUI(ttk.Frame):
 
     def _show_history_tab(self):
         """Creates and focuses the history tab if it doesn't exist."""
-        if self.history_view and self.history_view.winfo_exists():
-             for i, tab_text in enumerate(self.notebook.tabs()):
-                if self.notebook.tab(i, "text") == "History":
-                    self.notebook.select(i)
-                    return
+        # Check if the tab already exists by its text
+        for i, tab_id in enumerate(self.main_notebook.tabs()):
+            if self.main_notebook.tab(tab_id, "text") == "History":
+                self.main_notebook.select(i)
+                return
         
-        self.history_view = ModernGitLogViewer(self.notebook, self)
-        self.notebook.add(self.history_view, text="History")
-        self.notebook.select(self.notebook.tabs()[-1])
+        self.history_view = ModernGitLogViewer(self.main_notebook, self)
+        self.main_notebook.add(self.history_view, text="History")
+        self.main_notebook.select(self.main_notebook.tabs()[-1])
+
 
     def _show_branch_manager(self):
         BranchManager(self, self.git_logic)
         
     def show_detailed_error(self, title, details):
         DetailedErrorDialog(self, title, details)
-
 
 class ModernGitLogViewer(ttk.Frame):
     """A modern, graphical Git log/history viewer, designed to be a tab."""
@@ -852,8 +1177,15 @@ class ModernGitLogViewer(ttk.Frame):
         self.commit_map = {}
         self.lane_colors = [self.sm.COLOR_ACCENT, "#3399CC", "#9933CC", "#CC9933", "#33CC99", "#CC3399"]
         self.dot_id_to_commit = {}
-        self.tooltip = None
         self.hovered_dot_id = None
+        self.hovered_lane_index = -1 # New: Track the hovered lane for highlighting
+        self.row_height = 40 
+        self.lane_spacing = 30 
+        self.tooltip_window: Optional[tk.Toplevel] = None # Renamed to avoid conflict with Tooltip class
+
+        # New: Toggle for cleaner view
+        self.cleaner_view_enabled = tk.BooleanVar(value=False)
+        self.cleaner_view_enabled.trace_add("write", self._toggle_cleaner_view)
         
         main_pane = ttk.PanedWindow(self, orient=tk.VERTICAL)
         main_pane.pack(fill="both", expand=True)
@@ -863,16 +1195,24 @@ class ModernGitLogViewer(ttk.Frame):
         top_frame.grid_rowconfigure(0, weight=1)
         top_frame.grid_columnconfigure(1, weight=1)
 
+        # Canvas for the graph
         self.graph_canvas = tk.Canvas(top_frame, bg=self.sm.COLOR_BG_DARK, highlightthickness=0, width=200)
         self.graph_canvas.grid(row=0, column=0, sticky="ns")
 
+        # Text area for commit messages
         self.commit_text = tk.Text(top_frame, bg=self.sm.COLOR_BG_DARK, fg=self.sm.COLOR_FG, font=self.sm.FONT_UI, wrap="none", bd=0, highlightthickness=0, spacing2=8)
         self.commit_text.grid(row=0, column=1, sticky="nsew")
 
-        self.scrollbar = ttk.Scrollbar(top_frame, orient="vertical", command=self._on_scroll)
-        self.scrollbar.grid(row=0, column=2, sticky="ns")
-        self.graph_canvas.config(yscrollcommand=self.scrollbar.set)
-        self.commit_text.config(yscrollcommand=self.scrollbar.set)
+        # Vertical Scrollbar for both canvas and text
+        self.vscrollbar = ttk.Scrollbar(top_frame, orient="vertical", command=self._on_vertical_scroll)
+        self.vscrollbar.grid(row=0, column=2, sticky="ns")
+        self.graph_canvas.config(yscrollcommand=self.vscrollbar.set)
+        self.commit_text.config(yscrollcommand=self.vscrollbar.set)
+
+        # Horizontal Scrollbar for the canvas
+        self.hscrollbar = ttk.Scrollbar(top_frame, orient="horizontal", command=self.graph_canvas.xview)
+        self.hscrollbar.grid(row=1, column=0, columnspan=2, sticky="ew") # Position below canvas and text
+        self.graph_canvas.config(xscrollcommand=self.hscrollbar.set)
 
         bottom_frame = ttk.Frame(main_pane)
         main_pane.add(bottom_frame, weight=2)
@@ -883,14 +1223,42 @@ class ModernGitLogViewer(ttk.Frame):
         self.commit_detail_viewer.tag_config("addition", foreground=self.sm.COLOR_GREEN); self.commit_detail_viewer.tag_config("deletion", foreground=self.sm.COLOR_RED); self.commit_detail_viewer.tag_config("header", foreground=self.sm.COLOR_BLUE, font=(self.sm.FONT_CODE[0], self.sm.FONT_CODE[1], "bold"))
         self.commit_detail_viewer.config(state="disabled")
 
+        # Bindings for scrolling and interaction
         self.commit_text.bind("<MouseWheel>", self._on_mousewheel)
         self.graph_canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.graph_canvas.bind("<Motion>", self._on_canvas_hover)
         self.graph_canvas.bind("<Leave>", self._hide_tooltip)
-        self.commit_text.bind("<Button-1>", self._on_commit_click)
+        self.graph_canvas.bind("<Button-1>", self._on_canvas_click) 
         self.commit_text.bind("<Button-3>", self._show_commit_context_menu)
         
+        # New: Add the "Clean History" checkbox
+        self._create_toolbar(top_frame)
+
         self.populate_log()
+
+    def _create_toolbar(self, parent_frame):
+        toolbar = ttk.Frame(parent_frame, style="Header.TFrame")
+        # Position in top-right of the commit_text area, spanning across columns 0 and 1
+        toolbar.grid(row=0, column=1, sticky="ne", padx=5, pady=5) 
+
+        # Ensure the checkbox style is configured.
+        self.sm.style.configure("TCheckbutton", background=self.sm.COLOR_BG_DARK, foreground=self.sm.COLOR_FG)
+        self.sm.style.map("TCheckbutton", background=[('active', self.sm.COLOR_BG_LIGHT)])
+
+        clean_history_checkbox = ttk.Checkbutton(
+            toolbar,
+            text="Clean History",
+            variable=self.cleaner_view_enabled,
+            onvalue=True,
+            offvalue=False,
+            style="TCheckbutton"
+        )
+        clean_history_checkbox.pack(side="right", padx=5, pady=2)
+        Tooltip(clean_history_checkbox, "Toggle to simplify the graph by hiding merge commits and special entries.")
+
+    def _toggle_cleaner_view(self, *args):
+        """Callback for the cleaner view toggle."""
+        self.populate_log() # Re-populate and redraw the graph with new filtering rules
 
     def populate_log(self):
         """Starts the process of fetching and displaying the git log."""
@@ -907,12 +1275,14 @@ class ModernGitLogViewer(ttk.Frame):
 
     def _populate_log_worker(self):
         success, log_data = self.git_logic.get_log_for_graph()
-        self.after(0, self._update_ui_after_log, success, log_data)
+        current_branch = self.git_logic.get_current_branch()
+        self.after(0, self._update_ui_after_log, success, log_data, current_branch)
 
-    def _update_ui_after_log(self, success: bool, log_data: str):
+    def _update_ui_after_log(self, success: bool, log_data: str, current_branch: str):
         self.commits_data = []
         self.commit_map = {}
-        
+        self.current_branch_name = current_branch # Store current branch name
+
         if not success:
             self.commit_text.config(state="normal")
             self.commit_text.delete("1.0", tk.END)
@@ -922,73 +1292,156 @@ class ModernGitLogViewer(ttk.Frame):
         
         lines = log_data.splitlines()
         for i, line in enumerate(lines):
-            parts = line.split("|")
-            if len(parts) == 6:
-                chash, phash_str, author, date, refs, message = parts
+            parts = line.split("\x01") 
+            if len(parts) == 7:
+                chash, phash_str, author, date, refs, message_subject, message_body = parts
                 parents = phash_str.split()
-                commit_info = {"hash": chash, "parents": parents, "author": author, "date": date, "refs": refs.strip(), "message": message, "line_num": i}
+                
+                # Always filter out stash-related entries from the main history graph
+                stash_message_patterns = [
+                    r"^\s*WIP on ",
+                    r"^\s*index on ",
+                    r"^\s*untracked files on ",
+                    r"^\s*On " # Catches "On branch_name: commit_message"
+                ]
+                if "(refs/stash)" in refs or \
+                   any(re.search(pattern, message_subject) for pattern in stash_message_patterns):
+                    continue
+                
+                # Apply "Clean History" toggle for merge commits
+                if self.cleaner_view_enabled.get() and len(parents) > 1:
+                    continue
+
+                commit_info = {"hash": chash, "parents": parents, "author": author, "date": date, "refs": refs.strip(), "message": message_subject, "body": message_body, "log_line_num": i}
                 self.commits_data.append(commit_info)
-                self.commit_map[chash] = i
+                self.commit_map[chash] = len(self.commits_data) - 1 # Map hash to its index in the *filtered* list
         
         self.draw_graph()
         self.display_commits()
 
-    def _on_scroll(self, *args):
+    def _on_vertical_scroll(self, *args):
         self.graph_canvas.yview(*args)
         self.commit_text.yview(*args)
 
     def _on_mousewheel(self, event):
-        self.graph_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        self.commit_text.yview_scroll(int(-1*(event.delta/120)), "units")
+        # Vertical scrolling
+        if event.state & 0x1: # Shift key for horizontal scrolling (Windows/Linux)
+            self.graph_canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+        else:
+            self.graph_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            self.commit_text.yview_scroll(int(-1*(event.delta/120)), "units")
         return "break"
 
     def draw_graph(self):
         self.graph_canvas.delete("all")
         self.dot_id_to_commit.clear()
-        row_height = 40
         dot_radius = 4
         
         commit_lanes = self._assign_lanes()
         
+        # Keep track of line IDs for highlighting
+        self.lane_lines = {lane_idx: [] for lane_idx in set(commit_lanes.values())} # {lane_index: [list of line IDs]}
+        self.dot_objects = {} # {commit_hash: dot_id}
+        self.commit_lane_map = commit_lanes # Store for easy lookup
+
         for i, commit in enumerate(self.commits_data):
-            y = i * row_height + (row_height / 2)
+            y = i * self.row_height + (self.row_height / 2)
             lane_index = commit_lanes.get(commit["hash"], 0)
-            x = 30 + lane_index * 20
+            x = 30 + lane_index * self.lane_spacing 
             
             for p_hash in commit["parents"]:
+                # Only draw lines to parents that are also in the *filtered* commits_data
                 if p_hash in self.commit_map:
-                    p_index = self.commit_map[p_hash]
+                    p_index = self.commit_map[p_hash] 
                     p_lane_index = commit_lanes.get(p_hash, 0)
-                    p_y = p_index * row_height + (row_height / 2)
-                    p_x = 30 + p_lane_index * 20
+                    p_y = p_index * self.row_height + (self.row_height / 2)
+                    p_x = 30 + p_lane_index * self.lane_spacing 
                     color = self.lane_colors[lane_index % len(self.lane_colors)]
+                    
                     if p_lane_index == lane_index:
-                        self.graph_canvas.create_line(x, y, p_x, p_y, fill=color, width=2)
+                        line_id = self.graph_canvas.create_line(x, y, p_x, p_y, fill=color, width=2, tags=(f"lane_{lane_index}_line"))
                     else:
-                        self.graph_canvas.create_line(x, y, x, y + row_height/2, p_x, p_y - row_height/2, p_x, p_y, fill=color, width=2, smooth=True) #type: ignore
+                        # Curved line for merges/divergences
+                        cp1_x = x
+                        cp1_y = y + self.row_height / 2
+                        cp2_x = p_x
+                        cp2_y = p_y - self.row_height / 2
+                        line_id = self.graph_canvas.create_line(x, y, cp1_x, cp1_y, cp2_x, cp2_y, p_x, p_y, fill=color, width=2, smooth=True, splinesteps=12, tags=(f"lane_{lane_index}_line")) #type: ignore
+                    self.lane_lines[lane_index].append(line_id)
 
             color = self.lane_colors[lane_index % len(self.lane_colors)]
-            dot_id = self.graph_canvas.create_oval(x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius, fill=color, outline=self.sm.COLOR_BORDER, tags="commit_dot")
+            dot_id = self.graph_canvas.create_oval(x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius, fill=color, outline=self.sm.COLOR_BORDER, tags=(f"commit_dot_{commit['hash']}", f"lane_dot_{lane_index}"))
             self.dot_id_to_commit[dot_id] = commit
+            self.dot_objects[commit['hash']] = dot_id # Store dot ID by hash for easy lookup
 
-        total_height = len(self.commits_data) * row_height
-        self.graph_canvas.config(scrollregion=(0, 0, self.graph_canvas.winfo_width(), total_height))
+        total_height = len(self.commits_data) * self.row_height 
+        max_lane = max(commit_lanes.values()) if commit_lanes else 0
+        total_width = 30 + (max_lane + 1) * self.lane_spacing + 20 
+        self.graph_canvas.config(scrollregion=(0, 0, total_width, total_height))
+
 
     def _assign_lanes(self):
-        commit_lanes, lanes = {}, []
+        """
+        Assigns a horizontal 'lane' to each commit for graph visualization.
+        This is a basic greedy algorithm. It tries to reuse lanes that are
+        no longer active.
+        """
+        commit_lanes = {}  
+        active_lanes: List[Optional[str]] = [] 
+
         for commit in self.commits_data:
-            chash, my_lane = commit["hash"], -1
-            try: my_lane = lanes.index(chash)
-            except (ValueError, IndexError):
-                try: my_lane = lanes.index(None)
-                except ValueError: my_lane = len(lanes); lanes.append(None)
-            commit_lanes[chash] = my_lane
-            lanes[my_lane] = commit["parents"][0] if commit["parents"] else None
-            for p_hash in commit["parents"][1:]:
-                try: p_lane = lanes.index(None)
-                except ValueError: p_lane = len(lanes); lanes.append(None)
-                lanes[p_lane] = p_hash
+            chash = commit["hash"]
+            parents = commit["parents"]
+
+            assigned_lane = -1
+
+            # 1. Check if this commit is a direct continuation of an existing branch line.
+            for i, active_commit_in_lane in enumerate(active_lanes):
+                if active_commit_in_lane == chash:
+                    assigned_lane = i
+                    break
+            
+            # 2. If not a direct continuation, try to find an empty lane to reuse.
+            if assigned_lane == -1:
+                try:
+                    assigned_lane = active_lanes.index(None) 
+                except ValueError:
+                    assigned_lane = len(active_lanes)
+                    active_lanes.append(None) 
+
+            commit_lanes[chash] = assigned_lane
+
+            # Update the active_lanes for the current commit's parents.
+            # Only consider parents that are in the *filtered* commits_data
+            valid_parents = [p for p in parents if p in self.commit_map]
+
+            if valid_parents:
+                active_lanes[assigned_lane] = valid_parents[0]
+            else:
+                active_lanes[assigned_lane] = None
+
+            # For merge parents (beyond the first one), assign them to new or existing free lanes.
+            for p_hash in valid_parents[1:]:
+                found_merge_lane = False
+                for i, active_commit_in_in_lane in enumerate(active_lanes):
+                    if active_commit_in_in_lane == p_hash:
+                        found_merge_lane = True
+                        break
+                
+                if not found_merge_lane:
+                    try:
+                        free_lane_idx = active_lanes.index(None)
+                        active_lanes[free_lane_idx] = p_hash
+                        found_merge_lane = True
+                    except ValueError:
+                        active_lanes.append(p_hash)
+                        found_merge_lane = True 
+
+        while active_lanes and active_lanes[-1] is None:
+            active_lanes.pop()
+
         return commit_lanes
+
 
     def display_commits(self):
         self.commit_text.config(state="normal")
@@ -998,34 +1451,108 @@ class ModernGitLogViewer(ttk.Frame):
         self.commit_text.tag_configure("info", font=(self.sm.FONT_UI[0], 9), foreground="#999999")
         self.commit_text.tag_configure("hash", font=self.sm.FONT_CODE, foreground="#777777")
         self.commit_text.tag_configure("commit_block", spacing1=10, spacing3=10)
+        self.commit_text.tag_configure("current_branch_text", background=self.sm.COLOR_CURRENT_BRANCH_HIGHLIGHT, foreground=self.sm.COLOR_BG_DARK, font=(self.sm.FONT_UI[0], 8, 'bold'))
+
 
         for commit in self.commits_data:
             start_index = self.commit_text.index(tk.END)
             self.commit_text.insert(tk.END, f"{commit['message']}  ", "msg")
+            
+            # Check for current branch and apply highlight
+            is_current_branch_head = False
+            if self.current_branch_name and f"HEAD -> {self.current_branch_name}" in commit['refs']:
+                is_current_branch_head = True
+
             if commit['refs']:
                 refs_parts = [r.strip() for r in commit['refs'].strip('() ').split(',') if r.strip()]
                 for ref in refs_parts:
                     ref_text = ref.replace('HEAD -> ', '')
                     is_head = 'HEAD ->' in ref
                     is_remote = '/' in ref_text and not is_head
-                    color = self.sm.COLOR_ACCENT if is_head else self.sm.COLOR_GREEN if is_remote else self.sm.COLOR_ORANGE
-                    ref_label = tk.Label(self.commit_text, text=f" {ref_text} ", bg=color, fg="white", font=(self.sm.FONT_UI[0], 8, 'bold'))
+                    
+                    if is_current_branch_head and ref_text == self.current_branch_name:
+                        # Apply specific tag for current branch
+                        ref_label = tk.Label(self.commit_text, text=f" {ref_text} ", bg=self.sm.COLOR_CURRENT_BRANCH_HIGHLIGHT, fg=self.sm.COLOR_BG_DARK, font=(self.sm.FONT_UI[0], 8, 'bold'))
+                    else:
+                        color = self.sm.COLOR_ACCENT if is_head else self.sm.COLOR_GREEN if is_remote else self.sm.COLOR_ORANGE
+                        ref_label = tk.Label(self.commit_text, text=f" {ref_text} ", bg=color, fg="white", font=(self.sm.FONT_UI[0], 8, 'bold'))
+                    
                     self.commit_text.window_create(tk.END, window=ref_label, padx=2)
+            
             self.commit_text.insert(tk.END, f"\n{commit['author']}  •  {commit['date']}  ", "info")
             self.commit_text.insert(tk.END, f"{commit['hash'][:7]}\n", "hash")
             self.commit_text.tag_add("commit_block", start_index, tk.END)
 
         self.commit_text.config(state="disabled")
 
-    def _on_commit_click(self, event):
-        line_num = int(self.commit_text.index(f"@{event.x},{event.y}").split('.')[0]) - 1
-        commit_index = line_num // 2
-        
-        if 0 <= commit_index < len(self.commits_data):
-            commit = self.commits_data[commit_index]
-            self._fetch_and_display_commit_details(commit['hash'])
+    def _on_canvas_click(self, event):
+        """Handles left-click events on the graph canvas."""
+        canvas = event.widget
+        # Get the canvas coordinates relative to the scrollregion
+        canvas_x = canvas.canvasx(event.x)
+        canvas_y = canvas.canvasy(event.y)
+
+        # Find the closest item that is a 'commit_dot'
+        items = canvas.find_closest(canvas_x, canvas_y)
+        clicked_dot_id = None
+        for item_id in items:
+            if "commit_dot_" in canvas.gettags(item_id)[0]:
+                clicked_dot_id = item_id
+                break
+
+        if clicked_dot_id:
+            commit_data = self.dot_id_to_commit.get(clicked_dot_id)
+            if commit_data:
+                self._fetch_and_display_commit_details(commit_data['hash'])
         return "break"
+
+    def _show_commit_context_menu(self, event):
+        """Handles right-click events on the commit text area to show a context menu."""
+        # Get the line number from the text widget where the right-click occurred
+        line_num = int(self.commit_text.index(f"@{event.x},{event.y}").split('.')[0])
         
+        # Map the line number back to the commit data
+        # We need to find which commit corresponds to this line in the displayed text.
+        # This is tricky because of the variable height of commit entries.
+        # A more robust solution would involve storing the start/end line for each commit
+        # when `display_commits` is called.
+        
+        # For now, let's try to find the commit based on approximate line number
+        # This assumes a direct mapping, which might not be perfect with multi-line messages
+        commit_index = -1
+        current_line_count = 1
+        for i, commit in enumerate(self.commits_data):
+            # Estimate lines per commit (message + info line + padding)
+            estimated_lines = commit['message'].count('\n') + 2 
+            if line_num >= current_line_count and line_num < current_line_count + estimated_lines:
+                commit_index = i
+                break
+            current_line_count += estimated_lines
+
+        if not (0 <= commit_index < len(self.commits_data)): return
+        
+        commit = self.commits_data[commit_index]
+        commit_hash = commit['hash']
+        
+        menu = tk.Menu(self, tearoff=0, bg=self.sm.COLOR_BG_LIGHT, fg=self.sm.COLOR_FG)
+        menu.add_command(label=f"Create branch from '{commit_hash[:7]}'...", command=lambda: self._create_branch_from_commit(commit_hash))
+        menu.add_command(label=f"Checkout '{commit_hash[:7]}'", command=lambda: self._checkout_commit(commit_hash))
+        menu.add_separator()
+        # These actions will be moved to a dedicated "Rewrite History" tab in Phase 3
+        # For now, they are commented out/disabled as per the plan's intent.
+        # menu.add_command(label=f"Cherry-pick '{commit_hash[:7]}'", command=lambda: self._cherry_pick_commit(commit_hash))
+        # menu.add_command(label=f"Revert commit '{commit_hash[:7]}'", command=lambda: self._revert_commit(commit_hash))
+        # menu.add_separator()
+        # reset_menu = tk.Menu(menu, tearoff=0, bg=self.sm.COLOR_BG_LIGHT, fg=self.sm.COLOR_FG)
+        # menu.add_cascade(label=f"Reset current branch to '{commit_hash[:7]}'", menu=reset_menu)
+        # reset_menu.add_command(label="Soft - Keep all changes", command=lambda: self._reset_to_commit(commit_hash, "soft"))
+        # reset_menu.add_command(label="Mixed - Keep working dir, unstage changes", command=lambda: self._reset_to_commit(commit_hash, "mixed"))
+        # reset_menu.add_command(label="Hard - Discard all changes (DANGEROUS)", command=lambda: self._reset_to_commit(commit_hash, "hard"))
+        # menu.add_separator()
+        menu.add_command(label="Copy full commit hash", command=lambda: self._copy_to_clipboard(commit_hash))
+        menu.tk_popup(event.x_root, event.y_root)
+
+
     def _fetch_and_display_commit_details(self, commit_hash: str):
         self.commit_detail_viewer.config(state="normal")
         self.commit_detail_viewer.delete("1.0", tk.END)
@@ -1036,33 +1563,6 @@ class ModernGitLogViewer(ttk.Frame):
             success, details = self.git_logic.get_commit_details(commit_hash)
             self.after(0, self.parent_ui._display_colored_diff, details, self.commit_detail_viewer)
         threading.Thread(target=worker, daemon=True).start()
-
-    def _show_commit_context_menu(self, event):
-        line_num_str = self.commit_text.index(f"@{event.x},{event.y}").split('.')[0]
-        if not line_num_str: return
-        line_num = int(line_num_str) -1
-        commit_index = line_num // 2
-        
-        if not (0 <= commit_index < len(self.commits_data)): return
-        
-        commit = self.commits_data[commit_index]
-        commit_hash = commit['hash']
-        
-        menu = tk.Menu(self, tearoff=0, bg=self.sm.COLOR_BG_LIGHT, fg=self.sm.COLOR_FG)
-        menu.add_command(label=f"Create branch from '{commit_hash[:7]}'...", command=lambda: self._create_branch_from_commit(commit_hash))
-        menu.add_command(label=f"Checkout '{commit_hash[:7]}'", command=lambda: self._checkout_commit(commit_hash))
-        menu.add_separator()
-        menu.add_command(label=f"Cherry-pick '{commit_hash[:7]}'", command=lambda: self._cherry_pick_commit(commit_hash))
-        menu.add_command(label=f"Revert commit '{commit_hash[:7]}'", command=lambda: self._revert_commit(commit_hash))
-        menu.add_separator()
-        reset_menu = tk.Menu(menu, tearoff=0, bg=self.sm.COLOR_BG_LIGHT, fg=self.sm.COLOR_FG)
-        menu.add_cascade(label=f"Reset current branch to '{commit_hash[:7]}'", menu=reset_menu)
-        reset_menu.add_command(label="Soft - Keep all changes", command=lambda: self._reset_to_commit(commit_hash, "soft"))
-        reset_menu.add_command(label="Mixed - Keep working dir, unstage changes", command=lambda: self._reset_to_commit(commit_hash, "mixed"))
-        reset_menu.add_command(label="Hard - Discard all changes (DANGEROUS)", command=lambda: self._reset_to_commit(commit_hash, "hard"))
-        menu.add_separator()
-        menu.add_command(label="Copy full commit hash", command=lambda: self._copy_to_clipboard(commit_hash))
-        menu.tk_popup(event.x_root, event.y_root)
 
     def _create_branch_from_commit(self, commit_hash):
         branch_name = simpledialog.askstring("Create Branch", "Enter new branch name:", parent=self)
@@ -1132,25 +1632,70 @@ class ModernGitLogViewer(ttk.Frame):
 
     def _on_canvas_hover(self, event):
         canvas = event.widget
-        item_ids = canvas.find_overlapping(event.x - 1, event.y - 1, event.x + 1, event.y + 1)
-        
-        dot_id = next((item_id for item_id in reversed(item_ids) if "commit_dot" in canvas.gettags(item_id)), None)
+        # Get the canvas coordinates relative to the scrollregion
+        canvas_x = canvas.canvasx(event.x)
+        canvas_y = canvas.canvasy(event.y)
 
-        if dot_id is not None:
-            if dot_id != self.hovered_dot_id:
-                self.hovered_dot_id = dot_id
-                self._show_tooltip(event, self.dot_id_to_commit[dot_id])
-        else:
+        # Find the closest item that is a 'commit_dot'
+        items = canvas.find_closest(canvas_x, canvas_y)
+        current_hovered_dot_id = None
+        for item_id in items:
+            if "commit_dot_" in canvas.gettags(item_id)[0]:
+                current_hovered_dot_id = item_id
+                break
+
+        if current_hovered_dot_id and current_hovered_dot_id != self.hovered_dot_id:
+            self._unhighlight_previous_dot() # Unhighlight previous if different dot is hovered
+            self._unhighlight_lane(self.hovered_lane_index) # Unhighlight previous lane
+            self.hovered_dot_id = current_hovered_dot_id
+            commit_data = self.dot_id_to_commit.get(self.hovered_dot_id)
+            if commit_data:
+                lane_index = self.commit_lane_map.get(commit_data['hash'], -1)
+                self.hovered_lane_index = lane_index
+                self._highlight_lane(lane_index)
+                self._show_tooltip(event, commit_data)
+        elif not current_hovered_dot_id and self.hovered_dot_id:
             self._hide_tooltip()
+            self._unhighlight_previous_dot()
+            self._unhighlight_lane(self.hovered_lane_index)
+            self.hovered_lane_index = -1
+
+    def _highlight_lane(self, lane_index):
+        if lane_index == -1: return
+        # Highlight lines in the lane
+        for line_id in self.lane_lines.get(lane_index, []):
+            self.graph_canvas.itemconfig(line_id, width=4) # Thicker line
+        
+        # Highlight dots in the lane
+        for commit_hash, dot_id in self.dot_objects.items():
+            if self.commit_lane_map.get(commit_hash) == lane_index:
+                self.graph_canvas.itemconfig(dot_id, width=2, outline=self.sm.COLOR_YELLOW) # Thicker outline for dots
+
+    def _unhighlight_lane(self, lane_index):
+        if lane_index == -1: return
+        # Unhighlight lines in the lane
+        for line_id in self.lane_lines.get(lane_index, []):
+            self.graph_canvas.itemconfig(line_id, width=2) # Original thickness
+        
+        # Unhighlight dots in the lane
+        for commit_hash, dot_id in self.dot_objects.items():
+            if self.commit_lane_map.get(commit_hash) == lane_index:
+                self.graph_canvas.itemconfig(dot_id, width=1, outline=self.sm.COLOR_BORDER) # Original thickness and color
+
+    def _unhighlight_previous_dot(self):
+        if self.hovered_dot_id and self.graph_canvas.find_withtag(self.hovered_dot_id):
+            self.graph_canvas.itemconfig(self.hovered_dot_id, outline=self.sm.COLOR_BORDER, width=1)
+        self.hovered_dot_id = None
 
     def _show_tooltip(self, event, commit_data):
-        self._hide_tooltip()
+        if self.tooltip_window:
+            self._hide_tooltip()
         
         x, y = event.x_root + 15, event.y_root - 10
         
-        self.tooltip = tk.Toplevel(self.graph_canvas)
-        self.tooltip.wm_overrideredirect(True)
-        self.tooltip.wm_geometry(f"+{x}+{y}")
+        self.tooltip_window = tk.Toplevel(self.graph_canvas)
+        self.tooltip_window.wm_overrideredirect(True)
+        self.tooltip_window.wm_geometry(f"+{x}+{y}")
         
         tooltip_text = f"{commit_data['message']}\n\n" \
                        f"Author: {commit_data['author']}\n" \
@@ -1158,17 +1703,19 @@ class ModernGitLogViewer(ttk.Frame):
                        f"Hash: {commit_data['hash'][:12]}"
         if commit_data['refs']: tooltip_text += f"\nRefs: {commit_data['refs']}"
 
-        label = tk.Label(self.tooltip, text=tooltip_text, justify='left', bg="#252526", relief='solid', borderwidth=1, font=("Segoe UI", 9), foreground="#D4D4D4", wraplength=400, anchor='w', padx=5, pady=5)
+        label = tk.Label(self.tooltip_window, text=tooltip_text, justify='left', bg="#252526", relief='solid', borderwidth=1, font=("Segoe UI", 9), foreground="#D4D4D4", wraplength=400, anchor='w', padx=5, pady=5)
         label.pack(ipadx=1)
         
-        self.tooltip.update_idletasks()
-        self.tooltip.wm_geometry(f"+{x}+{event.y_root - self.tooltip.winfo_height() - 5}")
+        self.tooltip_window.update_idletasks()
+        self.tooltip_window.wm_geometry(f"+{x}+{event.y_root - self.tooltip_window.winfo_height() - 5}")
 
     def _hide_tooltip(self, event=None):
-        self.hovered_dot_id = None
-        if self.tooltip:
-            self.tooltip.destroy()
-            self.tooltip = None
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
+        self._unhighlight_previous_dot() # Ensure dot is unhighlighted when tooltip hides
+        self._unhighlight_lane(self.hovered_lane_index)
+        self.hovered_lane_index = -1
 
 class BranchManager(tk.Toplevel):
     """Dialog for viewing and switching branches."""
@@ -1266,15 +1813,18 @@ class BranchManager(tk.Toplevel):
         else:
             self.parent_ui.show_detailed_error(f"Failed to switch to '{branch_name_to_checkout}'", output)
     
-    def create_branch(self):
-        new_branch_name = self.new_branch_entry.get().strip()
+    def create_branch(self, new_branch_name=None):
+        if new_branch_name is None:
+            new_branch_name = self.new_branch_entry.get().strip()
         if not new_branch_name:
             messagebox.showwarning("Input Error", "Please enter a name for the new branch.", parent=self)
             return
         success, output = self.git_logic.create_branch(new_branch_name)
         if success:
             messagebox.showinfo("Success", f"Created and switched to new branch '{new_branch_name}'.", parent=self)
-            self.parent_ui.refresh(); self.destroy()
+            self.parent_ui.refresh(); self.populate_branches()
+            if self.parent_ui.history_view:
+                self.parent_ui.history_view.populate_log()
         else:
             self.parent_ui.show_detailed_error(f"Failed to create branch '{new_branch_name}'", output)
     
@@ -1306,8 +1856,3 @@ class BranchManager(tk.Toplevel):
             self.populate_branches()
         else:
             self.parent_ui.show_detailed_error(f"Failed to delete branch '{branch_name}'", output)
-
-class GitCommandAutocompleteManager:
-    # This class definition is now a placeholder until we implement the Git Console tab
-    def __init__(self, *args, **kwargs):
-        pass

@@ -119,17 +119,42 @@ class MergeEditor(tk.Toplevel):
         return (f"<<<<<<< {current_branch}", f">>>>>>> {theirs_name}")
 
     def _load_and_style_views(self):
+        # Load 'ours' (stage 2) and 'theirs' (stage 3) for the read-only side panes
         ok_ours, bytes_ours = self.git_logic.get_file_bytes_for_stage(self.filepath, 2)
         ok_theirs, bytes_theirs = self.git_logic.get_file_bytes_for_stage(self.filepath, 3)
         if not (ok_ours and ok_theirs):
-            messagebox.showerror("Load Error", "Could not load conflict versions from Git index.", parent=self); self.on_close(); return
-        content_ours, content_theirs = sanitize_content(bytes_ours), sanitize_content(bytes_theirs)
-        ours_header, theirs_header = self._get_conflict_headers_from_disk()
-        result_content = f"{ours_header}\n{content_ours}\n=======\n{content_theirs}\n{theirs_header}\n"
+            messagebox.showerror("Load Error", "Could not load conflict versions from Git index.", parent=self)
+            self.on_close()
+            return
+
+        content_ours = sanitize_content(bytes_ours)
+        content_theirs = sanitize_content(bytes_theirs)
+
+        # For the editable "Result" pane, load the actual file from the working directory.
+        # This file contains the conflict markers with the correct branch names.
+        result_content = ""
+        try:
+            with open(self.full_filepath, 'r', encoding='utf-8-sig', errors='replace') as f:
+                result_content = f.read()
+        except Exception as e:
+            messagebox.showerror("File Read Error", f"Could not read the conflicted file from disk:\n{e}", parent=self)
+            # Fallback to reconstructing the conflict if reading from disk fails
+            ours_header, theirs_header = self._get_conflict_headers_from_disk()
+            result_content = f"{ours_header}\n{content_ours}\n=======\n{content_theirs}\n{theirs_header}\n"
+
+        # Populate reference panes
         for editor, content in [(self.ours_editor, content_ours), (self.theirs_editor, content_theirs)]:
-            editor.config(state="normal"); editor.insert("1.0", content); editor.config(state="disabled")
+            editor.config(state="normal")
+            editor.delete("1.0", "end")
+            editor.insert("1.0", content)
+            editor.config(state="disabled")
+
+        # Populate the result editor
+        self.result_editor.delete("1.0", "end")
         self.result_editor.insert("1.0", result_content)
-        self._highlight_all_things(); self.result_editor.edit_modified(False)
+        
+        self._highlight_all_things()
+        self.result_editor.edit_modified(False)
 
     def _on_result_modified(self, event=None):
         if self.result_editor.edit_modified() and not self.is_shutting_down:

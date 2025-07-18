@@ -115,7 +115,6 @@ class PriestyCode(tk.Tk):
         self.error_console: ConsoleUi
         self.file_explorer: FileExplorer
         self.source_control_ui: SourceControlUI | None = None
-        self.git_console: scrolledtext.ScrolledText | None = None
 
         self.terminals: list[Terminal] = []
         self.terminal_ui_map: dict[Terminal, tk.Frame] = {}
@@ -676,10 +675,6 @@ class PriestyCode(tk.Tk):
             error_page, jump_callback=self._jump_to_error_location
         )
         self.error_console.pack(fill="both", expand=True)
-        
-        git_console_page = tk.Frame(self.output_notebook, bg="#252526")
-        self.git_console = scrolledtext.ScrolledText(git_console_page, bg="#252526", fg="#D4D4D4", font=("Consolas", 10), relief="flat", bd=0, state="disabled")
-        self.git_console.pack(fill="both", expand=True, padx=5, pady=2)
         
         self.output_notebook.add(terminal_page, text="TERMINAL")
         self.output_notebook.add(error_page, text="PROBLEMS")
@@ -1965,8 +1960,6 @@ class PriestyCode(tk.Tk):
             cast(CodeEditor, editor_frame.winfo_children()[0]).set_font_size(new_size)
         for term in self.terminals:
             term.text.config(font=("Consolas", new_size))
-        if self.git_console:
-            self.git_console.config(font=("Consolas", new_size))
         
         self.style.configure("Treeview", rowheight=int(new_size * 2.2))
         self.style.configure("Treeview.Heading", font=("Segoe UI", new_size, "bold"))
